@@ -5,6 +5,7 @@ from pathlib import Path
 import base64
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.access_control import AccessControl
 from pydantic import ValidationError
@@ -91,13 +92,20 @@ def _render_login_page_styles() -> None:
             max-width: 590px !important;
             min-height: 100vh !important;
             margin: 0 auto !important;
-            padding: clamp(34px, 6.5vh, 72px) 0 44px !important;
-            display: block !important;
+            padding: 32px 0 !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: center !important;
         }}
 
         .hr-login-hero {{
             margin: 0 0 30px !important;
             text-align: center !important;
+            transform: translateY(clamp(-52px, -5vh, -36px)) !important;
+        }}
+
+        [data-testid="stForm"] {{
+            transform: translateY(clamp(-52px, -5vh, -36px)) !important;
         }}
 
         .hr-login-title {{
@@ -189,6 +197,38 @@ def _render_login_page_styles() -> None:
             color: #101d35 !important;
         }}
 
+        .st-key-login_forgot_password_button button,
+        div[class*="st-key-login_forgot_password_button"] button {{
+            min-height: 40px !important;
+            margin-top: 9px !important;
+            color: #53637d !important;
+            -webkit-text-fill-color: #53637d !important;
+            background: transparent !important;
+            background-color: transparent !important;
+            border: 0 !important;
+            border-color: transparent !important;
+            box-shadow: none !important;
+            font-weight: 670 !important;
+        }}
+
+        .st-key-login_forgot_password_button button *,
+        div[class*="st-key-login_forgot_password_button"] button * {{
+            color: inherit !important;
+            -webkit-text-fill-color: inherit !important;
+        }}
+
+        .st-key-login_forgot_password_button button:hover,
+        .st-key-login_forgot_password_button button:focus-visible,
+        div[class*="st-key-login_forgot_password_button"] button:hover,
+        div[class*="st-key-login_forgot_password_button"] button:focus-visible {{
+            color: #101d35 !important;
+            -webkit-text-fill-color: #101d35 !important;
+            background: rgba(28,165,42,.08) !important;
+            background-color: rgba(28,165,42,.08) !important;
+            border: 0 !important;
+            box-shadow: none !important;
+        }}
+
         @media (max-width: 680px) {{
             [data-testid="stMainBlockContainer"],
             [data-testid="stMain"] .block-container {{
@@ -211,6 +251,13 @@ def _render_login_page_styles() -> None:
 
             .hr-login-subtitle {{
                 font-size: .95rem !important;
+            }}
+        }}
+
+        @media (max-height: 760px) {{
+            .hr-login-hero,
+            [data-testid="stForm"] {{
+                transform: translateY(-12px) !important;
             }}
         }}
         </style>
@@ -282,13 +329,14 @@ def render_login_page(default_company_code: str) -> None:
 
         submitted = st.form_submit_button(
             "Sign In",
-            use_container_width=True,
+            width="stretch",
             type="primary",
         )
         forgot_password = st.form_submit_button(
             "Forgot Password?",
-            use_container_width=True,
+            width="stretch",
             type="secondary",
+            key="login_forgot_password_button",
         )
 
     if forgot_password:
@@ -336,9 +384,9 @@ def render_login_page(default_company_code: str) -> None:
             )
 
         except ValidationError as error:
-            st.error(error.errors()[0]["msg"])
+            render_action_warning(error)
         except AuthenticationError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             # Do not reveal database or internal exception details.
             st.error(

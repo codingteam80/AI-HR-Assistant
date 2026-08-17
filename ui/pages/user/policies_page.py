@@ -9,6 +9,7 @@ from database.session import SessionFactory
 from modules.policy_qa.policy_assistant import PolicyAssistant
 from config.settings import get_settings
 from services.policy_service import PolicyService
+from ui.components.live_search import live_search_input
 
 
 def _source_caption(source) -> str:
@@ -85,10 +86,16 @@ def render_employee_policies_page(
     filter_columns = st.columns([2, 1])
 
     with filter_columns[0]:
-        search_text = st.text_input(
+        search_text = live_search_input(
             "Search Policies",
             placeholder=(
                 "Search title, category, or extracted file content..."
+            ),
+            key="employee_policy_search",
+            suggestions=(
+                value
+                for policy in all_policies
+                for value in (policy.title, policy.category)
             ),
         )
 
@@ -183,7 +190,7 @@ def render_employee_policies_page(
             data=download.data,
             file_name=download.filename,
             mime=download.mime_type,
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info(
@@ -207,7 +214,7 @@ def render_employee_policies_page(
         ask_submitted = st.form_submit_button(
             "Ask Policy Assistant",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if ask_submitted:

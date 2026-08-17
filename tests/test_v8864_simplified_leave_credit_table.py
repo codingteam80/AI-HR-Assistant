@@ -14,8 +14,8 @@ def test_adjustment_is_hidden_from_admin_and_employee_tables() -> None:
         source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
         assert '"Adjustment":' not in source
         assert 'Decimal(' in source
-        assert 'adjustment_days' in source
-        assert 'net credits added during the selected year' in source
+        assert 'Credit shows only the annual or approved event allocation' in source
+        assert 'corrections affect Available' in source
 
 
 def test_admin_editor_uses_plain_language_for_internal_correction() -> None:

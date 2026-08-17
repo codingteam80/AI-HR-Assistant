@@ -1,6 +1,7 @@
 """Administrator department-management page."""
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -82,7 +83,7 @@ def render_departments_page(
         create_submitted = st.form_submit_button(
             "Create Department",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if create_submitted:
@@ -104,9 +105,9 @@ def render_departments_page(
             st.rerun()
 
         except ValidationError as error:
-            st.error(error.errors()[0]["msg"])
+            render_action_warning(error)
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error("The department could not be created.")
 
@@ -138,7 +139,7 @@ def render_departments_page(
         status_submitted = st.form_submit_button(
             "Update Department Status",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if status_submitted:
@@ -158,7 +159,7 @@ def render_departments_page(
             st.rerun()
 
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error(
                 "The department status could not be updated."

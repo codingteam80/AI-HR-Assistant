@@ -5,7 +5,12 @@ import streamlit as st
 from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
 from modules.hr_assistant.hr_assistant import HRAssistant
+from modules.smart_ai.portal_ai import SmartPortalAssistant
 from ui.components.quick_actions import render_quick_actions
+from ui.module_view_navigation import (
+    EXACT_VIEW_QUERY_KEYS,
+    prime_exact_module_view,
+)
 from ui.navigation_state import set_navigation_state
 
 
@@ -20,7 +25,7 @@ _ACTION_QUERY_KEYS = {
     "announcement_id",
     "leave_request_id",
     "policy_id",
-}
+} | EXACT_VIEW_QUERY_KEYS
 
 
 def _chat_identity(
@@ -99,13 +104,22 @@ def _open_action(action: dict) -> None:
         if key in st.query_params:
             del st.query_params[key]
 
-    set_navigation_state(
-        portal_mode=str(action.get("portal_mode", "employee")),
-        current_page=str(action.get("page", "Dashboard")),
-    )
+    portal_mode = str(action.get("portal_mode", "employee"))
+    page = str(action.get("page", "Dashboard"))
+    query_params = {
+        str(key): str(value)
+        for key, value in dict(action.get("query_params", {})).items()
+    }
 
-    for key, value in dict(action.get("query_params", {})).items():
-        st.query_params[str(key)] = str(value)
+    prime_exact_module_view(
+        portal_mode=portal_mode,
+        page=page,
+        query_params=query_params,
+    )
+    set_navigation_state(portal_mode=portal_mode, current_page=page)
+
+    for key, value in query_params.items():
+        st.query_params[key] = value
 
     st.rerun()
 
@@ -126,7 +140,7 @@ def _render_message_actions(
     for action_index, action in enumerate(actions):
         if st.button(
             str(action.get("label", "Open")),
-            use_container_width=True,
+            width="stretch",
             key=(
                 "hr_assistant_action_"
                 f"{_chat_identity(current_user)}_"
@@ -137,22 +151,9 @@ def _render_message_actions(
 
 
 def _initial_messages() -> list[dict]:
-    """Return the grounded welcome message for a new conversation."""
+    """Start empty because the welcome message is display-only."""
 
-    return [
-        {
-            "role": "assistant",
-            "content": (
-                "Ask me about leave credits, filing leave, request status, "
-                "your employee information, approved HR policies, documents, "
-                "benefits, onboarding, announcements, or HR contacts. You may "
-                "use shorthand such as VL, SL, or EL."
-            ),
-            "sources": [],
-            "actions": [],
-            "intent": "welcome",
-        }
-    ]
+    return []
 
 
 def render_chat_page(current_user: AuthenticatedUser) -> None:
@@ -185,33 +186,51 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
             chat_state_key
         ]
 
-        for message_index, message in enumerate(messages):
-            role = str(message.get("role", "assistant"))
-            message_key = (
-                "hr_assistant_message_"
-                f"{_chat_identity(current_user)}_"
-                f"{role}_{message_index}"
-            )
+        # Remove the persisted welcome used by earlier checkpoints while
+        # preserving every real user and assistant message.
+        while messages and messages[0].get("intent") == "welcome":
+            messages.pop(0)
 
-            with st.chat_message(role):
-                # Stable wrapper for Light Mode contrast and Markdown lists.
-                with st.container(key=message_key):
-                    st.markdown(
-                        str(message.get("content", ""))
-                    )
+        # Reserve the complete conversation area before the input. Re-entering
+        # this container after a submission keeps the pending user message,
+        # loading state, and final history above the chat input.
+        conversation_area = st.container()
+        welcome_placeholder = None
 
-                    if message.get("sources"):
+        with conversation_area:
+            if not messages:
+                welcome_placeholder = st.empty()
+                with welcome_placeholder.container():
+                    with st.chat_message("assistant"):
+                        st.markdown("Good day, how can I assist you today?")
+
+            for message_index, message in enumerate(messages):
+                role = str(message.get("role", "assistant"))
+                message_key = (
+                    "hr_assistant_message_"
+                    f"{_chat_identity(current_user)}_"
+                    f"{role}_{message_index}"
+                )
+
+                with st.chat_message(role):
+                    # Stable wrapper for Light Mode contrast and Markdown lists.
+                    with st.container(key=message_key):
                         st.markdown(
-                            "**Approved policy sources**"
+                            str(message.get("content", ""))
                         )
-                        for source_line in message["sources"]:
-                            st.caption(source_line)
 
-                    _render_message_actions(
-                        current_user=current_user,
-                        message_index=message_index,
-                        actions=message.get("actions", []),
-                    )
+                        if message.get("sources"):
+                            st.markdown(
+                                "**Approved policy sources**"
+                            )
+                            for source_line in message["sources"]:
+                                st.caption(source_line)
+
+                        _render_message_actions(
+                            current_user=current_user,
+                            message_index=message_index,
+                            actions=message.get("actions", []),
+                        )
 
         question = st.chat_input(
             "Ask an HR question, e.g. 'Ilan na lang VL ko?'",
@@ -229,12 +248,32 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
                 }
             )
 
-            with SessionFactory() as session:
-                response = HRAssistant(session).answer(
-                    current_user=current_user,
-                    question=question,
-                    history=previous_history,
-                )
+            # The display-only welcome must disappear as soon as the first
+            # question is accepted, including while the answer is loading.
+            if welcome_placeholder is not None:
+                welcome_placeholder.empty()
+
+            with conversation_area:
+                with st.chat_message("user"):
+                    st.markdown(question)
+
+                with st.chat_message("assistant"):
+                    with st.spinner(
+                        "Searching your authorized HR records and company information…"
+                    ):
+                        with SessionFactory() as session:
+                            response = HRAssistant(session).answer(
+                                current_user=current_user,
+                                question=question,
+                                history=previous_history,
+                            )
+                            response = SmartPortalAssistant(session).enhance(
+                                current_user=current_user,
+                                role_scope="employee",
+                                question=question,
+                                history=previous_history,
+                                deterministic_response=response,
+                            )
 
             messages.append(
                 {
@@ -262,7 +301,7 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
     with side:
         if st.button(
             "New HR Conversation",
-            use_container_width=True,
+            width="stretch",
             key=(
                 "new_hr_assistant_conversation__"
                 f"{_chat_identity(current_user)}"

@@ -165,10 +165,15 @@ def _reconcile_leave_credits(
     try:
         with SessionFactory() as session:
             service = LeaveService(session)
+            # Post elapsed leave first so December 31 VL is included before
+            # an unmet utilization target is finalized and carried forward.
+            service.reconcile_approved_leave(
+                company_id=company_id
+            )
             # Creates the new calendar-year balances every January and also
             # applies service-anniversary entitlement increases when due.
             service.ensure_current_year_balances(company_id)
-            service.reconcile_approved_leave(
+            service.reconcile_leave_utilization(
                 company_id=company_id
             )
     except Exception:
@@ -236,6 +241,11 @@ def main() -> None:
     AuthSessionManager.restore_from_browser()
 
     if not AuthSessionManager.is_authenticated():
+        if st.session_state.get(
+            AuthSessionManager.LOGOUT_PENDING_KEY,
+            False,
+        ):
+            AuthSessionManager.complete_logout_transition()
         apply_theme(
             primary_color=public_primary_color
         )

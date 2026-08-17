@@ -6,6 +6,7 @@ Secrets are read from `.env` and are never displayed in the browser.
 """
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.current_user import AuthenticatedUser
 from ui.components.data_table import render_admin_table
@@ -146,7 +147,7 @@ def render_integrations_page(
         send_test = st.form_submit_button(
             "Send Internet Test Email",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=(
                 not status.internet_delivery_ready
             ),
@@ -167,7 +168,7 @@ def render_integrations_page(
             )
 
         except EmailDeliveryError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error(
                 "The test email could not be sent. "

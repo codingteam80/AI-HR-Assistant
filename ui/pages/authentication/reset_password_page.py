@@ -1,6 +1,7 @@
 """Public new-password page opened from a reset email."""
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 from pydantic import ValidationError
 
 from authentication.password_reset_service import (
@@ -43,7 +44,7 @@ def render_reset_password_page() -> None:
 
             if st.button(
                 "Return to Sign In",
-                use_container_width=True,
+                width="stretch",
             ):
                 return_to_login()
 
@@ -67,7 +68,7 @@ def render_reset_password_page() -> None:
 
             submitted = st.form_submit_button(
                 "Reset Password",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
 
@@ -97,9 +98,9 @@ def render_reset_password_page() -> None:
                 return_to_login()
 
             except ValidationError as error:
-                st.error(error.errors()[0]["msg"])
+                render_action_warning(error)
             except PasswordResetError as error:
-                st.error(str(error))
+                render_action_warning(error)
             except Exception:
                 st.error(
                     "The password could not be reset. "

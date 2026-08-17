@@ -19,21 +19,12 @@ def render_sidebar(
     render_company_sidebar_logo(current_user)
 
     st.sidebar.markdown(
-        f"<div class='hr-brand'>🤖 {assistant_name}</div>",
+        (
+            f"<div class='hr-brand'>🤖 {assistant_name}</div>"
+            "<div class='hr-employee-nav-spacer' aria-hidden='true'></div>"
+        ),
         unsafe_allow_html=True,
     )
-    st.sidebar.caption(
-        current_user.employee_name or current_user.username
-    )
-    access_label = (
-        "Admin"
-        if current_user.clearance == 1
-        else "User"
-    )
-    st.sidebar.caption(
-        f"{access_label} · {current_user.company_code}"
-    )
-    st.sidebar.divider()
 
     for page_name in USER_NAVIGATION:
         button_type = (
@@ -44,7 +35,7 @@ def render_sidebar(
 
         if st.sidebar.button(
             page_name,
-            use_container_width=True,
+            width="stretch",
             type=button_type,
             key=f"nav_{page_name}",
         ):
@@ -60,7 +51,7 @@ def render_sidebar(
     if AccessControl.is_admin(current_user):
         if st.sidebar.button(
             "Admin Portal",
-            use_container_width=True,
+            width="stretch",
             key="admin_portal_button",
         ):
             set_navigation_state(
@@ -71,19 +62,7 @@ def render_sidebar(
 
     if st.sidebar.button(
         "Log Out",
-        use_container_width=True,
+        width="stretch",
         key="logout_button",
     ):
         AuthSessionManager.logout()
-
-    st.sidebar.markdown(
-        """
-        <div class="hr-card" style="margin-top: 18px;">
-            <div class="hr-card-title">Need Human Support?</div>
-            <div class="hr-card-text">
-                Contact HR when the assistant cannot resolve your concern.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )

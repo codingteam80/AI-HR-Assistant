@@ -6,9 +6,11 @@ login-account information. Roles are no longer administered separately.
 
 from datetime import date
 from html import escape
+import json
 import re
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -23,10 +25,16 @@ from schemas.admin_management_schema import (
 from services.admin_management_service import (
     AdminManagementService,
 )
+from services.employee_bulk_import_service import (
+    ACCOUNT_PREVIEW_COLUMNS,
+    EmployeeBulkImportService,
+)
+from ui.components.live_search import live_search_input
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
 )
+from ui.pages.admin.onboarding_management import render_onboarding_management
 
 
 EMPLOYMENT_STATUS_OPTIONS = {
@@ -198,6 +206,12 @@ def _employee_rows(
                 "Employee Number": _display_value(employee.employee_number),
                 "Full Name": employee.full_name or "N/A",
                 "Job Title / Position": _display_value(employee.job_title),
+                "Hired Date": (
+                    employee.hire_date.isoformat()
+                    if employee.hire_date
+                    else "N/A"
+                ),
+                "Years of Service": _display_value(employee.years_of_service),
                 "Department": _display_value(
                     employee.department.name if employee.department else None
                 ),
@@ -243,6 +257,8 @@ def _employee_search_value(employee) -> str:
         employee.work_email,
         employee.telephone_mobile_no,
         employee.job_title,
+        employee.hire_date,
+        employee.years_of_service,
         employee.employment_status,
         (
             employee.department.name
@@ -355,19 +371,6 @@ def _leader_options(
         empty_label="No Leader",
         exclude_employee_id=exclude_employee_id,
     )
-
-
-def _validation_message(
-    error: ValidationError,
-) -> str:
-    """Return one readable Pydantic validation message."""
-
-    first = error.errors()[0]
-    message = str(
-        first.get("msg", "The submitted value is invalid.")
-    )
-
-    return message.removeprefix("Value error, ")
 
 
 def _html_cell(value: object) -> str:
@@ -520,37 +523,43 @@ def _render_wrapped_employee_table(
         .employee-master-table td:nth-child(3) {{ width: 165px; }}
 
         .employee-master-table th:nth-child(4),
-        .employee-master-table td:nth-child(4) {{ width: 145px; }}
+        .employee-master-table td:nth-child(4) {{ width: 130px; }}
 
         .employee-master-table th:nth-child(5),
-        .employee-master-table td:nth-child(5) {{ width: 165px; }}
+        .employee-master-table td:nth-child(5) {{ width: 120px; }}
 
         .employee-master-table th:nth-child(6),
-        .employee-master-table td:nth-child(6) {{ width: 165px; }}
+        .employee-master-table td:nth-child(6) {{ width: 145px; }}
 
         .employee-master-table th:nth-child(7),
-        .employee-master-table td:nth-child(7) {{ width: 125px; }}
+        .employee-master-table td:nth-child(7) {{ width: 165px; }}
 
         .employee-master-table th:nth-child(8),
-        .employee-master-table td:nth-child(8) {{ width: 145px; }}
+        .employee-master-table td:nth-child(8) {{ width: 165px; }}
 
         .employee-master-table th:nth-child(9),
-        .employee-master-table td:nth-child(9) {{ width: 145px; }}
+        .employee-master-table td:nth-child(9) {{ width: 125px; }}
 
         .employee-master-table th:nth-child(10),
-        .employee-master-table td:nth-child(10) {{ width: 90px; }}
+        .employee-master-table td:nth-child(10) {{ width: 145px; }}
 
         .employee-master-table th:nth-child(11),
-        .employee-master-table td:nth-child(11) {{ width: 250px; }}
+        .employee-master-table td:nth-child(11) {{ width: 145px; }}
 
         .employee-master-table th:nth-child(12),
-        .employee-master-table td:nth-child(12) {{ width: 150px; }}
+        .employee-master-table td:nth-child(12) {{ width: 90px; }}
 
         .employee-master-table th:nth-child(13),
-        .employee-master-table td:nth-child(13) {{ width: 230px; }}
+        .employee-master-table td:nth-child(13) {{ width: 250px; }}
 
         .employee-master-table th:nth-child(14),
-        .employee-master-table td:nth-child(14) {{ width: 240px; }}
+        .employee-master-table td:nth-child(14) {{ width: 150px; }}
+
+        .employee-master-table th:nth-child(15),
+        .employee-master-table td:nth-child(15) {{ width: 230px; }}
+
+        .employee-master-table th:nth-child(16),
+        .employee-master-table td:nth-child(16) {{ width: 240px; }}
     </style>
 
     <div class="employee-table-shell" role="region"
@@ -572,7 +581,90 @@ def _render_wrapped_employee_table(
     )
 
 
-def _render_employee_list(employees) -> None:
+def _render_employee_workspace_table(
+    rows: list[dict[str, object]],
+    *,
+    aria_label: str,
+    min_width: int,
+    max_height: int,
+) -> None:
+    """Render a safe scrollable table without changing the master-list grid."""
+
+    if not rows:
+        return
+    headers = list(rows[0])
+    header_html = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    body_html = "".join(
+        "<tr>"
+        + "".join(f"<td>{_html_cell(row.get(header, ''))}</td>" for header in headers)
+        + "</tr>"
+        for row in rows
+    )
+    st.markdown(
+        f"""
+        <style>
+            .employee-workspace-table-shell {{
+                width: 100%;
+                max-height: {max_height}px;
+                overflow: auto;
+                border: 1px solid var(--hr-border);
+                border-radius: 14px;
+                background: var(--hr-surface);
+                scrollbar-color: var(--hr-primary) var(--hr-border);
+            }}
+            .employee-workspace-table {{
+                width: 100%;
+                min-width: {min_width}px;
+                border-collapse: separate;
+                border-spacing: 0;
+                table-layout: fixed;
+                font-size: 0.84rem;
+            }}
+            .employee-workspace-table th {{
+                position: sticky;
+                top: 0;
+                z-index: 2;
+                padding: 9px 10px;
+                border-right: 1px solid var(--hr-border);
+                border-bottom: 1px solid var(--hr-border);
+                background: var(--hr-surface);
+                color: var(--hr-text-primary);
+                text-align: left;
+            }}
+            .employee-workspace-table td {{
+                padding: 9px 10px;
+                border-right: 1px solid var(--hr-border);
+                border-bottom: 1px solid var(--hr-border);
+                color: var(--hr-text-secondary);
+                vertical-align: top;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                line-height: 1.4;
+            }}
+            .employee-workspace-table th:last-child,
+            .employee-workspace-table td:last-child {{ border-right: 0; }}
+            .employee-workspace-table tbody tr:hover td {{
+                color: var(--hr-text-primary);
+                background: var(--hr-primary-soft);
+            }}
+        </style>
+        <div class="employee-workspace-table-shell" role="region"
+             aria-label="{escape(aria_label)}" tabindex="0">
+            <table class="employee-workspace-table">
+                <thead><tr>{header_html}</tr></thead>
+                <tbody>{body_html}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_employee_list(
+    current_user: AuthenticatedUser,
+    employees,
+    users,
+) -> None:
     """Display a searchable list with five records visible at a time."""
 
     st.subheader("Employee List")
@@ -582,13 +674,35 @@ def _render_employee_list(employees) -> None:
         "fields remain available in Add/Edit Employee."
     )
 
-    search_text = st.text_input(
+    metric_columns = st.columns(4)
+    metric_values = (
+        ("Employees", len(employees)),
+        ("User Accounts", len(users)),
+        ("Active Accounts", sum(1 for user in users if user.is_active)),
+        ("Role", "Admin" if current_user.clearance == 1 else "User"),
+    )
+    for column, (label, value) in zip(metric_columns, metric_values):
+        with column:
+            st.metric(label, value)
+
+    search_text = live_search_input(
         "Search Employees",
         placeholder=(
             "Search employee number, name, email, telephone/mobile, "
             "department, manager, position, username, or training..."
         ),
         key="employee_master_search",
+        suggestions=(
+            value
+            for employee in employees
+            for value in (
+                employee.employee_number,
+                employee.full_name,
+                employee.work_email,
+                employee.telephone_mobile_no,
+            )
+            if value
+        ),
     )
 
     filtered = _filter_employees(
@@ -610,6 +724,183 @@ def _render_employee_list(employees) -> None:
     _render_wrapped_employee_table(rows)
 
 
+def _render_bulk_employee_upload(current_user: AuthenticatedUser) -> None:
+    """Render template download, validated preview, and atomic Excel import."""
+
+    preview_key = "employee_bulk_import_preview"
+    result_key = "employee_bulk_import_result"
+    filename_key = "employee_bulk_import_filename"
+
+    with st.expander("Upload Employees via Excel", expanded=False):
+        st.caption(
+            "Download the exact template, enter employee information, then "
+            "validate the file. User ID is generated after saving; Clearance, "
+            "User Name, and Temporary Password remain editable in the preview."
+        )
+        template_data = EmployeeBulkImportService.build_template()
+        st.download_button(
+            "Download Employee Excel Template",
+            data=template_data,
+            file_name="Employee_Import_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="content",
+            key="employee_bulk_template_download",
+        )
+
+        uploaded_file = st.file_uploader(
+            "Upload Completed Employee Template",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            key="employee_bulk_upload_file",
+            help="Only the downloadable .xlsx template is accepted.",
+        )
+        validate_clicked = st.button(
+            "Validate and Preview Employees",
+            width="stretch",
+            disabled=uploaded_file is None,
+            key="employee_bulk_validate",
+        )
+        if validate_clicked and uploaded_file is not None:
+            try:
+                if uploaded_file.size > 10 * 1024 * 1024:
+                    raise ValueError("The employee Excel file must not exceed 10 MB.")
+                with st.spinner("Validating employee and account information…"):
+                    with SessionFactory() as session:
+                        preview = EmployeeBulkImportService(session).prepare_preview(
+                            uploaded_file.getvalue(),
+                            filename=uploaded_file.name,
+                            company_id=current_user.company_id,
+                        )
+                st.session_state[preview_key] = preview
+                st.session_state[filename_key] = uploaded_file.name
+                st.session_state.pop(result_key, None)
+            except ValueError as error:
+                st.session_state.pop(preview_key, None)
+                render_action_warning(error)
+
+        preview_rows = st.session_state.get(preview_key)
+        if isinstance(preview_rows, list) and preview_rows:
+            st.markdown("#### Employee and Account Preview")
+            st.caption(
+                "Employee values come from Excel. Review the calculated Hired "
+                "Date/Years of Service and edit only the three account defaults."
+            )
+            display_rows = [
+                {column: row.get(column, "") for column in ACCOUNT_PREVIEW_COLUMNS}
+                for row in preview_rows
+            ]
+            edited_data = st.data_editor(
+                display_rows,
+                width="stretch",
+                hide_index=True,
+                disabled=[
+                    "Row",
+                    "Employee Number",
+                    "Employee Name",
+                    "Hired Date",
+                    "Years of Service",
+                    "User ID",
+                    "Validation",
+                ],
+                column_config={
+                    "Clearance": st.column_config.SelectboxColumn(
+                        "Clearance",
+                        options=["1 - Admin", "2 - User"],
+                        required=True,
+                    ),
+                    "User Name": st.column_config.TextColumn(
+                        "User Name",
+                        required=True,
+                        max_chars=100,
+                    ),
+                    "Temporary Password": st.column_config.TextColumn(
+                        "Temporary Password",
+                        required=True,
+                        max_chars=128,
+                    ),
+                },
+                key="employee_bulk_account_editor",
+            )
+            edited_records = (
+                edited_data
+                if isinstance(edited_data, list)
+                else edited_data.to_dict(orient="records")
+            )
+            edited_by_row = {
+                int(item["Row"]): item
+                for item in edited_records
+            }
+            merged_preview: list[dict[str, object]] = []
+            for original in preview_rows:
+                merged = dict(original)
+                edited = edited_by_row.get(int(original["Row"]), {})
+                for field in ("Clearance", "User Name", "Temporary Password"):
+                    if field in edited:
+                        merged[field] = edited[field]
+                merged_preview.append(merged)
+            st.session_state[preview_key] = merged_preview
+
+            invalid_count = sum(
+                str(row.get("Validation", "")) != "Ready"
+                for row in merged_preview
+            )
+            if invalid_count:
+                st.error(
+                    f"{invalid_count} row(s) contain validation errors. "
+                    "Correct the Excel file and validate it again."
+                )
+            import_clicked = st.button(
+                "Import Employees",
+                type="primary",
+                width="stretch",
+                disabled=invalid_count > 0,
+                key="employee_bulk_import_submit",
+            )
+            if import_clicked:
+                try:
+                    with st.spinner("Creating employee records and login accounts…"):
+                        with SessionFactory() as session:
+                            service = EmployeeBulkImportService(session)
+                            results = service.import_preview_rows(
+                                merged_preview,
+                                company_id=current_user.company_id,
+                                current_user_id=current_user.user_id,
+                                filename=str(st.session_state.get(filename_key) or "employee_import.xlsx"),
+                            )
+                            result_data = service.build_import_result(results)
+                    st.session_state[result_key] = {
+                        "data": result_data,
+                        "count": len(results),
+                    }
+                    st.session_state.pop(preview_key, None)
+                    set_operation_feedback(
+                        f"Successfully imported {len(results)} employee record(s) and login account(s)."
+                    )
+                    st.rerun()
+                except (ValidationError, ValueError) as error:
+                    render_action_warning(error)
+                except Exception:
+                    st.error(
+                        "The employee batch could not be imported. No employee "
+                        "from this batch was saved."
+                    )
+
+        import_result = st.session_state.get(result_key)
+        if isinstance(import_result, dict) and import_result.get("data"):
+            st.success(
+                f"{int(import_result.get('count', 0))} employee account(s) were imported. "
+                "Download the controlled initial-credentials result now."
+            )
+            st.download_button(
+                "Download Employee Import Result",
+                data=import_result["data"],
+                file_name="Employee_Import_Result.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="content",
+                key="employee_bulk_result_download",
+            )
+
+
 def _render_add_employee(
     current_user: AuthenticatedUser,
     employees,
@@ -621,6 +912,10 @@ def _render_add_employee(
         "All employee and account values are entered in one workspace. "
         "The Email field is also used as the login email."
     )
+
+    _render_bulk_employee_upload(current_user)
+    st.divider()
+    st.markdown("#### Add One Employee Manually")
 
     manager_people = _manager_options(employees)
     leader_people = _leader_options(employees)
@@ -698,8 +993,8 @@ def _render_add_employee(
                 max_chars=150,
                 key="create_department",
                 help=(
-                    "Enter an existing or new department name. Matching is "
-                    "case-insensitive, and a new department record is created "
+                    "Enter an existing or new department name. "
+                    "Matching is case-insensitive, and a new department record is created "
                     "automatically when needed."
                 ),
             )
@@ -731,7 +1026,7 @@ def _render_add_employee(
             )
         with hire_column:
             hire_date = st.date_input(
-                "Hire Date", value=date.today(), key="create_hire_date"
+                "Hired Date", value=date.today(), key="create_hire_date"
             )
 
         st.markdown("### Training Checklist")
@@ -782,7 +1077,7 @@ def _render_add_employee(
     submitted = st.button(
         "Create Employee Record",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="create_employee_submit",
     )
 
@@ -792,27 +1087,27 @@ def _render_add_employee(
     try:
         request = EmployeeAccountCreate(
             company_id=current_user.company_id,
-            employee_number=employee_number.strip(),
-            last_name=last_name.strip(),
-            first_name=first_name.strip(),
+            employee_number=(employee_number or "").strip(),
+            last_name=(last_name or "").strip(),
+            first_name=(first_name or "").strip(),
             middle_name=_optional_value(middle_name),
             suffix=_optional_value(suffix),
             job_title=_optional_value(job_title),
             department_name=_optional_value(department_name),
             manager_id=manager_people[manager_label],
             leader_id=leader_people[leader_label],
-            work_email=email.strip(),
-            telephone_mobile_no=_optional_value(telephone_mobile_no.strip()),
+            work_email=(email or "").strip(),
+            telephone_mobile_no=_optional_value(telephone_mobile_no),
             gender=_optional_value(gender_label),
             civil_status=_optional_value(civil_status_label),
             date_of_birth=date_of_birth,
             employment_status=EMPLOYMENT_STATUS_OPTIONS[status_label],
             hire_date=hire_date,
-            trainings=_parse_training_text(training_text),
+            trainings=_parse_training_text(training_text or ""),
             create_login_account=True,
-            username=username.strip(),
-            login_email=email.strip(),
-            temporary_password=temporary_password,
+            username=(username or "").strip(),
+            login_email=(email or "").strip(),
+            temporary_password=temporary_password or "",
             clearance=int(clearance_label[0]),
         )
 
@@ -820,7 +1115,10 @@ def _render_add_employee(
             with SessionFactory() as session:
                 employee = AdminManagementService(
                     session
-                ).create_employee_with_optional_account(request)
+                ).create_employee_with_optional_account(
+                    request,
+                    current_user_id=current_user.user_id,
+                )
 
         set_operation_feedback(
             "Employee record created successfully: "
@@ -831,9 +1129,9 @@ def _render_add_employee(
                 del st.session_state[key]
         st.rerun()
     except ValidationError as error:
-        st.error(_validation_message(error))
+        render_action_warning(error)
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_delete_employee(
@@ -882,7 +1180,7 @@ def _render_delete_employee(
         delete_submitted = st.button(
             "Delete Employee Permanently",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=not acknowledged,
             key=(
                 "employee_delete_button_"
@@ -929,9 +1227,9 @@ def _render_delete_employee(
             st.rerun()
 
         except ValidationError as error:
-            st.error(_validation_message(error))
+            render_action_warning(error)
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error(
                 "The employee record could not be deleted. "
@@ -1092,8 +1390,8 @@ def _render_edit_employee(
                 max_chars=150,
                 key=prefix + "department",
                 help=(
-                    "Edit the department directly. Existing names are reused "
-                    "case-insensitively; new names create department records automatically."
+                    "Edit the department directly. Existing names are "
+                    "reused case-insensitively; new names create department records automatically."
                 ),
             )
         with manager_column:
@@ -1138,7 +1436,7 @@ def _render_edit_employee(
             )
         with hire_column:
             hire_date = st.date_input(
-                "Hire Date", value=values["hire_date"], key=prefix + "hire_date"
+                "Hired Date", value=values["hire_date"], key=prefix + "hire_date"
             )
 
         st.markdown("### Training Checklist")
@@ -1185,7 +1483,7 @@ def _render_edit_employee(
     submitted = st.button(
         "Save Employee Changes",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=prefix + "submit",
     )
 
@@ -1196,13 +1494,13 @@ def _render_edit_employee(
         request = EmployeeMasterUpdate(
             company_id=current_user.company_id,
             employee_id=selected_id,
-            employee_number=employee_number.strip(),
-            last_name=last_name.strip(),
-            first_name=first_name.strip(),
+            employee_number=(employee_number or "").strip(),
+            last_name=(last_name or "").strip(),
+            first_name=(first_name or "").strip(),
             middle_name=_optional_value(middle_name),
             suffix=_optional_value(suffix),
-            work_email=email.strip(),
-            telephone_mobile_no=_optional_value(telephone_mobile_no.strip()),
+            work_email=(email or "").strip(),
+            telephone_mobile_no=_optional_value(telephone_mobile_no),
             job_title=_optional_value(job_title),
             department_name=_optional_value(department_name),
             manager_id=manager_people[manager_label],
@@ -1212,8 +1510,8 @@ def _render_edit_employee(
             date_of_birth=date_of_birth,
             employment_status=EMPLOYMENT_STATUS_OPTIONS[status_label],
             hire_date=hire_date,
-            trainings=_parse_training_text(training_text),
-            username=username.strip(),
+            trainings=_parse_training_text(training_text or ""),
+            username=(username or "").strip(),
             clearance=int(clearance_label[0]),
             new_temporary_password=new_password or None,
         )
@@ -1230,9 +1528,191 @@ def _render_edit_employee(
         )
         st.rerun()
     except ValidationError as error:
-        st.error(_validation_message(error))
+        render_action_warning(error)
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
+
+
+def _history_changes(history) -> str:
+    """Return a readable old-to-new change list from safe audit JSON."""
+
+    try:
+        old_values = json.loads(history.old_values_json or "{}")
+        new_values = json.loads(history.new_values_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return "N/A"
+    keys = list(dict.fromkeys([*old_values, *new_values]))
+    if not keys:
+        return "N/A"
+    return "\n".join(
+        f"{key.replace('_', ' ').title()}: "
+        f"{_display_value(old_values.get(key))} → "
+        f"{_display_value(new_values.get(key))}"
+        for key in keys
+    )
+
+
+def _render_employee_history(history_rows, user_labels: dict[int, str]) -> None:
+    """Render searchable employee creation, edit, upload, and archive history."""
+
+    st.subheader("Employee History")
+    st.caption(
+        "Employee creation, Excel uploads, profile/account edits, archiving, "
+        "and restoration are retained here. Plain-text passwords are never audited."
+    )
+    search_text = live_search_input(
+        "Search Employee History",
+        placeholder="Search employee, action, administrator, upload, or change…",
+        key="employee_history_search",
+        suggestions=(
+            value
+            for history in history_rows
+            for value in (
+                history.employee_number,
+                history.employee_name,
+                history.action_type,
+                history.source,
+                history.upload_filename,
+            )
+            if value
+        ),
+    )
+    normalized = search_text.strip().casefold()
+    filtered = []
+    for history in history_rows:
+        actor = user_labels.get(history.performed_by_user_id, "System / Former User")
+        changes = _history_changes(history)
+        searchable = " ".join(
+            str(value or "")
+            for value in (
+                history.employee_number,
+                history.employee_name,
+                history.action_type,
+                history.source,
+                history.summary,
+                history.upload_filename,
+                actor,
+                changes,
+            )
+        ).casefold()
+        if not normalized or normalized in searchable:
+            filtered.append(
+                {
+                    "Date / Time": history.created_at.strftime("%Y-%m-%d %I:%M %p"),
+                    "Employee": f"{history.employee_number} — {history.employee_name}",
+                    "Action": history.action_type.replace("_", " ").title(),
+                    "Source": history.source.replace("_", " ").title(),
+                    "Performed By": actor,
+                    "Summary": history.summary,
+                    "Changes": changes,
+                    "Upload File": _display_value(history.upload_filename),
+                }
+            )
+    st.caption(f"Showing {len(filtered)} of {len(history_rows)} history record(s).")
+    if not filtered:
+        st.info("No employee history matches the current search.")
+        return
+    _render_employee_workspace_table(
+        filtered,
+        aria_label="Scrollable employee history",
+        min_width=1900,
+        max_height=430,
+    )
+
+
+def _render_employee_archive(
+    current_user: AuthenticatedUser,
+    archived_employees,
+) -> None:
+    """Render retained resigned records and a confirmed restoration action."""
+
+    st.subheader("Employee Archive")
+    st.caption(
+        "Resigned employees remain available with all related attendance, leave, "
+        "OT, documents, and history. Restoring reuses the same employee and account records."
+    )
+    search_text = live_search_input(
+        "Search Archived Employees",
+        placeholder="Search archived employee number, name, email, department, or position…",
+        key="employee_archive_search",
+        suggestions=(
+            value
+            for employee in archived_employees
+            for value in (employee.employee_number, employee.full_name, employee.work_email)
+            if value
+        ),
+    )
+    filtered = _filter_employees(archived_employees, search_text)
+    st.caption(
+        f"Showing {len(filtered)} of {len(archived_employees)} archived employee record(s)."
+    )
+    if not filtered:
+        st.info("No archived employee matches the current search.")
+        return
+
+    archive_rows = [
+        {
+            "Employee Number": employee.employee_number,
+            "Employee Name": employee.full_name,
+            "Hired Date": employee.hire_date.isoformat() if employee.hire_date else "N/A",
+            "Years of Service": _display_value(employee.years_of_service),
+            "Department": _display_value(employee.department.name if employee.department else None),
+            "Position": _display_value(employee.job_title),
+            "Email": _display_value(employee.work_email),
+            "Account": "Inactive",
+            "Archived Date": (
+                employee.archived_at.strftime("%Y-%m-%d %I:%M %p")
+                if employee.archived_at
+                else "N/A"
+            ),
+        }
+        for employee in filtered
+    ]
+    _render_employee_workspace_table(
+        archive_rows,
+        aria_label="Scrollable archived employee list",
+        min_width=1420,
+        max_height=390,
+    )
+
+    with st.expander("Restore Archived Employee", expanded=False):
+        options = {
+            f"{employee.employee_number} — {employee.full_name}": employee.id
+            for employee in filtered
+        }
+        selected_label = st.selectbox(
+            "Select Archived Employee",
+            options=list(options),
+            key="employee_archive_restore_selection",
+        )
+        selected_id = options[selected_label]
+        confirmed = st.checkbox(
+            "Restore this employee as Employed and reactivate the linked login account.",
+            key=f"employee_archive_restore_confirm_{selected_id}",
+        )
+        restore_clicked = st.button(
+            "Restore Employee Record",
+            type="primary",
+            width="stretch",
+            disabled=not confirmed,
+            key=f"employee_archive_restore_button_{selected_id}",
+        )
+        if restore_clicked:
+            try:
+                with st.spinner("Restoring employee and linked account…"):
+                    with SessionFactory() as session:
+                        restored = AdminManagementService(session).restore_archived_employee(
+                            company_id=current_user.company_id,
+                            employee_id=selected_id,
+                            current_user_id=current_user.user_id,
+                        )
+                st.session_state.pop(f"employee_archive_restore_confirm_{selected_id}", None)
+                set_operation_feedback(
+                    f"Employee restored successfully: {restored.employee_number} — {restored.full_name}"
+                )
+                st.rerun()
+            except ValueError as error:
+                render_action_warning(error)
 
 
 def render_employees_page(
@@ -1242,28 +1722,61 @@ def render_employees_page(
 
     st.title("Employees")
     st.caption(
-        "Manage employee information, training, login account, and "
-        "clearance in one place."
+        "Manage employee information, training, login accounts, onboarding, "
+        "benefits, and clearance in one place."
     )
 
     # Show the completed result after Streamlit refreshes the page.
     render_operation_feedback()
 
     with SessionFactory() as session:
-        employees = AdminManagementService(
-            session
-        ).list_employees(current_user.company_id)
+        service = AdminManagementService(session)
+        employees = service.list_employees(current_user.company_id)
+        archived_employees = service.list_archived_employees(current_user.company_id)
+        history_rows = service.list_employee_history(current_user.company_id)
+        users = service.list_users(current_user.company_id)
+        user_labels = {
+            user.id: (
+                user.employee.full_name
+                if user.employee is not None
+                else user.username
+            )
+            for user in users
+        }
 
-    list_tab, add_tab, edit_tab = st.tabs(
+    pending_tab = st.session_state.pop("employees_pending_active_tab", None)
+    if pending_tab in {
+        "Employee List",
+        "Add Employee",
+        "Edit Employee",
+        "Onboarding Management",
+        "History",
+        f"Archive ({len(archived_employees)})",
+    }:
+        st.session_state["employees_active_tab"] = pending_tab
+
+    (
+        list_tab,
+        add_tab,
+        edit_tab,
+        onboarding_tab,
+        history_tab,
+        archive_tab,
+    ) = st.tabs(
         [
             "Employee List",
             "Add Employee",
             "Edit Employee",
-        ]
+            "Onboarding Management",
+            "History",
+            f"Archive ({len(archived_employees)})",
+        ],
+        key="employees_active_tab",
+        on_change="rerun",
     )
 
     with list_tab:
-        _render_employee_list(employees)
+        _render_employee_list(current_user, employees, users)
 
     with add_tab:
         _render_add_employee(
@@ -1276,3 +1789,12 @@ def render_employees_page(
             current_user,
             employees,
         )
+
+    with onboarding_tab:
+        render_onboarding_management(current_user)
+
+    with history_tab:
+        _render_employee_history(history_rows, user_labels)
+
+    with archive_tab:
+        _render_employee_archive(current_user, archived_employees)

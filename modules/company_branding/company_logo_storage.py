@@ -11,10 +11,133 @@ Security rules:
 """
 
 from io import BytesIO
+import colorsys
+import math
 import os
 from pathlib import Path
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+
+def extract_logo_theme_colors(
+    image_bytes: bytes,
+    *,
+    max_colors: int = 4,
+) -> list[str]:
+    """Return useful accent-color suggestions sampled from a logo.
+
+    Transparent, nearly white, nearly black, and low-saturation pixels are
+    de-prioritized so the result favors actual brand colors instead of the
+    logo canvas or text. The function never stores the image.
+    """
+
+    if not image_bytes or max_colors <= 0:
+        return []
+
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+            image.thumbnail((240, 240), resampling)
+            pixels = []
+
+            pixel_data = (
+                image.get_flattened_data()
+                if hasattr(image, "get_flattened_data")
+                else image.getdata()
+            )
+
+            for red, green, blue, alpha in pixel_data:
+                if alpha < 48:
+                    continue
+
+                maximum = max(red, green, blue)
+                minimum = min(red, green, blue)
+                brightness = (red + green + blue) / 3
+                saturation = (
+                    (maximum - minimum) / maximum
+                    if maximum
+                    else 0.0
+                )
+
+                if brightness >= 245 and saturation < 0.15:
+                    continue
+
+                if brightness <= 22 and saturation < 0.20:
+                    continue
+
+                pixels.append((red, green, blue))
+
+    except (UnidentifiedImageError, OSError, SyntaxError):
+        return []
+
+    if not pixels:
+        return []
+
+    sample = Image.new("RGB", (len(pixels), 1))
+    sample.putdata(pixels)
+    quantized = sample.quantize(
+        colors=min(16, max(6, max_colors * 3)),
+        method=Image.Quantize.MEDIANCUT,
+    )
+    palette = quantized.getpalette() or []
+    ranked = sorted(
+        quantized.getcolors() or [],
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    candidates: list[tuple[float, tuple[int, int, int]]] = []
+
+    for count, palette_index in ranked:
+        offset = palette_index * 3
+
+        if offset + 2 >= len(palette):
+            continue
+
+        rgb = tuple(palette[offset:offset + 3])
+        red, green, blue = rgb
+        _, saturation, value = colorsys.rgb_to_hsv(
+            red / 255,
+            green / 255,
+            blue / 255,
+        )
+
+        # Brand accents should be visible on both light and dark surfaces.
+        if saturation < 0.16 or value < 0.16 or value > 0.97:
+            continue
+
+        score = count * (0.55 + saturation)
+        candidates.append((score, rgb))
+
+    if not candidates:
+        for count, palette_index in ranked:
+            offset = palette_index * 3
+
+            if offset + 2 < len(palette):
+                candidates.append(
+                    (float(count), tuple(palette[offset:offset + 3]))
+                )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected: list[tuple[int, int, int]] = []
+
+    for _, rgb in candidates:
+        if any(
+            math.dist(rgb, existing) < 52
+            for existing in selected
+        ):
+            continue
+
+        selected.append(rgb)
+
+        if len(selected) >= max_colors:
+            break
+
+    return [
+        "#{:02X}{:02X}{:02X}".format(*rgb)
+        for rgb in selected
+    ]
 
 
 class CompanyLogoStorage:

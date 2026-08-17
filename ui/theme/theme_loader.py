@@ -15,8 +15,8 @@ import base64
 from pathlib import Path
 
 import streamlit as st
-import streamlit.components.v1 as components
 
+from ui.components.browser_bridge import render_browser_bridge
 from ui.theme.color_palette import build_accent_palette
 from ui.theme.design_tokens import DARK_THEME, LIGHT_THEME
 from ui.theme.theme_state import get_active_theme
@@ -145,11 +145,7 @@ def _synchronize_theme_with_browser(
         </script>
     """.replace("__ACTIVE_THEME__", active_theme)
 
-    components.html(
-        script,
-        height=0,
-        width=0,
-    )
+    render_browser_bridge(script)
 
 
 def _enforce_input_value_contrast(
@@ -443,25 +439,38 @@ def _enforce_input_value_contrast(
                 );
 
                 surfaces.forEach((surface) => {
+                    const isCalendar = surface.matches(
+                        '[data-baseweb="calendar"]'
+                    );
+                    const surfaceBackground = isCalendar
+                        ? '#FFFFFF'
+                        : inputBackground;
+                    const surfaceText = isCalendar
+                        ? '#172033'
+                        : inputText;
+                    const surfaceBorder = isCalendar
+                        ? '#D7DEE8'
+                        : borderColor;
+
                     setImportant(
                         surface,
                         'background',
-                        inputBackground
+                        surfaceBackground
                     );
                     setImportant(
                         surface,
                         'background-color',
-                        inputBackground
+                        surfaceBackground
                     );
                     setImportant(
                         surface,
                         'color',
-                        inputText
+                        surfaceText
                     );
                     setImportant(
                         surface,
                         'border-color',
-                        borderColor
+                        surfaceBorder
                     );
                     setImportant(
                         surface,
@@ -472,11 +481,39 @@ def _enforce_input_value_contrast(
                     surface
                         .querySelectorAll('*')
                         .forEach((element) => {
+                            const selectedCalendarItem = (
+                                isCalendar
+                                && (
+                                    element.matches(
+                                        '[aria-selected="true"],'
+                                        + '[data-selected="true"]'
+                                    )
+                                    || element.closest(
+                                        '[aria-selected="true"],'
+                                        + '[data-selected="true"]'
+                                    )
+                                )
+                            );
+                            const disabledCalendarItem = (
+                                isCalendar
+                                && (
+                                    element.matches('[aria-disabled="true"]')
+                                    || element.closest('[aria-disabled="true"]')
+                                )
+                            );
+                            const elementColor = selectedCalendarItem
+                                ? '#FFFFFF'
+                                : disabledCalendarItem
+                                    ? '#98A2B3'
+                                    : surfaceText;
+
                             if (element.tagName === 'SVG') {
                                 setImportant(
                                     element,
                                     'color',
-                                    iconColor
+                                    isCalendar
+                                        ? elementColor
+                                        : iconColor
                                 );
                                 setImportant(
                                     element,
@@ -489,12 +526,12 @@ def _enforce_input_value_contrast(
                             setImportant(
                                 element,
                                 'color',
-                                inputText
+                                elementColor
                             );
                             setImportant(
                                 element,
                                 '-webkit-text-fill-color',
-                                inputText
+                                elementColor
                             );
                         });
                 });
@@ -1242,11 +1279,7 @@ const applyLightControls = () => {
         .replace("__TEXT_PRIMARY__", tokens["text_primary"])
     )
 
-    components.html(
-        script,
-        height=0,
-        width=0,
-    )
+    render_browser_bridge(script)
 
 
 
@@ -1294,7 +1327,7 @@ def _install_native_copy_shortcut_guard() -> None:
         </script>
     """
 
-    components.html(script, height=0, width=0)
+    render_browser_bridge(script)
 
 def apply_theme(
     primary_color: str | None = None,
@@ -1452,6 +1485,16 @@ def apply_theme(
         width: 285px !important;
         min-width: 285px !important;
         max-width: 285px !important;
+    }}
+
+    [data-testid="stSidebarHeader"] {{
+        display: none !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
     }}
 
     /* Hide collapse/open controls across supported Streamlit versions. */
@@ -1658,7 +1701,21 @@ def apply_theme(
    Larger transparent logo area with consistent aspect-ratio-safe sizing.
 ========================================================= */
 [data-testid="stSidebarUserContent"] {{
-    padding-top: 0.45rem !important;
+    min-height: 100vh !important;
+    min-height: 100dvh !important;
+    padding-top: 2.00rem !important;
+    padding-bottom: 0.75rem !important;
+
+    display: flex !important;
+    flex-direction: column !important;
+    box-sizing: border-box !important;
+}}
+
+[data-testid="stSidebarUserContent"] [data-testid="stVerticalBlock"] {{
+    width: 100% !important;
+    margin-top: auto !important;
+    margin-bottom: auto !important;
+    gap: 0.55rem !important;
 }}
 
 .hr-sidebar-logo-shell {{
@@ -1666,7 +1723,7 @@ def apply_theme(
     height: 132px;
     min-height: 132px;
     max-height: 132px;
-    margin: 0 0 8px 0;
+    margin: 0 0 2px 0;
     padding: 0;
 
     display: flex;
@@ -1711,8 +1768,31 @@ def apply_theme(
 
     .hr-brand {{
         color: var(--hr-primary-text);
-        font-size: 1.25rem;
-        font-weight: 750;
+        font-size: 1.38rem;
+        line-height: 1.2;
+        font-weight: 780;
+        text-align: center;
+        margin: 0.1rem 0 0.25rem;
+    }}
+
+    .hr-admin-nav-spacer,
+    .hr-employee-nav-spacer {{
+        width: 100%;
+        height: 28px;
+        min-height: 28px;
+        pointer-events: none;
+    }}
+
+    section[data-testid="stSidebar"] div.stButton > button {{
+        box-shadow:
+            0 3px 8px rgba(30, 41, 59, 0.09),
+            0 1px 2px rgba(30, 41, 59, 0.06) !important;
+    }}
+
+    section[data-testid="stSidebar"] div.stButton > button:hover {{
+        box-shadow:
+            0 5px 12px rgba(30, 41, 59, 0.12),
+            0 2px 4px rgba(30, 41, 59, 0.07) !important;
     }}
 
     .hr-card-title,
@@ -2137,8 +2217,7 @@ div[data-baseweb="select"] svg {{
 
 [data-baseweb="popover"] [role="listbox"],
 [data-baseweb="popover"] [role="menu"],
-[data-baseweb="menu"],
-[data-baseweb="calendar"] {{
+[data-baseweb="menu"] {{
     color: #FFFFFF !important;
     background: #252630 !important;
     background-color: #252630 !important;
@@ -2149,8 +2228,7 @@ div[data-baseweb="select"] svg {{
 
 [data-baseweb="popover"] [role="listbox"] *,
 [data-baseweb="popover"] [role="menu"] *,
-[data-baseweb="menu"] *,
-[data-baseweb="calendar"] * {{
+[data-baseweb="menu"] * {{
     color: #FFFFFF !important;
     -webkit-text-fill-color: #FFFFFF !important;
 }}
@@ -2163,6 +2241,60 @@ div[data-baseweb="select"] svg {{
     -webkit-text-fill-color: #FFFFFF !important;
     background: var(--hr-primary) !important;
     background-color: var(--hr-primary) !important;
+}}
+
+/* The date picker is a light, high-contrast surface even though its closed
+   input intentionally keeps the approved dark-control appearance. */
+[data-baseweb="calendar"] {{
+    color: #172033 !important;
+    background: #FFFFFF !important;
+    background-color: #FFFFFF !important;
+    border: 1px solid #D7DEE8 !important;
+    color-scheme: light !important;
+    box-shadow: 0 16px 36px rgba(24, 36, 74, 0.20) !important;
+}}
+
+[data-baseweb="calendar"] * {{
+    color: #172033 !important;
+    -webkit-text-fill-color: #172033 !important;
+}}
+
+[data-baseweb="calendar"] [role="columnheader"],
+[data-baseweb="calendar"] [role="columnheader"] * {{
+    color: #667085 !important;
+    -webkit-text-fill-color: #667085 !important;
+    font-weight: 700 !important;
+}}
+
+[data-baseweb="calendar"] button {{
+    color: #172033 !important;
+    -webkit-text-fill-color: #172033 !important;
+    background-color: transparent !important;
+    border-radius: 8px !important;
+}}
+
+[data-baseweb="calendar"] button:hover {{
+    color: var(--hr-primary-text) !important;
+    -webkit-text-fill-color: var(--hr-primary-text) !important;
+    background: var(--hr-primary-soft) !important;
+    background-color: var(--hr-primary-soft) !important;
+}}
+
+[data-baseweb="calendar"] [aria-selected="true"],
+[data-baseweb="calendar"] [aria-selected="true"] *,
+[data-baseweb="calendar"] [data-selected="true"],
+[data-baseweb="calendar"] [data-selected="true"] * {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    background: var(--hr-primary) !important;
+    background-color: var(--hr-primary) !important;
+}}
+
+[data-baseweb="calendar"] [aria-disabled="true"],
+[data-baseweb="calendar"] [aria-disabled="true"] * {{
+    color: #98A2B3 !important;
+    -webkit-text-fill-color: #98A2B3 !important;
+    opacity: 1 !important;
 }}
 
 /* Labels are outside dark controls, so they remain dark on the light page. */
@@ -3831,9 +3963,34 @@ div[class*="st-key-notification_bell_container"]
     min-width: min(460px, calc(100vw - 32px)) !important;
     max-width: min(460px, calc(100vw - 32px)) !important;
     max-height: min(620px, calc(100vh - 150px)) !important;
+    overflow: hidden !important;
+    z-index: 10030 !important;
+}}
+
+.st-key-notification_scroll_area {{
+    width: 100% !important;
+    max-height: min(430px, calc(100vh - 300px)) !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
-    z-index: 10030 !important;
+    padding-right: 4px !important;
+    scrollbar-gutter: stable !important;
+}}
+
+.st-key-notification_action_footer {{
+    position: relative !important;
+    z-index: 4 !important;
+    flex: 0 0 auto !important;
+    width: 100% !important;
+    margin-top: 2px !important;
+    padding-top: 10px !important;
+    background: #FFFFFF !important;
+    border-top: 1px solid #E2E7EF !important;
+    box-shadow: 0 -8px 14px rgba(255, 255, 255, 0.92) !important;
+}}
+
+.st-key-notification_action_footer
+[data-testid="stVerticalBlock"] {{
+    gap: 0 !important;
 }}
 
 /* Clickable notification cards. */
@@ -3904,8 +4061,8 @@ div[class*="st-key-notification_item_"]
 
 .st-key-notification_dropdown_panel
 .hr-notification-header {{
-    position: sticky !important;
-    top: -12px !important;
+    position: relative !important;
+    top: auto !important;
     z-index: 2 !important;
     padding-top: 12px !important;
     background: #FFFFFF !important;
@@ -4059,6 +4216,380 @@ div[class*="st-key-employee_policy_content_"]
     color: var(--hr-text-primary) !important;
     -webkit-text-fill-color: var(--hr-text-primary) !important;
     opacity: 1 !important;
+}}
+
+/* =========================================================
+   STREAMLIT 1.61 INPUT SURFACE COMPATIBILITY — v8.8.90
+   Restore the approved dark controls after internal wrapper changes.
+========================================================= */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stTimeInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stSelectbox"] [role="combobox"],
+[data-testid="stMultiSelect"] [role="combobox"] {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    caret-color: #FFFFFF !important;
+    background: #252630 !important;
+    background-color: #252630 !important;
+    border-color: #3A3D4A !important;
+    border-radius: 10px !important;
+    color-scheme: dark !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stTextInput"] div:has(> input),
+[data-testid="stNumberInput"] div:has(> input),
+[data-testid="stDateInput"] div:has(> input),
+[data-testid="stTimeInput"] div:has(> input),
+[data-testid="stTextArea"] div:has(> textarea),
+[data-testid="stSelectbox"] div:has(> [role="combobox"]),
+[data-testid="stMultiSelect"] div:has(> [role="combobox"]) {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    background: #252630 !important;
+    background-color: #252630 !important;
+    border-color: #3A3D4A !important;
+    border-radius: 10px !important;
+    color-scheme: dark !important;
+}}
+
+[data-testid="stSelectbox"] [role="combobox"] *,
+[data-testid="stMultiSelect"] [role="combobox"] *,
+[data-testid="stSelectbox"] div:has(> [role="combobox"]) *,
+[data-testid="stMultiSelect"] div:has(> [role="combobox"]) * {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stTextInput"] input::placeholder,
+[data-testid="stNumberInput"] input::placeholder,
+[data-testid="stDateInput"] input::placeholder,
+[data-testid="stTimeInput"] input::placeholder,
+[data-testid="stTextArea"] textarea::placeholder,
+[data-testid="stSelectbox"] [role="combobox"]::placeholder,
+[data-testid="stMultiSelect"] [role="combobox"]::placeholder {{
+    color: #B9BED0 !important;
+    -webkit-text-fill-color: #B9BED0 !important;
+    opacity: 0.86 !important;
+}}
+
+[data-testid="stTextInput"] input:disabled,
+[data-testid="stNumberInput"] input:disabled,
+[data-testid="stDateInput"] input:disabled,
+[data-testid="stTimeInput"] input:disabled,
+[data-testid="stTextArea"] textarea:disabled,
+[data-testid="stSelectbox"] [aria-disabled="true"],
+[data-testid="stMultiSelect"] [aria-disabled="true"] {{
+    color: #D6D9E3 !important;
+    -webkit-text-fill-color: #D6D9E3 !important;
+    background: #252630 !important;
+    background-color: #252630 !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stTextInput"] div:has(> input):hover,
+[data-testid="stNumberInput"] div:has(> input):hover,
+[data-testid="stDateInput"] div:has(> input):hover,
+[data-testid="stTimeInput"] div:has(> input):hover,
+[data-testid="stTextArea"] div:has(> textarea):hover,
+[data-testid="stSelectbox"] div:has(> [role="combobox"]):hover,
+[data-testid="stMultiSelect"] div:has(> [role="combobox"]):hover {{
+    background: #2D2F3A !important;
+    background-color: #2D2F3A !important;
+    border-color: var(--hr-primary) !important;
+}}
+
+[data-testid="stTextInput"] div:has(> input):focus-within,
+[data-testid="stNumberInput"] div:has(> input):focus-within,
+[data-testid="stDateInput"] div:has(> input):focus-within,
+[data-testid="stTimeInput"] div:has(> input):focus-within,
+[data-testid="stTextArea"] div:has(> textarea):focus-within,
+[data-testid="stSelectbox"] div:has(> [role="combobox"]):focus-within,
+[data-testid="stMultiSelect"] div:has(> [role="combobox"]):focus-within {{
+    background: #252630 !important;
+    background-color: #252630 !important;
+    border-color: var(--hr-primary-text) !important;
+    box-shadow: 0 0 0 1px var(--hr-primary) !important;
+}}
+
+/* =========================================================
+   NATIVE-LOOK PERSISTENT ADMIN TABS — v8.8.85
+   Keep session-backed navigation while matching the former st.tabs look.
+========================================================= */
+.st-key-company_profile_active_tab [data-testid="stSegmentedControl"],
+.st-key-employees_active_tab [data-testid="stSegmentedControl"],
+.st-key-policies_active_tab [data-testid="stSegmentedControl"],
+.st-key-company_forms_active_tab [data-testid="stSegmentedControl"] {{
+    width: max-content !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}}
+
+.st-key-company_profile_active_tab [data-testid="stSegmentedControl"] button,
+.st-key-employees_active_tab [data-testid="stSegmentedControl"] button,
+.st-key-policies_active_tab [data-testid="stSegmentedControl"] button,
+.st-key-company_forms_active_tab [data-testid="stSegmentedControl"] button {{
+    min-height: 42px !important;
+    padding: 0.55rem 0.9rem !important;
+    color: var(--hr-text-primary) !important;
+    -webkit-text-fill-color: var(--hr-text-primary) !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: inset 0 -1px 0 var(--hr-border) !important;
+    font-weight: 500 !important;
+}}
+
+.st-key-company_profile_active_tab [data-testid="stSegmentedControl"] button:hover,
+.st-key-employees_active_tab [data-testid="stSegmentedControl"] button:hover,
+.st-key-policies_active_tab [data-testid="stSegmentedControl"] button:hover,
+.st-key-company_forms_active_tab [data-testid="stSegmentedControl"] button:hover {{
+    color: var(--hr-primary-text) !important;
+    -webkit-text-fill-color: var(--hr-primary-text) !important;
+    background: transparent !important;
+    box-shadow: inset 0 -2px 0 rgba(var(--hr-primary-rgb), 0.42) !important;
+}}
+
+.st-key-company_profile_active_tab [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+.st-key-company_profile_active_tab [data-testid="stSegmentedControl"] button[aria-checked="true"],
+.st-key-employees_active_tab [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+.st-key-employees_active_tab [data-testid="stSegmentedControl"] button[aria-checked="true"],
+.st-key-policies_active_tab [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+.st-key-policies_active_tab [data-testid="stSegmentedControl"] button[aria-checked="true"],
+.st-key-company_forms_active_tab [data-testid="stSegmentedControl"] button[aria-pressed="true"],
+.st-key-company_forms_active_tab [data-testid="stSegmentedControl"] button[aria-checked="true"] {{
+    color: var(--hr-primary-text) !important;
+    -webkit-text-fill-color: var(--hr-primary-text) !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    box-shadow: inset 0 -3px 0 var(--hr-primary) !important;
+    font-weight: 650 !important;
+}}
+
+/* Streamlit 1.50 renders segmented controls through BaseWeb button groups. */
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] {{
+    width: max-content !important;
+    max-width: 100% !important;
+    gap: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}}
+
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] button {{
+    min-height: 42px !important;
+    padding: 0.55rem 0.9rem !important;
+    color: var(--hr-text-primary) !important;
+    -webkit-text-fill-color: var(--hr-text-primary) !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: inset 0 -1px 0 var(--hr-border) !important;
+    font-weight: 500 !important;
+}}
+
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] button * {{
+    color: inherit !important;
+    -webkit-text-fill-color: inherit !important;
+}}
+
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] button:hover {{
+    color: var(--hr-primary-text) !important;
+    -webkit-text-fill-color: var(--hr-primary-text) !important;
+    background: transparent !important;
+    box-shadow: inset 0 -2px 0 rgba(var(--hr-primary-rgb), 0.42) !important;
+}}
+
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] button[aria-pressed="true"],
+:is(
+    .st-key-company_profile_active_tab,
+    .st-key-employees_active_tab,
+    .st-key-policies_active_tab,
+    .st-key-company_forms_active_tab
+) [data-baseweb="button-group"] button[aria-checked="true"] {{
+    color: var(--hr-primary-text) !important;
+    -webkit-text-fill-color: var(--hr-primary-text) !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    box-shadow: inset 0 -3px 0 var(--hr-primary) !important;
+    font-weight: 650 !important;
+}}
+
+/* =========================================================
+   CHAT ASSISTANT ALIGNMENT + INPUT CONTRAST — v8.8.120
+   Keep assistant responses on the left and move each signed-in user's
+   question to the right without changing message behavior.
+========================================================= */
+
+[data-testid="stChatMessage"]:has(
+    [data-testid="stChatMessageAvatarUser"]
+) {{
+    width: fit-content !important;
+    max-width: min(72%, 760px) !important;
+    margin-left: auto !important;
+    margin-right: 0 !important;
+    flex-direction: row-reverse !important;
+}}
+
+[data-testid="stChatMessage"]:has(
+    [data-testid="stChatMessageAvatarUser"]
+) [data-testid="stMarkdownContainer"] {{
+    text-align: right !important;
+}}
+
+/*
+   Render the whole Chat Assistant input as one dark rounded field. The keyed
+   Streamlit element wrapper must remain transparent so no white outer panel
+   appears around the native chat input.
+*/
+div[class*="st-key-admin_hr_assistant_chat_input__"],
+div[class*="st-key-hr_assistant_chat_input__"] {{
+    padding: 0 !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+}}
+
+[data-testid="stChatInput"] {{
+    color-scheme: dark !important;
+    color: #FFFFFF !important;
+    background: #252630 !important;
+    background-color: #252630 !important;
+    border: 1px solid #252630 !important;
+    border-radius: 10px !important;
+    box-shadow: none !important;
+    overflow: hidden !important;
+    padding: 0 5px 0 12px !important;
+}}
+
+[data-testid="stChatInput"] > div,
+[data-testid="stChatInput"] div[data-baseweb="textarea"],
+[data-testid="stChatInput"] div[data-baseweb="base-input"] {{
+    background: transparent !important;
+    background-color: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+}}
+
+[data-testid="stChatInput"] div[data-baseweb="textarea"],
+[data-testid="stChatInput"] textarea {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    caret-color: #FFFFFF !important;
+    border: 0 !important;
+    box-shadow: none !important;
+}}
+
+[data-testid="stChatInput"] textarea::placeholder {{
+    color: rgba(255, 255, 255, 0.76) !important;
+    -webkit-text-fill-color: rgba(255, 255, 255, 0.76) !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stChatInput"] button {{
+    width: 34px !important;
+    min-width: 34px !important;
+    height: 34px !important;
+    min-height: 34px !important;
+    padding: 0 !important;
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    background: #101116 !important;
+    background-color: #101116 !important;
+    border: 1px solid #101116 !important;
+    border-radius: 8px !important;
+    box-shadow: none !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stChatInput"] button:hover,
+[data-testid="stChatInput"] button:focus,
+[data-testid="stChatInput"] button:disabled {{
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    background: #101116 !important;
+    background-color: #101116 !important;
+    border-color: #101116 !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stChatInput"] button > * {{
+    display: flex !important;
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
+    opacity: 1 !important;
+}}
+
+[data-testid="stChatInput"] button::before {{
+    content: none !important;
+    display: none !important;
+}}
+
+/* Keep Streamlit's original send-arrow shape; only its color is controlled. */
+[data-testid="stChatInput"] button svg {{
+    display: block !important;
+    color: #FFFFFF !important;
+    opacity: 1 !important;
+}}
+
+/* Compact Quick Action title/subtitle rhythm in both portal side panels. */
+div[class*="st-key-admin_quick_action_card_"] [data-testid="stVerticalBlock"],
+div[class*="st-key-employee_quick_action_card_"] [data-testid="stVerticalBlock"] {{
+    gap: 0.42rem !important;
+}}
+
+div[class*="st-key-admin_quick_action_card_"] [data-testid="stMarkdownContainer"] p,
+div[class*="st-key-employee_quick_action_card_"] [data-testid="stMarkdownContainer"] p {{
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}}
+
+@media (max-width: 760px) {{
+    [data-testid="stChatMessage"]:has(
+        [data-testid="stChatMessageAvatarUser"]
+    ) {{
+        max-width: 88% !important;
+    }}
 }}
 
     </style>

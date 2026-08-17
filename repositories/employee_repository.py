@@ -88,8 +88,10 @@ class EmployeeRepository(BaseRepository[Employee]):
     def list_with_details(
         self,
         company_id: int,
+        *,
+        archived: bool | None = None,
     ) -> list[Employee]:
-        """Return employee, department, manager, account, and training data."""
+        """Return detailed employees, optionally filtered by archive state."""
 
         statement = (
             select(Employee)
@@ -107,6 +109,15 @@ class EmployeeRepository(BaseRepository[Employee]):
                 Employee.employee_number,
             )
         )
+
+        if archived is True:
+            statement = statement.where(
+                Employee.employment_status == "resigned"
+            )
+        elif archived is False:
+            statement = statement.where(
+                Employee.employment_status == "employed"
+            )
 
         return list(
             self.session.scalars(statement).unique().all()
@@ -161,3 +172,28 @@ class EmployeeRepository(BaseRepository[Employee]):
         return list(
             self.session.scalars(statement).unique().all()
         )
+
+    def list_team_members(
+        self,
+        *,
+        company_id: int,
+        leader_employee_id: int,
+    ) -> list[Employee]:
+        """Return employed direct members assigned to one leader."""
+
+        statement = (
+            select(Employee)
+            .options(
+                joinedload(Employee.department),
+                joinedload(Employee.manager).joinedload(Employee.user),
+                joinedload(Employee.leader).joinedload(Employee.user),
+                joinedload(Employee.user),
+            )
+            .where(
+                Employee.company_id == company_id,
+                Employee.leader_id == leader_employee_id,
+                Employee.employment_status == "employed",
+            )
+            .order_by(Employee.last_name, Employee.first_name)
+        )
+        return list(self.session.scalars(statement).unique().all())

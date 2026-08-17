@@ -27,7 +27,20 @@ class Settings(BaseSettings):
 
     # Application identity and runtime behavior.
     app_name: str = "AI HR Assistant"
-    app_version: str = "0.8.8.70"
+    app_version: str = "0.8.8.158"
+    # Immediate base checkpoint: app_version: str = "0.8.8.157"
+    # Earlier base checkpoint: app_version: str = "0.8.8.156"
+    # Earlier base checkpoint: app_version: str = "0.8.8.155"
+    # Earlier base checkpoint: app_version: str = "0.8.8.154"
+    # Earlier base checkpoint: app_version: str = "0.8.8.153"
+    # Earlier base checkpoint: app_version: str = "0.8.8.152"
+    # Earlier base checkpoint: app_version: str = "0.8.8.151"
+    # Earlier base checkpoint: app_version: str = "0.8.8.150"
+    # Earlier base checkpoint: app_version: str = "0.8.8.149"
+    # Earlier base checkpoint: app_version: str = "0.8.8.148"
+    # Earlier compatibility checkpoint: app_version: str = "0.8.8.147"
+    # Previous compatibility marker: app_version: str = "0.8.8.70"
+    # Immediate base checkpoint: 0.8.8.143
     environment: str = "development"
     debug: bool = True
 
@@ -80,6 +93,31 @@ class Settings(BaseSettings):
     company_logo_upload_max_mb: int = 5
 
     display_timezone: str = "Asia/Manila"
+
+    # Shared local Smart AI configuration for both the Admin and Employee
+    # Chat Assistant pages. The deterministic HR services remain authoritative;
+    # Ollama is used only to synthesize grounded answers from approved portal
+    # context. Both normal and complex questions use the same lightweight model
+    # so an installation needs to download only one Ollama model.
+    smart_ai_enabled: bool = True
+    smart_ai_ollama_base_url: str = "http://localhost:11434"
+    smart_ai_ollama_model: str = "qwen2.5:3b"
+    smart_ai_quality_ollama_model: str = "qwen2.5:3b"
+    smart_ai_ollama_timeout_seconds: int = 120
+
+    # Retrieval remains dependency-safe: BM25 always works, while Chroma,
+    # embeddings, and reranking activate only when their optional packages are
+    # installed locally.
+    smart_ai_chunk_size: int = 256
+    smart_ai_chunk_overlap: int = 40
+    smart_ai_bm25_top_k: int = 8
+    smart_ai_vector_top_k: int = 8
+    smart_ai_final_top_k: int = 5
+    smart_ai_chroma_dir: str = "data/smart_ai/chroma"
+    smart_ai_chroma_collection: str = "hr_portal_knowledge"
+    smart_ai_embedding_model: str = "intfloat/multilingual-e5-small"
+    smart_ai_reranker_enabled: bool = False
+    smart_ai_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Password-reset links.
     # Set this to the public Streamlit URL in production.

@@ -85,7 +85,9 @@ def test_success_is_saved_before_each_rerun() -> None:
         "ui/pages/admin/employees_page.py"
     )
 
-    assert source.count("set_operation_feedback(") == 3
+    # Create, edit, delete, bulk import, and archive restoration all preserve
+    # a completion message across their Streamlit rerun.
+    assert source.count("set_operation_feedback(") == 5
     assert source.count("st.rerun()") >= 3
 
 

@@ -252,8 +252,9 @@ def render_selectable_admin_table(
     key: str,
     height: int = 320,
 ) -> int | None:
-    """Render a fixed-height scrollable table and return one clicked row.
+    """Render a fixed-height whole-row clickable table.
 
+    Clicking anywhere on a data row selects that row and returns its index.
     This native selectable table is used only where a row click must trigger
     an in-app action such as a secure file-preview dialog. Other administration
     tables continue to use ``render_admin_table`` for the custom HTML layout.
@@ -278,6 +279,16 @@ def render_selectable_admin_table(
                 border-radius: 14px !important;
                 background: var(--hr-surface) !important;
                 box-shadow: var(--hr-shadow) !important;
+            }}
+
+            /* Streamlit renders the selectable grid on a canvas. A pointer
+               cursor makes the whole-row preview action discoverable without
+               changing its built-in keyboard and row-selection behavior. */
+            div[class*="st-key-{scoped_key}"] [data-testid="stDataFrame"],
+            div[class*="st-key-{scoped_key}"] [data-testid="stDataFrame"] canvas,
+            div[class*="st-key-{scoped_key}"] [data-testid="stDataFrame"] [role="grid"],
+            div[class*="st-key-{scoped_key}"] [data-testid="stDataFrame"] [role="gridcell"] {{
+                cursor: pointer !important;
             }}
         </style>
         """,
@@ -308,14 +319,21 @@ def render_selectable_admin_table(
         )
     )
 
+    visible_height = min(
+        max(96, int(height)),
+        44 + (len(frame) * 42),
+    )
+
     event = st.dataframe(
         styled_frame,
         key=key,
         hide_index=True,
-        use_container_width=True,
-        height=max(180, int(height)),
+        width="stretch",
+        height=visible_height,
         row_height=42,
         on_select="rerun",
+        # Streamlit's single-row mode selects a row when any of its data cells
+        # is clicked; the selector at the left is only a visible state marker.
         selection_mode="single-row",
     )
 

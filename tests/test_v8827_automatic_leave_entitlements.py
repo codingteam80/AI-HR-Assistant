@@ -162,8 +162,8 @@ def test_base_and_five_year_entitlements(tmp_path: Path) -> None:
             year=2025,
             as_of=after_five,
         )
-        # The fifth anniversary occurs after January 1, so the +2 applies
-        # during the following January processing instead of mid-year.
+        # Five completed years remains in the 1–5 bracket. The 17-day bracket
+        # begins only when six years are complete on January 1.
         assert updated_vacation == Decimal("15.00")
         assert updated_sick == Decimal("15.00")
         assert service.calculate_annual_allocation(
@@ -171,6 +171,12 @@ def test_base_and_five_year_entitlements(tmp_path: Path) -> None:
             leave_type=vacation,
             year=2026,
             as_of=date(2026, 1, 1),
+        ) == Decimal("15.00")
+        assert service.calculate_annual_allocation(
+            employee=employee,
+            leave_type=vacation,
+            year=2027,
+            as_of=date(2027, 1, 1),
         ) == Decimal("17.00")
 
 
@@ -409,4 +415,3 @@ def test_emergency_uses_vacation_then_lwop(tmp_path: Path) -> None:
             "3 Emergency Leave (deducted from Vacation Leave) + 1 LWOP"
             == service.allocation_breakdown(approved)
         )
-

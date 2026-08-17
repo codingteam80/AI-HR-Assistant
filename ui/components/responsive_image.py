@@ -56,6 +56,7 @@ def render_responsive_image(
     caption: str | None = None,
     max_width: int = 900,
     max_height: int = 440,
+    fill_container: bool = False,
 ) -> None:
     """Display a centered, bounded image using its natural aspect ratio."""
 
@@ -70,6 +71,14 @@ def render_responsive_image(
     if prepared is None:
         st.warning(
             "The announcement image could not be displayed."
+        )
+        return
+
+    if fill_container:
+        st.image(
+            prepared,
+            caption=caption,
+            width="stretch",
         )
         return
 

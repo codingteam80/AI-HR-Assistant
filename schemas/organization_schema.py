@@ -6,7 +6,57 @@ Purpose:
 - Provide consistent length, required-field, and status validation.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+class CompanyProfileUpdate(BaseModel):
+    """Editable company identity fields shown in Company Profile."""
+
+    company_id: int
+    code: str = Field(min_length=2, max_length=50)
+    name: str = Field(min_length=2, max_length=200)
+
+    @field_validator("code")
+    @classmethod
+    def normalize_company_code(cls, value: str) -> str:
+        """Normalize login code and reject ambiguous characters."""
+
+        normalized = value.strip().upper()
+
+        if not normalized:
+            raise ValueError("Company code is required.")
+
+        if not 2 <= len(normalized) <= 50:
+            raise ValueError("Company code must be 2 to 50 characters long.")
+
+        if not normalized.isascii():
+            raise ValueError(
+                "Company code may contain only ASCII letters, numbers, "
+                "hyphens, and underscores."
+            )
+
+        if not normalized[0].isalnum() or any(
+            not (character.isalnum() or character in {"_", "-"})
+            for character in normalized
+        ):
+            raise ValueError(
+                "Company code may contain only letters, numbers, "
+                "hyphens, and underscores."
+            )
+
+        return normalized
+
+    @field_validator("name")
+    @classmethod
+    def normalize_company_name(cls, value: str) -> str:
+        """Trim the display name before persistence."""
+
+        normalized = value.strip()
+
+        if not 2 <= len(normalized) <= 200:
+            raise ValueError("Company name must be 2 to 200 characters long.")
+
+        return normalized
 
 
 class CompanyNameUpdate(BaseModel):

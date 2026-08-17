@@ -88,7 +88,7 @@ def test_standard_january_accrual_is_15_for_sl_and_vl(tmp_path: Path) -> None:
         assert Decimal(balances["BEREAVEMENT"].credit_days) == Decimal("0.00")
 
 
-def test_five_completed_years_on_january_first_receives_17(tmp_path: Path) -> None:
+def test_five_completed_years_on_january_first_remains_15(tmp_path: Path) -> None:
     factory = _factory()
     with factory() as session:
         seed = seed_initial_data(session, _settings(tmp_path))
@@ -107,8 +107,8 @@ def test_five_completed_years_on_january_first_receives_17(tmp_path: Path) -> No
             )
         )
 
-        assert Decimal(balances["VACATION"].credit_days) == Decimal("17.00")
-        assert Decimal(balances["SICK"].credit_days) == Decimal("17.00")
+        assert Decimal(balances["VACATION"].credit_days) == Decimal("15.00")
+        assert Decimal(balances["SICK"].credit_days) == Decimal("15.00")
 
 
 def test_midyear_fifth_anniversary_applies_next_january(tmp_path: Path) -> None:
@@ -146,10 +146,17 @@ def test_midyear_fifth_anniversary_applies_next_january(tmp_path: Path) -> None:
             year=2026,
             as_of=date(2026, 1, 1),
         )
+        sixth_year_january = service.calculate_annual_allocation(
+            employee=employee,
+            leave_type=vacation,
+            year=2027,
+            as_of=date(2027, 1, 1),
+        )
 
         assert before_anniversary == Decimal("15.00")
         assert after_anniversary == Decimal("15.00")
-        assert next_january == Decimal("17.00")
+        assert next_january == Decimal("15.00")
+        assert sixth_year_january == Decimal("17.00")
 
 
 def test_unused_sl_vl_becomes_next_year_beginning_credit(tmp_path: Path) -> None:

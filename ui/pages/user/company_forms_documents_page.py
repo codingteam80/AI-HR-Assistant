@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -11,6 +12,9 @@ from database.session import SessionFactory
 from services.company_form_service import (
     ALLOWED_SUBMISSION_EXTENSIONS,
     CompanyFormService,
+)
+from ui.components.company_form_download import (
+    prepare_editable_company_form_download,
 )
 from ui.components.data_table import render_selectable_admin_table
 from ui.components.file_preview import render_file_preview_dialog
@@ -20,7 +24,7 @@ from ui.components.operation_feedback import (
 )
 
 
-EMPLOYEE_FORM_TABS = ["View", "Download", "Fill / Submit"]
+EMPLOYEE_FORM_TABS = ["View", "Download", "Fill / Submit", "My Documents"]
 NEXT_TAB_KEY = "employee_company_forms_next_tab"
 PREVIEW_STATE_KEY = "employee_company_forms_preview_target"
 VIEW_TABLE_VERSION_KEY = "employee_company_forms_view_table_version"
@@ -128,7 +132,7 @@ def _render_pending_preview(current_user: AuthenticatedUser) -> None:
                 )
     except (ValueError, FileNotFoundError) as error:
         st.session_state[PREVIEW_STATE_KEY] = None
-        st.error(str(error))
+        render_action_warning(error)
         return
 
     render_file_preview_dialog(
@@ -150,7 +154,7 @@ def _render_view(
         st.subheader("Available Company Forms")
         st.caption(
             "Only active forms uploaded by your company are shown. Use the "
-            "Download tab to obtain the original template."
+            "Download tab to obtain an editable template."
         )
         if not forms:
             st.info("No company forms are currently available.")
@@ -206,16 +210,33 @@ def _render_download(
                 else "This document is download-only."
             )
         )
-        with SessionFactory() as session:
-            download = CompanyFormService(session).get_form_download(
-                company_id=current_user.company_id,
-                form_id=selected.id,
+        try:
+            with SessionFactory() as session:
+                original_download = CompanyFormService(
+                    session
+                ).get_form_download(
+                    company_id=current_user.company_id,
+                    form_id=selected.id,
+                )
+            download = prepare_editable_company_form_download(
+                filename=original_download.filename,
+                mime_type=original_download.mime_type,
+                data=original_download.data,
+            )
+        except (ValueError, FileNotFoundError) as error:
+            render_action_warning(error)
+            return
+
+        if original_download.filename.lower().endswith(".pdf"):
+            st.caption(
+                "The stored PDF remains unchanged. Download Form provides an "
+                "editable Word (.docx) copy."
             )
 
         preview_column, download_column = st.columns(2)
         if preview_column.button(
             "View Form",
-            use_container_width=True,
+            width="stretch",
             key=f"employee_preview_company_form_{selected.id}",
         ):
             _queue_preview(
@@ -224,12 +245,12 @@ def _render_download(
                 table_version_key="employee_download_preview_version",
             )
         download_column.download_button(
-            "Download Original Form",
+            "Download Form",
             data=download.data,
             file_name=download.filename,
             mime=download.mime_type,
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key=f"employee_download_company_form_{selected.id}",
         )
 
@@ -237,12 +258,11 @@ def _render_download(
 def _render_fill_submit(
     current_user: AuthenticatedUser,
     forms,
-    submissions,
 ) -> None:
-    """Upload a completed copy and display the employee's own history."""
+    """Upload one completed company form for administrator review."""
 
     settings = get_settings()
-    with st.container(height=720, border=True):
+    with st.container(height=720, border=False):
         st.subheader("Fill / Submit Completed Form")
         eligible_forms = [
             item for item in forms if item.allow_employee_submission
@@ -288,7 +308,7 @@ def _render_fill_submit(
                 submit = st.form_submit_button(
                     "Submit Filled Form",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
             if submit:
@@ -315,13 +335,24 @@ def _render_fill_submit(
                             "Your completed form was submitted and administrators were notified.",
                             namespace="employee_company_forms",
                         )
-                        st.session_state[NEXT_TAB_KEY] = "Fill / Submit"
+                        st.session_state[NEXT_TAB_KEY] = "My Documents"
                         st.rerun()
                     except ValueError as error:
-                        st.error(str(error))
+                        render_action_warning(error)
 
-        st.divider()
+
+def _render_my_documents(
+    current_user: AuthenticatedUser,
+    submissions,
+) -> None:
+    """Display only the signed-in employee's submitted form copies."""
+
+    with st.container(height=620, border=False):
         st.subheader("My Submitted Forms")
+        st.caption(
+            "Review the forms you submitted to administrators, including "
+            "their current status and any administrator note."
+        )
         if not submissions:
             st.info("You have not submitted a completed company form yet.")
             return
@@ -370,7 +401,7 @@ def _render_fill_submit(
         preview_column, download_column = st.columns(2)
         if preview_column.button(
             "View My Submitted Copy",
-            use_container_width=True,
+            width="stretch",
             key=f"employee_preview_submission_{selected_id}",
         ):
             _queue_preview(
@@ -383,7 +414,7 @@ def _render_fill_submit(
             data=download.data,
             file_name=download.filename,
             mime=download.mime_type,
-            use_container_width=True,
+            width="stretch",
             key=f"employee_download_submission_{selected_id}",
         )
 
@@ -412,12 +443,27 @@ def render_employee_company_forms_documents_page(
             else []
         )
 
-    tabs = st.tabs(EMPLOYEE_FORM_TABS, default=_selected_tab())
+    requested_tab = _selected_tab()
+    if (
+        "employee_company_forms_active_tab" not in st.session_state
+        or requested_tab != "View"
+    ):
+        # Session State is the sole initial-value source for this keyed tab.
+        # Supplying both ``default`` and a stored value emits a Streamlit
+        # warning and is intentionally avoided.
+        st.session_state["employee_company_forms_active_tab"] = requested_tab
+    tabs = st.tabs(
+        EMPLOYEE_FORM_TABS,
+        key="employee_company_forms_active_tab",
+        on_change="rerun",
+    )
     with tabs[0]:
         _render_view(current_user, forms)
     with tabs[1]:
         _render_download(current_user, forms)
     with tabs[2]:
-        _render_fill_submit(current_user, forms, submissions)
+        _render_fill_submit(current_user, forms)
+    with tabs[3]:
+        _render_my_documents(current_user, submissions)
 
     _render_pending_preview(current_user)

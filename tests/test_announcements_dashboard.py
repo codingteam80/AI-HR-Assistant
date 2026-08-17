@@ -295,6 +295,10 @@ def test_admin_and_employee_routes_include_announcements() -> None:
         PROJECT_ROOT
         / "ui/layouts/user_layout.py"
     ).read_text(encoding="utf-8")
+    employee_dashboard = (
+        PROJECT_ROOT
+        / "ui/pages/user/dashboard_page.py"
+    ).read_text(encoding="utf-8")
 
     assert (
         'page == "Announcements"'
@@ -302,9 +306,10 @@ def test_admin_and_employee_routes_include_announcements() -> None:
     )
     assert "render_admin_announcements_page" in admin_layout
     assert '"Dashboard"' in user_layout
+    assert '"Announcements"' in user_layout
     assert '"Company Announcements"' in user_layout
     assert "render_employee_dashboard_page" in user_layout
-    assert "render_employee_announcements_page" not in user_layout
+    assert "render_employee_announcements_page" in employee_dashboard
 
 
 def test_employee_dashboard_is_default_and_first_navigation_item() -> None:
@@ -332,18 +337,14 @@ def test_employee_dashboard_is_default_and_first_navigation_item() -> None:
     )
 
 
-def test_dashboard_contains_full_width_announcement_sections() -> None:
+def test_announcements_have_a_separate_employee_workspace() -> None:
     source = (
-        PROJECT_ROOT
-        / "ui/pages/user/dashboard_page.py"
+        PROJECT_ROOT / "ui/pages/user/announcements_page.py"
     ).read_text(encoding="utf-8")
 
     assert "Company Announcements" in source
-    assert "Featured" in source
-    assert "Latest Updates" in source
-    assert "Quick Access" not in source
-    assert "quick_access_area" not in source
-    assert "[1.0, 2.0]" in source
+    assert "Search Announcements" in source
+    assert "render_announcement_card" in source
 
 
 def test_admin_form_supports_image_and_publication_controls() -> None:
@@ -441,7 +442,7 @@ def test_admin_delete_is_archive_only() -> None:
     assert 'f"Archive ({len(archived_announcements)})"' in source
 
 
-def test_employee_dashboard_and_announcements_are_merged() -> None:
+def test_employee_announcements_are_a_dashboard_subtab() -> None:
     constants = (
         PROJECT_ROOT
         / "core/constants.py"
@@ -461,7 +462,11 @@ def test_employee_dashboard_and_announcements_are_merged() -> None:
 
     assert '"Dashboard"' in navigation
     assert '"Company Announcements"' not in navigation
+    assert '"Announcements"' not in navigation
+    assert "st.tabs(" in dashboard
+    assert 'on_change="rerun"' in dashboard
+    assert 'content: " ({unread_count})"' in dashboard
     assert "announcement_area, quick_access_area" not in dashboard
-    assert "[1.0, 2.0]" in dashboard
-    assert "dashboard_announcement_category" in dashboard
-    assert "dashboard_announcement_search" in dashboard
+    assert "dashboard_announcement_category" not in dashboard
+    assert "dashboard_announcement_search" not in dashboard
+    assert "render_announcement_card" not in dashboard

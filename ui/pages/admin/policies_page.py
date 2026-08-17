@@ -6,6 +6,7 @@ import hashlib
 import html
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -19,6 +20,7 @@ from schemas.policy_schema import (
 )
 from services.policy_service import PolicyAdminView, PolicyService
 from ui.components.data_table import render_admin_table
+from ui.components.live_search import live_search_input
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -543,7 +545,7 @@ def _render_extracted_content(view: PolicyAdminView) -> None:
         data=text.encode("utf-8"),
         file_name=_extracted_text_filename(view),
         mime="text/plain",
-        use_container_width=True,
+        width="stretch",
         key=f"download_extracted_{view.policy.id}",
     )
 
@@ -551,10 +553,14 @@ def _render_extracted_content(view: PolicyAdminView) -> None:
 def _render_sections(view: PolicyAdminView) -> None:
     """Render searchable policy sections in a bounded scroll box."""
 
-    section_search = st.text_input(
+    section_search = live_search_input(
         "Find in Sections",
         placeholder="Search a heading or extracted text...",
         key=f"section_search_{view.policy.id}",
+        suggestions=(
+            section.heading
+            for section in view.sections
+        ),
     ).strip().lower()
     matches = [
         section
@@ -611,11 +617,11 @@ def _render_original_file(current_user: AuthenticatedUser, view: PolicyAdminView
             data=download.data,
             file_name=download.filename,
             mime=download.mime_type,
-            use_container_width=True,
+            width="stretch",
             key=f"download_original_{view.policy.id}",
         )
     except (ValueError, FileNotFoundError) as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _version_rows(current_user: AuthenticatedUser, title: str):
@@ -676,7 +682,7 @@ def _render_move_to_bin(current_user: AuthenticatedUser, view: PolicyAdminView) 
         )
         submitted = st.form_submit_button(
             "Move Policy Version to Bin",
-            use_container_width=True,
+            width="stretch",
         )
     if submitted:
         if not acknowledged:
@@ -701,7 +707,7 @@ def _render_move_to_bin(current_user: AuthenticatedUser, view: PolicyAdminView) 
             )
             st.rerun()
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
 
 
 def _render_upload(current_user: AuthenticatedUser, all_versions) -> None:
@@ -773,7 +779,7 @@ def _render_upload(current_user: AuthenticatedUser, all_versions) -> None:
                 selected_existing_title=selected_title,
             )
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
         return
 
     fingerprint = hashlib.sha256(
@@ -857,7 +863,7 @@ def _render_upload(current_user: AuthenticatedUser, all_versions) -> None:
     if st.button(
         "Upload and Process Policy",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=_policy_upload_widget_key(
             upload_nonce,
             "submit",
@@ -893,9 +899,9 @@ def _render_upload(current_user: AuthenticatedUser, all_versions) -> None:
             )
             st.rerun()
         except ValidationError as error:
-            st.error(error.errors()[0]["msg"])
+            render_action_warning(error)
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error("The file could not be processed. Confirm that it is readable and supported.")
 
@@ -955,7 +961,7 @@ def _render_edit_policy_details(
         submitted = st.form_submit_button(
             "Save Policy Changes",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not submitted:
@@ -987,9 +993,9 @@ def _render_edit_policy_details(
         st.rerun()
 
     except ValidationError as error:
-        st.error(error.errors()[0]["msg"])
+        render_action_warning(error)
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_upload_new_version(
@@ -1056,7 +1062,7 @@ def _render_upload_new_version(
                 selected_existing_title=policy.title,
             )
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
         return
 
     fingerprint = hashlib.sha256(
@@ -1171,7 +1177,7 @@ def _render_upload_new_version(
     if not st.button(
         "Upload New Policy Version",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=_policy_version_widget_key(
             policy.id,
             nonce,
@@ -1220,9 +1226,9 @@ def _render_upload_new_version(
         st.rerun()
 
     except ValidationError as error:
-        st.error(error.errors()[0]["msg"])
+        render_action_warning(error)
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
     except Exception:
         st.error(
             "The new policy version could not be processed."
@@ -1258,7 +1264,7 @@ def _render_permanent_delete(
         )
         submitted = st.form_submit_button(
             "Delete Policy Version Permanently",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not submitted:
@@ -1293,9 +1299,9 @@ def _render_permanent_delete(
         st.rerun()
 
     except ValidationError as error:
-        st.error(error.errors()[0]["msg"])
+        render_action_warning(error)
     except ValueError as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_policy_library(
@@ -1348,14 +1354,14 @@ def _render_policy_library(
         preview_clicked = st.button(
             "Preview Selected Policy",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="preview_selected_policy",
         )
 
     with close_column:
         close_clicked = st.button(
             "Close Preview",
-            use_container_width=True,
+            width="stretch",
             key="close_policy_library_preview",
         )
 
@@ -1402,7 +1408,7 @@ def _render_policy_library(
             _POLICY_LIBRARY_PREVIEW_STATE_KEY,
             None,
         )
-        st.error(str(error))
+        render_action_warning(error)
         return
 
     document = view.document
@@ -1444,7 +1450,7 @@ def _render_manage(current_user: AuthenticatedUser, policies) -> None:
                 policy_id=selected_id,
             )
     except ValueError as error:
-        st.error(str(error)); return
+        render_action_warning(error); return
 
     tabs = st.tabs([
         "Overview",
@@ -1541,7 +1547,7 @@ def _render_bin(current_user: AuthenticatedUser, policies, document_map) -> None
         if st.button(
             "Restore Policy Version",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         ):
             try:
                 with st.spinner(
@@ -1561,7 +1567,7 @@ def _render_bin(current_user: AuthenticatedUser, policies, document_map) -> None
                 )
                 st.rerun()
             except ValueError as error:
-                st.error(str(error))
+                render_action_warning(error)
     with tabs[5]:
         _render_permanent_delete(
             current_user,
@@ -1593,12 +1599,25 @@ def render_admin_policies_page(current_user: AuthenticatedUser) -> None:
             policies=bin_policies,
         )
 
-    policies_tab, upload_tab, manage_tab, bin_tab = st.tabs([
+    policy_tab_labels = [
         "Policies",
         "Upload Policy File",
         "Manage Existing Policy",
         f"Bin ({len(bin_policies)})",
-    ])
+    ]
+    current_policy_tab = st.session_state.get("policies_active_tab")
+    if (
+        isinstance(current_policy_tab, str)
+        and current_policy_tab.startswith("Bin (")
+        and current_policy_tab not in policy_tab_labels
+    ):
+        st.session_state["policies_active_tab"] = policy_tab_labels[-1]
+
+    policies_tab, upload_tab, manage_tab, bin_tab = st.tabs(
+        policy_tab_labels,
+        key="policies_active_tab",
+        on_change="rerun",
+    )
 
     with policies_tab:
         _render_policy_library(

@@ -1,10 +1,55 @@
 """Non-destructive upgrades for databases created by earlier checkpoints."""
 
+import time
+
 from sqlalchemy import Engine, inspect, text
+from sqlalchemy.exc import OperationalError
+
+
+_SQLITE_LOCK_RETRY_ATTEMPTS = 8
+_SQLITE_LOCK_RETRY_BASE_SECONDS = 0.10
+
+
+def _is_sqlite_lock_error(engine: Engine, exc: OperationalError) -> bool:
+    """Return True only for SQLite's temporary write-lock error."""
+
+    if engine.dialect.name != "sqlite":
+        return False
+
+    return "database is locked" in str(exc).lower()
 
 
 def upgrade_existing_schema(engine: Engine) -> None:
-    """Add new columns and normalize legacy values without deleting data."""
+    """Upgrade an existing schema, retrying temporary SQLite write locks.
+
+    Streamlit may briefly overlap database work during a rerun or application
+    restart. SQLite allows only one writer at a time, so a safe, idempotent
+    schema upgrade is retried instead of crashing the whole application.
+    """
+
+    for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
+        try:
+            _upgrade_existing_schema_once(engine)
+            return
+        except OperationalError as exc:
+            if not _is_sqlite_lock_error(engine, exc):
+                raise
+
+            if attempt >= _SQLITE_LOCK_RETRY_ATTEMPTS - 1:
+                raise
+
+            # Drop pooled connections before the next attempt so a stale
+            # connection cannot prolong the lock. Every upgrade block is
+            # idempotent, therefore restarting the upgrade is safe even when
+            # an earlier block already committed.
+            engine.dispose()
+            time.sleep(
+                _SQLITE_LOCK_RETRY_BASE_SECONDS * (attempt + 1)
+            )
+
+
+def _upgrade_existing_schema_once(engine: Engine) -> None:
+    """Add missing columns and normalize legacy values without deleting data."""
 
     inspector = inspect(engine)
     table_names = set(inspector.get_table_names())
@@ -33,14 +78,46 @@ def upgrade_existing_schema(engine: Engine) -> None:
                     )
                 )
 
-            connection.execute(
+            attendance_columns = {
+                "attendance_regular_hours": "NUMERIC(6, 2) NOT NULL DEFAULT 8.00",
+                "attendance_lunch_minutes": "INTEGER NOT NULL DEFAULT 60",
+                "work_monday": "BOOLEAN NOT NULL DEFAULT 1",
+                "work_tuesday": "BOOLEAN NOT NULL DEFAULT 1",
+                "work_wednesday": "BOOLEAN NOT NULL DEFAULT 1",
+                "work_thursday": "BOOLEAN NOT NULL DEFAULT 1",
+                "work_friday": "BOOLEAN NOT NULL DEFAULT 1",
+                "work_saturday": "BOOLEAN NOT NULL DEFAULT 0",
+                "work_sunday": "BOOLEAN NOT NULL DEFAULT 0",
+            }
+            for column_name, column_sql in attendance_columns.items():
+                if column_name not in company_columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE companies ADD COLUMN "
+                            f"{column_name} {column_sql}"
+                        )
+                    )
+
+            missing_theme_color = connection.execute(
                 text(
-                    "UPDATE companies "
-                    "SET theme_primary_color = '#4338E8' "
+                    "SELECT 1 FROM companies "
                     "WHERE theme_primary_color IS NULL "
-                    "OR trim(theme_primary_color) = ''"
+                    "OR trim(theme_primary_color) = '' "
+                    "LIMIT 1"
                 )
-            )
+            ).first()
+
+            # Do not issue a no-op UPDATE on every application startup. Even
+            # an UPDATE that changes zero rows requests SQLite's writer lock.
+            if missing_theme_color is not None:
+                connection.execute(
+                    text(
+                        "UPDATE companies "
+                        "SET theme_primary_color = '#4338E8' "
+                        "WHERE theme_primary_color IS NULL "
+                        "OR trim(theme_primary_color) = ''"
+                    )
+                )
 
     if "users" in table_names:
         user_columns = {
@@ -129,6 +206,27 @@ def upgrade_existing_schema(engine: Engine) -> None:
                     )
                 )
 
+            datetime_sql = (
+                "TIMESTAMP WITH TIME ZONE"
+                if engine.dialect.name == "postgresql"
+                else "DATETIME"
+            )
+            if "archived_at" not in employee_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employees "
+                        f"ADD COLUMN archived_at {datetime_sql}"
+                    )
+                )
+
+            if "archived_by_user_id" not in employee_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employees "
+                        "ADD COLUMN archived_by_user_id INTEGER"
+                    )
+                )
+
             # Earlier versions stored active/inactive. Preserve the records
             # while converting them to the new user-facing terms.
             connection.execute(
@@ -136,13 +234,11 @@ def upgrade_existing_schema(engine: Engine) -> None:
                     """
                     UPDATE employees
                     SET employment_status = 'employed'
-                    WHERE lower(employment_status) IN (
-                        'active',
-                        'employed'
-                    )
+                    WHERE lower(employment_status) = 'active'
                     """
                 )
             )
+
             connection.execute(
                 text(
                     """
@@ -150,10 +246,19 @@ def upgrade_existing_schema(engine: Engine) -> None:
                     SET employment_status = 'resigned'
                     WHERE lower(employment_status) IN (
                         'inactive',
-                        'resigned',
                         'terminated'
                     )
                     """
+                )
+            )
+
+            # Existing resigned rows become archived without deleting or
+            # rewriting any employee-linked records.
+            connection.execute(
+                text(
+                    "UPDATE employees SET archived_at = COALESCE("
+                    "archived_at, updated_at, CURRENT_TIMESTAMP) "
+                    "WHERE lower(employment_status) = 'resigned'"
                 )
             )
     if "hr_policies" in table_names:
@@ -269,6 +374,9 @@ def upgrade_existing_schema(engine: Engine) -> None:
                         reminder_two_weeks_sent_at = reminder_sent_at,
                         reminder_one_week_sent_at = reminder_sent_at
                     WHERE reminder_sent_at IS NOT NULL
+                      AND (reminder_one_month_sent_at IS NULL
+                           OR reminder_two_weeks_sent_at IS NULL
+                           OR reminder_one_week_sent_at IS NULL)
                     """
                 )
             )
@@ -517,6 +625,31 @@ def upgrade_existing_schema(engine: Engine) -> None:
                     "lwop_days",
                     "NUMERIC(8, 2) NOT NULL DEFAULT 0",
                 ),
+                ("filed_by_employee_id", "INTEGER"),
+                ("filed_by_user_id", "INTEGER"),
+                ("filed_on_behalf", boolean_sql),
+                ("leader_employee_id", "INTEGER"),
+                ("current_approver_employee_id", "INTEGER"),
+                ("approval_stage", "VARCHAR(30) NOT NULL DEFAULT 'manager'"),
+                ("to_emails_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("leader_comment", "TEXT"),
+                ("leader_reviewed_at", datetime_sql),
+                ("leader_reviewed_by_user_id", "INTEGER"),
+                ("cancellation_status", "VARCHAR(30) NOT NULL DEFAULT 'none'"),
+                ("cancellation_reason", "TEXT"),
+                ("cancellation_requested_at", datetime_sql),
+                ("cancellation_requested_by_user_id", "INTEGER"),
+                ("cancellation_requested_by_employee_id", "INTEGER"),
+                ("cancellation_effective_date", "DATE"),
+                ("cancellation_reviewed_at", datetime_sql),
+                ("cancellation_reviewed_by_user_id", "INTEGER"),
+                ("cancellation_comment", "TEXT"),
+                ("cancellation_restored_primary_days", "NUMERIC(8, 2) NOT NULL DEFAULT 0"),
+                ("cancellation_restored_fallback_days", "NUMERIC(8, 2) NOT NULL DEFAULT 0"),
+                ("cancellation_removed_lwop_days", "NUMERIC(8, 2) NOT NULL DEFAULT 0"),
+                ("duration_code", "VARCHAR(10) NOT NULL DEFAULT '90503'"),
+                ("reason_code", "VARCHAR(10) NOT NULL DEFAULT '0'"),
+                ("reason_other", "TEXT"),
             )
 
             for column_name, column_sql in additions:
@@ -528,6 +661,57 @@ def upgrade_existing_schema(engine: Engine) -> None:
                             f"{column_sql}"
                         )
                     )
+
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET filed_by_employee_id = employee_id "
+                    "WHERE filed_by_employee_id IS NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET duration_code = '90503' "
+                    "WHERE duration_code IS NULL OR trim(duration_code) = ''"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET reason_code = '0' "
+                    "WHERE reason_code IS NULL OR trim(reason_code) = ''"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET reason_other = reason "
+                    "WHERE reason_other IS NULL AND reason IS NOT NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET current_approver_employee_id = manager_employee_id "
+                    "WHERE current_approver_employee_id IS NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET approval_stage = 'manager' "
+                    "WHERE approval_stage IS NULL OR trim(approval_stage) = ''"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE leave_requests "
+                    "SET cancellation_status = 'none' "
+                    "WHERE cancellation_status IS NULL "
+                    "OR trim(cancellation_status) = ''"
+                )
+            )
 
             # Existing requests predate the paid-credit/LWOP split. Preserve
             # their previous behavior by assigning all paid requests to the
@@ -610,3 +794,54 @@ def upgrade_existing_schema(engine: Engine) -> None:
                         "WHERE status = 'sent_to_manager'"
                     )
                 )
+
+    # Attendance sessions preserve actual punches and quarter-hour payroll
+    # values while retaining the legacy daily summary columns.
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "attendance_records" in table_names:
+        attendance_columns = {
+            column["name"]
+            for column in inspector.get_columns("attendance_records")
+        }
+        with engine.begin() as connection:
+            for column_name, column_sql in (
+                ("leave_duration_code", "VARCHAR(10)"),
+                ("leave_hours", "NUMERIC(8, 2) NOT NULL DEFAULT 0.00"),
+                ("undertime_hours", "NUMERIC(8, 2) NOT NULL DEFAULT 0.00"),
+            ):
+                if column_name not in attendance_columns:
+                    connection.execute(
+                        text(
+                            "ALTER TABLE attendance_records "
+                            f"ADD COLUMN {column_name} {column_sql}"
+                        )
+                    )
+
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "attendance_sessions" in table_names and "attendance_records" in table_names:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO attendance_sessions (
+                        company_id, attendance_record_id, sequence_number,
+                        work_status, actual_time_in, actual_time_out,
+                        rounded_time_in, rounded_time_out, source,
+                        created_at, updated_at
+                    )
+                    SELECT ar.company_id, ar.id, 1,
+                           CASE WHEN ar.work_status IN ('WFO', 'WFH')
+                                THEN ar.work_status ELSE 'WFO' END,
+                           ar.time_in, ar.time_out, ar.time_in, ar.time_out,
+                           'legacy_migration', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM attendance_records ar
+                    WHERE ar.time_in IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM attendance_sessions session
+                          WHERE session.attendance_record_id = ar.id
+                      )
+                    """
+                )
+            )

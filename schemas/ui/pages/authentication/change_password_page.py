@@ -49,7 +49,7 @@ def render_change_password_page(
 
             submitted = st.form_submit_button(
                 "Update Password",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
 

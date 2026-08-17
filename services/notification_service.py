@@ -35,8 +35,55 @@ class NotificationService:
     def unread_count(self, *, company_id: int, user_id: int) -> int:
         return self.repository.unread_count(company_id=company_id, user_id=user_id)
 
+    def exists_for_entity_event(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        event_type: str,
+        related_entity_type: str,
+        related_entity_id: int,
+    ) -> bool:
+        """Check an entity event before creating a reminder again."""
+
+        return self.repository.exists_for_entity_event(
+            company_id=company_id,
+            user_id=user_id,
+            event_type=event_type,
+            related_entity_type=related_entity_type,
+            related_entity_id=related_entity_id,
+        )
+
     def list_recent(self, *, company_id: int, user_id: int, limit: int = 10):
         return self.repository.list_recent(company_id=company_id, user_id=user_id, limit=limit)
+
+    def unread_announcement_count(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        announcement_ids: list[int],
+    ) -> int:
+        return self.repository.unread_announcement_count(
+            company_id=company_id,
+            user_id=user_id,
+            announcement_ids=announcement_ids,
+        )
+
+    def mark_announcements_read(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        announcement_ids: list[int],
+    ) -> int:
+        """Mark announcements presented in the employee workspace read."""
+
+        return self.repository.mark_announcements_read(
+            company_id=company_id,
+            user_id=user_id,
+            announcement_ids=announcement_ids,
+        )
 
     def mark_read(
         self,

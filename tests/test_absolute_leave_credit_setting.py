@@ -255,7 +255,7 @@ def test_admin_ui_uses_absolute_non_negative_input() -> None:
     assert "negative values" not in editor.lower()
 
 
-def test_visible_breakdown_hides_adjustment_column_but_keeps_internal_total() -> None:
+def test_visible_breakdown_does_not_inflate_credit_with_adjustment() -> None:
     source = (
         PROJECT_ROOT
         / "ui/pages/admin/leave_management_page.py"
@@ -272,7 +272,8 @@ def test_visible_breakdown_hides_adjustment_column_but_keeps_internal_total() ->
     assert '"Current Credits"' in breakdown
     assert '"Adjustment":' not in breakdown
     assert "credit_days" in breakdown
-    assert "adjustment_days" in breakdown
+    assert "adjustment_days" not in breakdown
+    assert "corrections affect Available" in breakdown
 
 
 def test_employee_tab_is_named_set_leave_credits() -> None:
@@ -303,5 +304,4 @@ def test_credit_form_has_no_reason_field() -> None:
     assert "Adjustment Reason" not in editor
     assert "st.text_input(" not in editor
     assert 'reason="Manual leave credit update"' in editor
-
 

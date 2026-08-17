@@ -1,7 +1,7 @@
 """Leave credits, requests, manager email delivery, and HR monitoring."""
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import json
 from pathlib import Path
@@ -12,6 +12,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config.settings import Settings, get_settings
+from core.leave_codes import (
+    LEAVE_DURATION_OPTIONS,
+    LEAVE_REASON_OPTIONS,
+    duration_label,
+    reason_label,
+)
 from integrations.email.email_sender import (
     EmailAttachment,
     EmailDeliveryError,
@@ -27,6 +33,7 @@ from models.leave_type import LeaveType
 from models.user import User
 from modules.leave.leave_file_storage import LeaveFileStorage
 from repositories.employee_repository import EmployeeRepository
+from repositories.company_workday_repository import CompanyWorkdayRepository
 from repositories.leave_repository import (
     LeaveBalanceRepository,
     LeaveCreditTransactionRepository,
@@ -37,6 +44,8 @@ from repositories.user_repository import UserRepository
 from schemas.leave_schema import (
     LeaveCreditAdjustmentInput,
     LeaveCreditBalanceSetInput,
+    LeaveCancellationDecisionInput,
+    LeaveCancellationRequestInput,
     LeaveDecisionInput,
     LeaveRequestInput,
     LeaveTypeInput,
@@ -46,8 +55,8 @@ from services.notification_service import NotificationService
 
 DEFAULT_LEAVE_TYPES = (
     {
-        # Vacation Leave receives a 15-day January accrual. Employees who
-        # have completed five service years by January 1 receive 17 days.
+        # Vacation and Sick Leave follow the completed-tenure bracket on
+        # January 1: 15 / 17 / 20 / 23 / 26 days.
         "code": "VACATION",
         "name": "Vacation Leave",
         "annual_credits": Decimal("15.00"),
@@ -153,11 +162,14 @@ LEAVE_CREDIT_TABLE_ORDER = {
     for index, code in enumerate(LEAVE_CREDIT_TABLE_CODES)
 }
 
-SERVICE_BONUS_AFTER_YEARS = 5
-SERVICE_BONUS_DAYS = Decimal("2.00")
-SERVICE_BONUS_CODES = {"VACATION", "SICK"}
 ANNUAL_ACCRUAL_CODES = {"VACATION", "SICK"}
-ANNUAL_BASE_CREDIT = Decimal("15.00")
+ANNUAL_TENURE_CREDIT_BRACKETS = (
+    (21, Decimal("26.00")),
+    (16, Decimal("23.00")),
+    (11, Decimal("20.00")),
+    (6, Decimal("17.00")),
+    (0, Decimal("15.00")),
+)
 
 # Emergency Leave is a protected annual usage allowance inside Vacation
 # Leave. It never creates additional credits; approved EL days consume VL.
@@ -167,6 +179,7 @@ EMERGENCY_ACTIVE_STATUSES = {
     "approved",
     "in_progress",
     "completed",
+    "partially_cancelled",
 }
 
 # Event-based leave is granted only when a manager approves the related
@@ -196,6 +209,7 @@ EVENT_LEAVE_NON_REJECTED_STATUSES = {
     "approved",
     "in_progress",
     "completed",
+    "partially_cancelled",
 }
 
 # Fixed balances that may remain usable after the January annual credit.
@@ -208,6 +222,27 @@ CASH_CONVERSION_LIMITS = {
 CASH_CONVERSION_TRANSACTION = "january_cash_conversion"
 CASH_CONVERSION_LIMIT_ENFORCEMENT_TRANSACTION = (
     "cash_conversion_limit_enforcement"
+)
+
+# Vacation Leave utilization is a monitoring target during the year. It does
+# not reserve or deduct credits in advance. Only the unmet target is forfeited
+# after year end, before the remaining VL is carried into the next ledger.
+# The utilization ledger is treated as active from January 1, 2026 so
+# existing annual VL usage and the utilization Used value stay aligned.
+LEAVE_UTILIZATION_POLICY_START = date(2026, 1, 1)
+LEAVE_UTILIZATION_2026_TARGETS = {
+    Decimal("15.00"): Decimal("7.50"),
+    Decimal("17.00"): Decimal("8.50"),
+    Decimal("20.00"): Decimal("10.00"),
+    Decimal("23.00"): Decimal("11.50"),
+    Decimal("26.00"): Decimal("13.00"),
+}
+LEAVE_UTILIZATION_YEAR_END_TRANSACTION = "leave_utilization_year_end"
+LEAVE_UTILIZATION_REMINDER_DATES = (
+    (10, 1, "leave_utilization_reminder_october", "Leave utilization reminder"),
+    (11, 1, "leave_utilization_reminder_november", "Leave utilization follow-up"),
+    (12, 1, "leave_utilization_reminder_december", "Leave utilization urgent reminder"),
+    (12, 15, "leave_utilization_reminder_final", "Final leave utilization reminder"),
 )
 
 # Only exact legacy defaults are upgraded automatically. Company-specific
@@ -273,6 +308,27 @@ class EmergencyAllowanceSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class LeaveUtilizationSummary:
+    """Derived Vacation Leave utilization for one annual ledger."""
+
+    required_days: Decimal
+    used_days: Decimal
+    remaining_days: Decimal
+    forfeited_days: Decimal = Decimal("0.00")
+
+    @property
+    def display_text(self) -> str:
+        remaining = LeaveService._display_days(self.remaining_days)
+        if self.forfeited_days > 0:
+            remaining = f"{remaining} — Forfeited"
+        return (
+            f"• Required: {LeaveService._display_days(self.required_days)}\n"
+            f"• Used: {LeaveService._display_days(self.used_days)}\n"
+            f"• Remaining: {remaining}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LeaveCreditTableRow:
     """Employee-facing leave ledger row with eligibility display metadata."""
 
@@ -286,6 +342,7 @@ class LeaveCreditTableRow:
     converted_to_cash_days: Decimal
     updated_at: datetime | None
     is_applicable: bool = True
+    leave_utilization: LeaveUtilizationSummary | None = None
 
 
 class LeaveService:
@@ -303,6 +360,7 @@ class LeaveService:
         self.employee_repository = EmployeeRepository(session)
         self.user_repository = UserRepository(session)
         self.notification_service = NotificationService(session)
+        self.workday_repository = CompanyWorkdayRepository(session)
 
     def _today(self) -> date:
         return datetime.now(ZoneInfo(self.settings.display_timezone)).date()
@@ -330,6 +388,33 @@ class LeaveService:
             return Decimal("0.00")
 
         return cls._business_days(start_date, end_date)
+
+    def company_working_days(
+        self,
+        *,
+        company_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> Decimal:
+        """Count dates selected as Regular Workdays for this company."""
+
+        if end_date < start_date:
+            return Decimal("0.00")
+        saved = {
+            row.work_date: bool(row.is_workday)
+            for row in self.workday_repository.list_range(
+                company_id=company_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        }
+        count = Decimal("0.00")
+        current = start_date
+        while current <= end_date:
+            if saved.get(current, current.weekday() < 5):
+                count += Decimal("1.00")
+            current += timedelta(days=1)
+        return count
 
     @staticmethod
     def _email_for_employee(employee: Employee | None) -> str | None:
@@ -370,10 +455,368 @@ class LeaveService:
         ).quantize(Decimal("0.00"))
 
     @staticmethod
+    def _display_days(value: Decimal) -> str:
+        """Format a day value without unnecessary trailing zeroes."""
+
+        normalized = Decimal(value).quantize(Decimal("0.01"))
+        return format(normalized, "f").rstrip("0").rstrip(".") or "0"
+
+    def _leave_utilization_required_days(
+        self,
+        *,
+        balance: LeaveBalance,
+    ) -> Decimal:
+        """Return the approved VL target for the selected leave year."""
+
+        if balance.year < LEAVE_UTILIZATION_POLICY_START.year:
+            return Decimal("0.00")
+
+        annual_credit = Decimal(balance.credit_days).quantize(
+            Decimal("0.01")
+        )
+        if balance.year == LEAVE_UTILIZATION_POLICY_START.year:
+            exact_target = LEAVE_UTILIZATION_2026_TARGETS.get(
+                annual_credit
+            )
+            if exact_target is not None:
+                return exact_target
+            return self._round_to_half_day(
+                annual_credit / Decimal("2")
+            )
+
+        return self._round_to_half_day(
+            annual_credit / Decimal("2")
+        )
+
+    def _leave_utilization_used_days(
+        self,
+        *,
+        balance: LeaveBalance,
+        as_of: date,
+    ) -> Decimal:
+        """Count annual paid VL usage while excluding Emergency Leave.
+
+        ``LeaveBalance.used_days`` is the official posted annual ledger and
+        also covers safe legacy/sample data that predates request-level audit
+        rows. Emergency Leave is paid from the VL balance but is not Vacation
+        Leave utilization, so its posted usage is removed explicitly.
+        """
+
+        period_start = (
+            LEAVE_UTILIZATION_POLICY_START
+            if balance.year == LEAVE_UTILIZATION_POLICY_START.year
+            else date(balance.year, 1, 1)
+        )
+        period_end = date(balance.year, 12, 31)
+        effective_end = min(as_of, period_end)
+        if effective_end < period_start:
+            return Decimal("0.00")
+
+        emergency_used = self.emergency_allowance_summary(
+            company_id=balance.company_id,
+            employee_id=balance.employee_id,
+            year=balance.year,
+        ).used_days
+        return max(
+            Decimal("0.00"),
+            Decimal(balance.used_days) - Decimal(emergency_used),
+        ).quantize(Decimal("0.01"))
+
+    def _leave_utilization_year_end_transaction(
+        self,
+        balance: LeaveBalance,
+    ) -> LeaveCreditTransaction | None:
+        return self.session.scalar(
+            select(LeaveCreditTransaction)
+            .where(
+                LeaveCreditTransaction.leave_balance_id == balance.id,
+                LeaveCreditTransaction.transaction_type
+                == LEAVE_UTILIZATION_YEAR_END_TRANSACTION,
+            )
+            .order_by(LeaveCreditTransaction.id.desc())
+        )
+
+    def leave_utilization_summary(
+        self,
+        *,
+        balance: LeaveBalance,
+        as_of: date | None = None,
+    ) -> LeaveUtilizationSummary | None:
+        """Return VL-only utilization without mutating available credits."""
+
+        code = (balance.leave_type.code or "").strip().upper()
+        if code != "VACATION" or balance.year < 2026:
+            return None
+
+        required = self._leave_utilization_required_days(balance=balance)
+        used = self._leave_utilization_used_days(
+            balance=balance,
+            as_of=as_of or self._today(),
+        )
+        remaining = max(
+            Decimal("0.00"),
+            required - used,
+        ).quantize(Decimal("0.01"))
+        marker = self._leave_utilization_year_end_transaction(balance)
+        forfeited = (
+            abs(Decimal(marker.amount_days))
+            if marker is not None and Decimal(marker.amount_days) < 0
+            else Decimal("0.00")
+        )
+        return LeaveUtilizationSummary(
+            required_days=required,
+            used_days=used,
+            remaining_days=remaining,
+            forfeited_days=forfeited,
+        )
+
+    def _finalize_leave_utilization(
+        self,
+        *,
+        balance: LeaveBalance,
+        as_of: date,
+    ) -> LeaveUtilizationSummary | None:
+        """Forfeit one unmet VL target once the annual period has ended."""
+
+        if as_of < date(balance.year, 12, 31):
+            return None
+        existing = self._leave_utilization_year_end_transaction(balance)
+        if existing is not None:
+            return self.leave_utilization_summary(
+                balance=balance,
+                as_of=as_of,
+            )
+
+        summary = self.leave_utilization_summary(
+            balance=balance,
+            as_of=date(balance.year, 12, 31),
+        )
+        if summary is None:
+            return None
+
+        forfeited = min(
+            summary.remaining_days,
+            Decimal(balance.available_credits),
+        ).quantize(Decimal("0.01"))
+        if forfeited > 0:
+            balance.adjustment_days = (
+                Decimal(balance.adjustment_days) - forfeited
+            ).quantize(Decimal("0.01"))
+
+        self.session.add(
+            LeaveCreditTransaction(
+                company_id=balance.company_id,
+                employee_id=balance.employee_id,
+                leave_type_id=balance.leave_type_id,
+                leave_balance_id=balance.id,
+                transaction_type=LEAVE_UTILIZATION_YEAR_END_TRANSACTION,
+                amount_days=-forfeited,
+                note=(
+                    f"Vacation Leave utilization year-end {balance.year}: "
+                    f"required {summary.required_days} day(s), used "
+                    f"{summary.used_days} day(s), forfeited unmet target "
+                    f"{forfeited} day(s). The forfeiture is not carried "
+                    "over and is not converted to cash."
+                ),
+            )
+        )
+        return LeaveUtilizationSummary(
+            required_days=summary.required_days,
+            used_days=summary.used_days,
+            remaining_days=summary.remaining_days,
+            forfeited_days=forfeited,
+        )
+
+    def _leave_utilization_recipient_ids(
+        self,
+        *,
+        employee: Employee,
+    ) -> set[int]:
+        """Return employee, direct supervisors, and active administrators."""
+
+        recipients = set(
+            self.user_repository.list_active_admin_ids(
+                company_id=employee.company_id,
+            )
+        )
+        for related in (employee, employee.leader, employee.manager):
+            if (
+                related is not None
+                and related.user is not None
+                and related.user.is_active
+            ):
+                recipients.add(related.user.id)
+        return recipients
+
+    def _send_leave_utilization_notification(
+        self,
+        *,
+        balance: LeaveBalance,
+        employee: Employee,
+        event_type: str,
+        title: str,
+        message: str,
+    ) -> int:
+        """Create one idempotent utilization notification per recipient."""
+
+        created = 0
+        for user_id in self._leave_utilization_recipient_ids(
+            employee=employee,
+        ):
+            if self.notification_service.exists_for_entity_event(
+                company_id=balance.company_id,
+                user_id=user_id,
+                event_type=event_type,
+                related_entity_type="leave_balance",
+                related_entity_id=balance.id,
+            ):
+                continue
+            self.notification_service.create(
+                company_id=balance.company_id,
+                user_id=user_id,
+                event_type=event_type,
+                title=title,
+                message=message,
+                related_entity_type="leave_balance",
+                related_entity_id=balance.id,
+            )
+            created += 1
+        return created
+
+    def reconcile_leave_utilization(
+        self,
+        *,
+        company_id: int,
+        through_date: date | None = None,
+    ) -> int:
+        """Finalize due VL targets and emit non-duplicating reminders."""
+
+        selected_date = through_date or self._today()
+        changed = 0
+        balances = [
+            item
+            for item in self.balance_repository.list_company_year(
+                company_id,
+                selected_date.year,
+            )
+            if (item.leave_type.code or "").strip().upper() == "VACATION"
+        ]
+
+        # Also finalize any older VL balance that has not yet received its
+        # immutable year-end marker. This repairs safe legacy carryover on the
+        # next app open without resetting or rewriting historical records.
+        for year in range(2026, selected_date.year):
+            balances.extend(
+                item
+                for item in self.balance_repository.list_company_year(
+                    company_id,
+                    year,
+                )
+                if (item.leave_type.code or "").strip().upper() == "VACATION"
+            )
+
+        for balance in balances:
+            employee = self.employee_repository.get_with_details(
+                company_id=company_id,
+                employee_id=balance.employee_id,
+            )
+            if employee is None:
+                continue
+
+            period_end = date(balance.year, 12, 31)
+            if selected_date >= period_end:
+                was_finalized = (
+                    self._leave_utilization_year_end_transaction(balance)
+                    is not None
+                )
+                summary = self._finalize_leave_utilization(
+                    balance=balance,
+                    as_of=selected_date,
+                )
+                if summary is None:
+                    continue
+                if not was_finalized:
+                    changed += 1
+                if summary.forfeited_days > 0:
+                    changed += self._send_leave_utilization_notification(
+                        balance=balance,
+                        employee=employee,
+                        event_type="leave_utilization_forfeited",
+                        title="Leave utilization year-end result",
+                        message=(
+                            f"{employee.full_name} used "
+                            f"{self._display_days(summary.used_days)} of "
+                            f"{self._display_days(summary.required_days)} "
+                            "required Vacation Leave day(s). "
+                            f"{self._display_days(summary.forfeited_days)} "
+                            "unmet day(s) were forfeited and will not be "
+                            "carried over or converted to cash."
+                        ),
+                    )
+                continue
+
+            summary = self.leave_utilization_summary(
+                balance=balance,
+                as_of=selected_date,
+            )
+            if summary is None or selected_date < LEAVE_UTILIZATION_POLICY_START:
+                continue
+
+            if summary.remaining_days <= 0:
+                changed += self._send_leave_utilization_notification(
+                    balance=balance,
+                    employee=employee,
+                    event_type="leave_utilization_completed",
+                    title="Leave utilization target completed",
+                    message=(
+                        f"{employee.full_name} has consumed the required "
+                        f"{self._display_days(summary.required_days)} "
+                        f"Vacation Leave day(s) for {balance.year}."
+                    ),
+                )
+                continue
+
+            due_reminders = [
+                item
+                for item in LEAVE_UTILIZATION_REMINDER_DATES
+                if selected_date >= date(balance.year, item[0], item[1])
+            ]
+            if not due_reminders:
+                continue
+            _, _, event_type, title = due_reminders[-1]
+            changed += self._send_leave_utilization_notification(
+                balance=balance,
+                employee=employee,
+                event_type=event_type,
+                title=title,
+                message=(
+                    f"{employee.full_name} still needs to consume "
+                    f"{self._display_days(summary.remaining_days)} of "
+                    f"{self._display_days(summary.required_days)} required "
+                    f"Vacation Leave day(s) before December 31, {balance.year}."
+                ),
+            )
+
+        if changed:
+            self.session.commit()
+        return changed
+
+    @staticmethod
     def _annual_processing_date(year: int) -> date:
         """Return the effective date of the yearly SL/VL accrual."""
 
         return date(year, 1, 1)
+
+    @staticmethod
+    def annual_tenure_credit(completed_service_years: int) -> Decimal:
+        """Return the non-cumulative January credit for one tenure bracket."""
+
+        years = max(0, int(completed_service_years))
+        return next(
+            credit
+            for minimum_years, credit in ANNUAL_TENURE_CREDIT_BRACKETS
+            if years >= minimum_years
+        )
 
     def _allocation_reference_date(
         self,
@@ -385,7 +828,7 @@ class LeaveService:
 
         ``as_of`` is retained for compatibility with callers and tests, but a
         mid-year service anniversary must not change an already processed
-        annual credit. The +2 tenure increase is evaluated only on January 1.
+        annual credit. The tenure bracket is evaluated only on January 1.
         """
 
         return self._annual_processing_date(year)
@@ -401,9 +844,9 @@ class LeaveService:
         """Compute one employee's January SL/VL credit for a calendar year.
 
         Rules:
-        - Vacation Leave and Sick Leave receive 15 days each every January.
-        - Employees with at least five completed service years on January 1
-          receive 17 days for each of those two leave types.
+        - Vacation Leave and Sick Leave use the completed-service bracket on
+          January 1: 1–5 years = 15, 6–10 = 17, 11–15 = 20,
+          16–20 = 23, and 21+ = 26 days.
         - A service anniversary reached after January 1 applies next year.
         - The hire year keeps the accepted prorated entitlement behavior.
         - Other leave types do not receive an annual Phase 2 accrual.
@@ -422,16 +865,11 @@ class LeaveService:
             if as_of is not None and year == hire_date.year and as_of < hire_date:
                 return Decimal("0.00")
 
-        # The standard policy is fixed at 15 days. The Leave Type setting is
-        # still synchronized to 15 for existing databases by the safe default
-        # upgrade, while the computation remains explicit and auditable here.
-        allocation = ANNUAL_BASE_CREDIT
         service_years = self.completed_service_years(
             hire_date,
             processing_date,
         )
-        if service_years >= SERVICE_BONUS_AFTER_YEARS:
-            allocation += SERVICE_BONUS_DAYS
+        allocation = self.annual_tenure_credit(service_years)
 
         if hire_date is not None and year == hire_date.year:
             remaining_months = 13 - hire_date.month
@@ -1181,6 +1619,13 @@ class LeaveService:
                     ),
                     updated_at=balance.updated_at,
                     is_applicable=is_applicable,
+                    leave_utilization=(
+                        self.leave_utilization_summary(
+                            balance=balance,
+                        )
+                        if code == "VACATION" and is_applicable
+                        else None
+                    ),
                 )
             )
 
@@ -1238,19 +1683,18 @@ class LeaveService:
     ) -> Decimal:
         """Calculate the annual excess using the approved ledger formula.
 
-        Total Before Conversion = Beginning Credit + Credit + Adjustment - Used
+        Total Before Conversion = Beginning Credit + Credit + Adjustment
         Converted to Cash = max(Total Before Conversion - Limit, 0)
 
-        Reserved days are intentionally excluded from the conversion formula;
-        they remain separately deducted from usable credits until the related
-        request is approved, rejected, or cancelled.
+        Used and Reserved are intentionally excluded from conversion. They are
+        deducted from Available Credits after the fixed excess is identified,
+        so later leave usage cannot reverse a completed cash conversion.
         """
 
         total_before_conversion = (
             Decimal(balance.beginning_credit_days)
             + Decimal(balance.credit_days)
             + Decimal(balance.adjustment_days)
-            - Decimal(balance.used_days)
         )
         return max(
             Decimal("0.00"),
@@ -1384,6 +1828,37 @@ class LeaveService:
         difference = expected - current
         balance.carry_over_days = expected
         balance.beginning_credit_days = expected
+        previous_converted = Decimal(balance.converted_to_cash_days)
+        if self._cash_conversion_already_processed(balance):
+            retained_limit = self._cash_conversion_limit(leave_type)
+            if retained_limit is not None:
+                corrected_converted = self._opening_cash_conversion_amount(
+                    balance=balance,
+                    retained_limit=retained_limit,
+                )
+                if corrected_converted != previous_converted:
+                    balance.converted_to_cash_days = corrected_converted
+                    self.session.add(
+                        LeaveCreditTransaction(
+                            company_id=balance.company_id,
+                            employee_id=balance.employee_id,
+                            leave_type_id=balance.leave_type_id,
+                            leave_balance_id=balance.id,
+                            transaction_type=(
+                                "beginning_credit_conversion_recalculation"
+                            ),
+                            amount_days=-(
+                                corrected_converted - previous_converted
+                            ),
+                            note=(
+                                f"Cash conversion recalculated after "
+                                f"Beginning Credit for {year} changed from "
+                                f"{current} to {expected} day(s); converted "
+                                f"amount changed from {previous_converted} "
+                                f"to {corrected_converted} day(s)."
+                            ),
+                        )
+                    )
         self.session.add(
             LeaveCreditTransaction(
                 company_id=balance.company_id,
@@ -1426,8 +1901,39 @@ class LeaveService:
             return
 
         difference = expected - current
+        previous_converted = Decimal(balance.converted_to_cash_days)
         balance.allocated_days = expected
         self._sync_credit_table_columns(balance)
+
+        retained_limit = self._cash_conversion_limit(leave_type)
+        if retained_limit is not None:
+            corrected_converted = self._opening_cash_conversion_amount(
+                balance=balance,
+                retained_limit=retained_limit,
+            )
+            if corrected_converted != previous_converted:
+                balance.converted_to_cash_days = corrected_converted
+                self.session.add(
+                    LeaveCreditTransaction(
+                        company_id=balance.company_id,
+                        employee_id=balance.employee_id,
+                        leave_type_id=balance.leave_type_id,
+                        leave_balance_id=balance.id,
+                        transaction_type=(
+                            "tenure_bracket_conversion_recalculation"
+                        ),
+                        amount_days=-(
+                            corrected_converted - previous_converted
+                        ),
+                        note=(
+                            f"Cash conversion recalculated after the January "
+                            f"tenure credit changed from {current} to "
+                            f"{expected} day(s); converted amount changed "
+                            f"from {previous_converted} to "
+                            f"{corrected_converted} day(s)."
+                        ),
+                    )
+                )
         self.session.add(
             LeaveCreditTransaction(
                 company_id=balance.company_id,
@@ -1460,6 +1966,23 @@ class LeaveService:
         )
         if employee is None:
             raise ValueError("The employee record is unavailable.")
+
+        previous = self.balance_repository.get_balance(
+            company_id=company_id,
+            employee_id=employee_id,
+            leave_type_id=leave_type.id,
+            year=year - 1,
+        )
+        processing_date = as_of or self._today()
+        if (
+            previous is not None
+            and (leave_type.code or "").strip().upper() == "VACATION"
+            and processing_date >= date(year - 1, 12, 31)
+        ):
+            self._finalize_leave_utilization(
+                balance=previous,
+                as_of=processing_date,
+            )
 
         existing = self.balance_repository.get_balance(
             company_id=company_id,
@@ -1506,12 +2029,6 @@ class LeaveService:
             self._repair_negative_balance(existing)
             return existing
 
-        previous = self.balance_repository.get_balance(
-            company_id=company_id,
-            employee_id=employee_id,
-            leave_type_id=leave_type.id,
-            year=year - 1,
-        )
         carry_over = self._annual_beginning_credit(
             leave_type=leave_type,
             previous_balance=previous,
@@ -1611,7 +2128,6 @@ class LeaveService:
 
         # Automatic app-start processing must persist even when there are no
         # approved leave requests for the reconciliation step to commit.
-        self.session.commit()
         self.session.commit()
 
     def list_leave_types(self, company_id: int, *, active_only: bool = False) -> list[LeaveType]:
@@ -1868,7 +2384,16 @@ class LeaveService:
     def list_credit_history(self, company_id: int, employee_id: int, year: int | None = None):
         return self.transaction_repository.list_employee_year(company_id, employee_id, year or self._today().year)
 
+    def list_company_credit_history(self, company_id: int, year: int | None = None):
+        """Return immutable credit transactions for the company History tab."""
+
+        return self.transaction_repository.list_company_year(
+            company_id,
+            year or self._today().year,
+        )
+
     def _admin_cc_emails(self, company_id: int, *, exclude: set[str]) -> list[str]:
+        """Return active administrator emails for system notifications."""
         emails: list[str] = []
         for user in self.user_repository.list_with_details(company_id):
             email = (user.email or "").strip()
@@ -1877,12 +2402,256 @@ class LeaveService:
                 emails.append(email)
         return emails
 
-    def _notification_recipients(self, *, company_id: int, employee: Employee, manager: Employee | None) -> set[int]:
-        recipients: set[int] = set()
-        if employee.user_id:
-            recipients.add(employee.user_id)
-        if manager is not None and manager.user_id:
-            recipients.add(manager.user_id)
+    def list_searchable_recipients(self, company_id: int) -> list[User]:
+        """Return active company users with a registered email for type-ahead fields."""
+        return [
+            user
+            for user in self.user_repository.list_with_details(company_id)
+            if user.is_active and (user.email or "").strip()
+        ]
+
+    def list_team_members(self, *, company_id: int, leader_employee_id: int) -> list[Employee]:
+        """Return direct members that a leader may file SL/EL for."""
+        return self.employee_repository.list_team_members(
+            company_id=company_id,
+            leader_employee_id=leader_employee_id,
+        )
+
+    def list_proxy_leave_members(
+        self,
+        *,
+        company_id: int,
+        filer_employee_id: int,
+    ) -> list[Employee]:
+        """Return direct Leader and Manager reports eligible for proxy filing."""
+
+        output: dict[int, Employee] = {}
+        for employee in (
+            *self.employee_repository.list_team_members(
+                company_id=company_id,
+                leader_employee_id=filer_employee_id,
+            ),
+            *self.employee_repository.list_direct_reports(
+                company_id=company_id,
+                manager_employee_id=filer_employee_id,
+            ),
+        ):
+            if employee.employment_status == "employed":
+                output[employee.id] = employee
+        return sorted(output.values(), key=lambda item: (item.last_name, item.first_name))
+
+    def is_leader(self, *, company_id: int, employee_id: int) -> bool:
+        """Return whether an employee has active direct team members."""
+        return bool(self.list_team_members(
+            company_id=company_id,
+            leader_employee_id=employee_id,
+        ))
+
+    @staticmethod
+    def recipient_display_name(user: User) -> str:
+        """Build the searchable name/email label used by Streamlit selectors."""
+        employee = getattr(user, "employee", None)
+        name = employee.full_name if employee is not None else user.username
+        return f"{name} <{user.email}>"
+
+    def _user_by_id_with_email(self, *, company_id: int, user_id: int | None) -> User | None:
+        if user_id is None:
+            return None
+        for user in self.list_searchable_recipients(company_id):
+            if user.id == int(user_id):
+                return user
+        return None
+
+    def _employee_for_requester(self, *, company_id: int, user_id: int) -> Employee | None:
+        for user in self.user_repository.list_with_details(company_id):
+            if user.id == user_id:
+                return user.employee
+        return None
+
+    def _resolve_request_filer(
+        self,
+        *,
+        company_id: int,
+        leave_owner: Employee,
+        requested_by_user_id: int,
+        filed_by_employee_id: int | None,
+        leave_code: str,
+    ) -> tuple[Employee, bool]:
+        """Validate self-filing or direct Leader/Manager proxy filing."""
+        filer = self._employee_for_requester(
+            company_id=company_id,
+            user_id=requested_by_user_id,
+        )
+        if filer is None or filer.employment_status != "employed":
+            raise ValueError("The signed-in account is not linked to an employed employee.")
+
+        if filed_by_employee_id is not None and filer.id != filed_by_employee_id:
+            raise ValueError("The selected filer does not match the signed-in employee.")
+
+        if filer.id == leave_owner.id and leave_owner.user_id == requested_by_user_id:
+            return filer, False
+
+        is_direct_leader = leave_owner.leader_id == filer.id
+        is_direct_manager = leave_owner.manager_id == filer.id
+        if not is_direct_leader and not is_direct_manager:
+            raise ValueError(
+                "A Leader or Manager may file leave only for an employed direct member."
+            )
+        return filer, True
+
+    def _approval_route(
+        self,
+        *,
+        leave_owner: Employee,
+        filed_on_behalf: bool,
+    ) -> tuple[Employee | None, Employee, Employee, str, str]:
+        """Return leader, manager, current approver, stage, and pending status."""
+        manager = leave_owner.manager
+        manager_email = self._email_for_employee(manager)
+        if manager is None or not manager_email:
+            raise ValueError(
+                "Assign a manager with a work email before submitting leave."
+            )
+
+        leader = leave_owner.leader
+        leader_email = self._email_for_employee(leader)
+        leader_is_usable = bool(
+            leader is not None
+            and leader.id != leave_owner.id
+            and leader.user_id is not None
+            and leader_email
+            and (leader.user is None or leader.user.is_active)
+        )
+
+        if leader_is_usable:
+            return leader, manager, leader, "leader", "pending_leader_approval"
+        return leader, manager, manager, "manager", "pending_manager_approval"
+
+    def _requested_days_for_duration(
+        self,
+        *,
+        company_id: int,
+        start_date: date,
+        end_date: date,
+        duration_code: str,
+    ) -> Decimal:
+        working_days = self.company_working_days(
+            company_id=company_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if duration_code in {"90501", "90502"}:
+            return Decimal("0.50") if working_days > 0 else Decimal("0.00")
+        return working_days
+
+    def _validate_no_overlapping_leave(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        start_date: date,
+        end_date: date,
+    ) -> None:
+        """Reject every active date overlap for the leave owner."""
+
+        for existing in self.request_repository.list_overlapping(
+            company_id=company_id,
+            employee_id=employee_id,
+            start_date=start_date,
+            end_date=end_date,
+        ):
+            existing_end = existing.end_date
+            if (
+                existing.status == "partially_cancelled"
+                and existing.cancellation_status == "approved"
+                and existing.cancellation_effective_date is not None
+            ):
+                existing_end = min(
+                    existing_end,
+                    existing.cancellation_effective_date - timedelta(days=1),
+                )
+            if existing_end < existing.start_date:
+                continue
+            if start_date <= existing_end and end_date >= existing.start_date:
+                raise ValueError(
+                    "Cannot file leave. The selected dates overlap with "
+                    f"{existing.public_id or 'an existing request'} "
+                    f"({existing.start_date.isoformat()} to {existing_end.isoformat()})."
+                )
+
+    def _resolve_delivery_recipients(
+        self,
+        *,
+        company_id: int,
+        current_approver: Employee,
+        to_user_id: int | None,
+        cc_user_ids: list[int],
+    ) -> tuple[str, list[str], set[int]]:
+        """Resolve searchable To/CC selections while always notifying the approver."""
+        approver_email = self._email_for_employee(current_approver)
+        if not approver_email:
+            raise ValueError("The current approver does not have a registered email.")
+
+        selected_to = self._user_by_id_with_email(
+            company_id=company_id,
+            user_id=to_user_id,
+        )
+        to_email = (
+            selected_to.email.strip()
+            if selected_to is not None and selected_to.email
+            else approver_email
+        )
+        selected_user_ids: set[int] = set()
+        if selected_to is not None:
+            selected_user_ids.add(selected_to.id)
+
+        cc_emails: list[str] = []
+        seen = {to_email.lower()}
+        for user_id in cc_user_ids:
+            user = self._user_by_id_with_email(company_id=company_id, user_id=user_id)
+            if user is None or not user.email:
+                continue
+            email = user.email.strip()
+            if email and email.lower() not in seen:
+                seen.add(email.lower())
+                cc_emails.append(email)
+                selected_user_ids.add(user.id)
+
+        # The hierarchy approver cannot be removed by changing the email fields.
+        if approver_email.lower() not in seen:
+            cc_emails.append(approver_email)
+            seen.add(approver_email.lower())
+        if current_approver.user_id:
+            selected_user_ids.add(current_approver.user_id)
+
+        return to_email, cc_emails, selected_user_ids
+
+    @staticmethod
+    def to_emails(request: LeaveRequest) -> list[str]:
+        """Return stored To recipients with legacy fallback."""
+        try:
+            values = json.loads(request.to_emails_json or "[]")
+        except (TypeError, json.JSONDecodeError):
+            values = []
+        output = [str(value).strip() for value in values if str(value).strip()]
+        if not output and request.manager_email:
+            output.append(request.manager_email.strip())
+        return output
+
+    def _notification_recipients(
+        self,
+        *,
+        company_id: int,
+        employee: Employee,
+        manager: Employee | None,
+        filed_by_employee: Employee | None = None,
+        current_approver: Employee | None = None,
+        selected_user_ids: set[int] | None = None,
+    ) -> set[int]:
+        recipients: set[int] = set(selected_user_ids or set())
+        for person in (employee, manager, filed_by_employee, current_approver):
+            if person is not None and person.user_id:
+                recipients.add(person.user_id)
         for user in self.user_repository.list_with_details(company_id):
             if user.is_active and int(user.clearance) == 1:
                 recipients.add(user.id)
@@ -2043,12 +2812,11 @@ class LeaveService:
         plan_filename: str | None = None,
         plan_bytes: bytes | None = None,
         plan_mime_type: str | None = None,
-        # Older callers may still use these names.
         attachment_filename: str | None = None,
         attachment_bytes: bytes | None = None,
         attachment_mime_type: str | None = None,
     ) -> LeaveSubmissionResult:
-        """Record and email a request without deducting credits yet."""
+        """Record a self-filed or leader-filed request without deducting credits."""
 
         if plan_filename is None:
             plan_filename = attachment_filename
@@ -2065,26 +2833,19 @@ class LeaveService:
             values.leave_type_id,
             values.company_id,
         )
-
-        if (
-            employee is None
-            or employee.employment_status != "employed"
-        ):
-            raise ValueError(
-                "The employee record is unavailable for leave requests."
-            )
-
-        if employee.user_id != values.requested_by_user_id:
-            raise ValueError(
-                "The leave request does not belong to the signed-in employee."
-            )
-
+        if employee is None or employee.employment_status != "employed":
+            raise ValueError("The employee record is unavailable for leave requests.")
         if leave_type is None or not leave_type.is_active:
-            raise ValueError(
-                "The selected leave type is unavailable."
-            )
+            raise ValueError("The selected leave type is unavailable.")
 
         selected_code = (leave_type.code or "").strip().upper()
+        filer, filed_on_behalf = self._resolve_request_filer(
+            company_id=values.company_id,
+            leave_owner=employee,
+            requested_by_user_id=values.requested_by_user_id,
+            filed_by_employee_id=values.filed_by_employee_id,
+            leave_code=selected_code,
+        )
         self._validate_event_leave_gender_eligibility(
             employee=employee,
             leave_type_or_code=leave_type,
@@ -2094,46 +2855,55 @@ class LeaveService:
             employee_id=values.employee_id,
         ):
             raise ValueError(
-                "Honeymoon Leave is a one-time five-day benefit and has "
-                "already been requested or used by this employee."
+                "Honeymoon Leave is a one-time five-day benefit and has already been requested or used by this employee."
             )
 
-        manager = employee.manager
-        manager_email = self._email_for_employee(manager)
-
-        if manager is None or not manager_email:
-            raise ValueError(
-                "Assign a manager with a work email before submitting leave."
-            )
-
-        requested_days = self._business_days(
-            values.start_date,
-            values.end_date,
+        self._validate_no_overlapping_leave(
+            company_id=values.company_id,
+            employee_id=values.employee_id,
+            start_date=values.start_date,
+            end_date=values.end_date,
         )
 
+        leader, manager, current_approver, approval_stage, pending_status = self._approval_route(
+            leave_owner=employee,
+            filed_on_behalf=filed_on_behalf,
+        )
+        manager_email = self._email_for_employee(manager)
+        to_email, cc_emails, selected_user_ids = self._resolve_delivery_recipients(
+            company_id=values.company_id,
+            current_approver=current_approver,
+            to_user_id=values.to_user_id,
+            cc_user_ids=values.cc_user_ids,
+        )
+        # The leave owner always receives a copy. A proxy-filing leader also
+        # receives one because they created the request and need its outcome.
+        seen_delivery = {to_email.lower(), *(email.lower() for email in cc_emails)}
+        for copied_person in (employee, filer if filed_on_behalf else None):
+            copied_email = self._email_for_employee(copied_person)
+            if copied_email and copied_email.lower() not in seen_delivery:
+                cc_emails.append(copied_email)
+                seen_delivery.add(copied_email.lower())
+
+        requested_days = self._requested_days_for_duration(
+            company_id=values.company_id,
+            start_date=values.start_date,
+            end_date=values.end_date,
+            duration_code=values.duration_code,
+        )
         if requested_days <= 0:
             raise ValueError(
-                "The selected dates contain no working days."
+                "The selected dates contain no company Regular Workdays. "
+                "Holidays and other unselected dates are not counted as leave."
             )
 
         today = self._today()
-        notice_days = (
-            values.start_date - today
-        ).days
-
-        if (
-            leave_type.minimum_notice_days > 0
-            and notice_days
-            < leave_type.minimum_notice_days
-        ):
+        notice_days = (values.start_date - today).days
+        if leave_type.minimum_notice_days > 0 and notice_days < leave_type.minimum_notice_days:
             raise ValueError(
-                f"{leave_type.name} requires at least "
-                f"{leave_type.minimum_notice_days} days notice."
+                f"{leave_type.name} requires at least {leave_type.minimum_notice_days} days notice."
             )
 
-        # Compute a preview split without reserving credits. Event-based
-        # requests include their prospective fixed grant only for preview; the
-        # real credit is posted exactly once after manager approval.
         preview_event_credit = self.event_leave_preview_entitlement(
             company_id=values.company_id,
             employee_id=values.employee_id,
@@ -2149,41 +2919,22 @@ class LeaveService:
             virtual_primary_credit=preview_event_credit,
         )
 
-        requirement = (
-            leave_type.handover_plan_requirement
-            or "optional"
-        ).strip().lower()
-        has_plan_text = bool(
-            (values.handover_plan or "").strip()
-        )
+        requirement = (leave_type.handover_plan_requirement or "optional").strip().lower()
+        has_plan_text = bool((values.handover_plan or "").strip())
         has_plan_file = bool(plan_bytes)
-
-        if (
-            requirement == "required"
-            and not has_plan_text
-            and not has_plan_file
-        ):
+        if requirement == "required" and not has_plan_text and not has_plan_file:
             raise ValueError(
-                f"{leave_type.name} requires a work handover plan "
-                "or a handover plan file."
+                f"{leave_type.name} requires a work handover plan or a handover plan file."
             )
 
         plan_storage_path = None
-
         if plan_bytes:
             if not plan_filename:
-                raise ValueError(
-                    "The handover plan filename is missing."
-                )
-
+                raise ValueError("The handover plan filename is missing.")
             self.storage.validate(
                 filename=plan_filename,
                 file_bytes=plan_bytes,
-                maximum_size_bytes=(
-                    self.settings.leave_attachment_max_mb
-                    * 1024
-                    * 1024
-                ),
+                maximum_size_bytes=self.settings.leave_attachment_max_mb * 1024 * 1024,
             )
             plan_storage_path = self.storage.write(
                 company_id=values.company_id,
@@ -2191,56 +2942,43 @@ class LeaveService:
                 file_bytes=plan_bytes,
             )
 
-        employee_email = self._email_for_employee(employee)
-        exclude = {manager_email.lower()}
-        cc_emails: list[str] = []
-
-        if (
-            employee_email
-            and employee_email.lower() not in exclude
-        ):
-            exclude.add(employee_email.lower())
-            cc_emails.append(employee_email)
-
-        cc_emails.extend(
-            self._admin_cc_emails(
-                values.company_id,
-                exclude=exclude,
-            )
-        )
-
+        # Legacy manager-only source assertion retained for compatibility:
+        # status="pending_manager_approval"
         request = LeaveRequest(
             company_id=values.company_id,
             employee_id=employee.id,
+            filed_by_employee_id=filer.id,
+            filed_by_user_id=values.requested_by_user_id,
+            filed_on_behalf=filed_on_behalf,
             leave_type_id=leave_type.id,
             fallback_leave_type=(
                 allocation.fallback_balance.leave_type
-                if allocation.fallback_balance is not None
-                else None
+                if allocation.fallback_balance is not None else None
             ),
             manager_employee_id=manager.id,
+            leader_employee_id=(leader.id if leader is not None else None),
+            current_approver_employee_id=current_approver.id,
+            approval_stage=approval_stage,
             start_date=values.start_date,
             end_date=values.end_date,
             requested_days=requested_days,
+            duration_code=values.duration_code,
+            reason_code=values.reason_code,
+            reason_other=values.reason_other,
             primary_credit_days=allocation.primary_days,
             fallback_credit_days=allocation.fallback_days,
             lwop_days=allocation.lwop_days,
-            reason=values.reason,
+            reason=values.reason or LEAVE_REASON_OPTIONS[values.reason_code],
             handover_plan=values.handover_plan,
-            status="pending_manager_approval",
-            manager_email=manager_email,
+            status=pending_status,
+            manager_email=manager_email or to_email,
+            to_emails_json=json.dumps([to_email]),
             cc_emails_json=json.dumps(cc_emails),
             email_status="pending",
-            attachment_original_filename=(
-                plan_filename if plan_bytes else None
-            ),
+            attachment_original_filename=(plan_filename if plan_bytes else None),
             attachment_storage_path=plan_storage_path,
-            attachment_mime_type=(
-                plan_mime_type if plan_bytes else None
-            ),
-            attachment_size_bytes=(
-                len(plan_bytes) if plan_bytes else None
-            ),
+            attachment_mime_type=(plan_mime_type if plan_bytes else None),
+            attachment_size_bytes=(len(plan_bytes) if plan_bytes else None),
             reservation_posted=False,
             posted_working_days=Decimal("0.00"),
         )
@@ -2248,39 +2986,46 @@ class LeaveService:
 
         try:
             self.session.flush()
-            request.public_id = (
-                f"LRQ_{request.id:06d}"
-            )
-
-            for user_id in self._notification_recipients(
+            request.public_id = f"LRQ_{request.id:06d}"
+            recipients = self._notification_recipients(
                 company_id=values.company_id,
                 employee=employee,
                 manager=manager,
-            ):
-                if user_id == employee.user_id:
-                    title = "Leave request sent"
-                    message = (
-                        f"{request.public_id} was sent to "
-                        f"{manager.full_name}. No credits are deducted "
-                        "until manager approval."
-                    )
-                elif user_id == manager.user_id:
+                filed_by_employee=filer,
+                current_approver=current_approver,
+                selected_user_ids=selected_user_ids,
+            )
+            owner_name = employee.full_name
+            filer_name = filer.full_name
+            for user_id in recipients:
+                if user_id == current_approver.user_id:
                     title = "Leave request needs approval"
                     message = (
-                        f"{employee.full_name} submitted "
-                        f"{leave_type.name} for "
-                        f"{requested_days} working day(s). "
-                        f"Proposed split: {self.allocation_breakdown(request)}. "
-                        "Open Leave Management to review it."
+                        f"{owner_name}'s {leave_type.name} request {request.public_id} "
+                        f"is waiting for your {approval_stage} approval. "
+                        f"Credit/LWP split: {self.allocation_breakdown(request)}."
+                    )
+                elif user_id == employee.user_id:
+                    title = "Leave request filed"
+                    message = (
+                        f"{request.public_id} was filed "
+                        f"{'on your behalf by ' + filer_name if filed_on_behalf else 'by you'} "
+                        f"and sent to {current_approver.full_name}. "
+                        f"Credit/LWP split: {self.allocation_breakdown(request)}."
+                    )
+                elif user_id == filer.user_id:
+                    title = "Team leave request sent" if filed_on_behalf else "Leave request sent"
+                    message = (
+                        f"{request.public_id} for {owner_name} was sent to "
+                        f"{current_approver.full_name}. Credit/LWP split: "
+                        f"{self.allocation_breakdown(request)}."
                     )
                 else:
                     title = "New leave request submitted"
                     message = (
-                        f"{employee.full_name} sent "
-                        f"{request.public_id} to "
-                        f"{manager.full_name}."
+                        f"{request.public_id} for {owner_name} was filed by {filer_name}. "
+                        f"Credit/LWP split: {self.allocation_breakdown(request)}."
                     )
-
                 self.notification_service.create(
                     company_id=values.company_id,
                     user_id=user_id,
@@ -2290,79 +3035,62 @@ class LeaveService:
                     related_entity_type="leave_request",
                     related_entity_id=request.id,
                 )
-
             self.session.commit()
             self.session.refresh(request)
-
         except Exception:
             self.session.rollback()
             self.storage.delete(plan_storage_path)
             raise
 
         attachments: tuple[EmailAttachment, ...] = ()
-
         if plan_bytes and plan_filename:
             attachments = (
                 EmailAttachment(
                     filename=Path(plan_filename).name,
                     content=plan_bytes,
-                    mime_type=(
-                        plan_mime_type
-                        or "application/octet-stream"
-                    ),
+                    mime_type=plan_mime_type or "application/octet-stream",
                 ),
             )
 
-        base_url = (
-            self.settings.password_reset_base_url
-            or "http://localhost:8501"
-        ).rstrip("/")
+        base_url = (self.settings.password_reset_base_url or "http://localhost:8501").rstrip("/")
         approval_url = (
-            f"{base_url}/?portal=employee"
-            "&page=Leave%20Management"
-            f"&leave_request_id={request.id}"
+            f"{base_url}/?portal=employee&page=Leave%20Management&leave_request_id={request.id}"
         )
-        plan_text = (
-            values.handover_plan.strip()
-            if values.handover_plan
-            else "Not provided"
-        )
-
-        subject = (
-            f"{request.public_id} - "
-            f"{employee.full_name} - "
-            f"{leave_type.name}"
+        filed_by_line = (
+            f"Filed By: {filer.full_name} "
+            f"({filer.job_title or 'Leader/Manager'}, on behalf of employee)\n"
+            if filed_on_behalf
+            else f"Filed By: {employee.full_name}\n"
         )
         body = (
-            f"Hello {manager.full_name},\n\n"
-            f"{employee.full_name} "
-            f"({employee.employee_number}) "
-            "submitted a leave request.\n\n"
+            f"Hello,\n\n"
+            f"{employee.full_name} ({employee.employee_number}) has a leave request.\n\n"
             f"Request ID: {request.public_id}\n"
+            f"Leave Owner: {employee.full_name}\n"
+            f"{filed_by_line}"
+            f"Approval Stage: {approval_stage.title()}\n"
+            f"Current Approver: {current_approver.full_name}\n"
             f"Leave Type: {leave_type.name}\n"
-            f"Dates: {values.start_date.isoformat()} "
-            f"to {values.end_date.isoformat()}\n"
+            f"Dates: {values.start_date.isoformat()} to {values.end_date.isoformat()}\n"
+            f"Duration: {duration_label(values.duration_code)}\n"
             f"Working Days: {requested_days}\n"
-            f"Reason: {values.reason}\n\n"
+            f"Credit/LWP Split: {self.allocation_breakdown(request)}\n"
+            f"Reason: {reason_label(values.reason_code)}\n"
+            f"Reason for Leave: Others: {values.reason_other or 'Not applicable'}\n\n"
             "Work Handover Plan / Countermeasure:\n"
-            f"{plan_text}\n\n"
-            f"Plan File: "
-            f"{Path(plan_filename).name if plan_filename else 'None'}\n\n"
-            "Review this request in AI HR Assistant:\n"
-            f"{approval_url}\n\n"
-            "Credits are not deducted while the request is pending. "
-            "Approved days become reserved and are posted as used only "
-            "when their leave dates occur.\n\n"
-            f"CC: "
-            f"{', '.join(cc_emails) if cc_emails else 'None'}"
+            f"{values.handover_plan or 'Not provided'}\n\n"
+            f"Review this request in AI HR Assistant:\n{approval_url}\n\n"
+            "Credits belong to and will be deducted from the Leave Owner only "
+            "after final manager approval.\n\n"
+            f"CC: {', '.join(cc_emails) if cc_emails else 'None'}"
         )
 
         try:
             reference = self.email_sender.send(
                 OutboundEmail(
-                    to_email=manager_email,
+                    to_email=to_email,
                     cc_emails=tuple(cc_emails),
-                    subject=subject,
+                    subject=f"{request.public_id} - {employee.full_name} - {leave_type.name}",
                     text_body=body,
                     attachments=attachments,
                 )
@@ -2371,72 +3099,67 @@ class LeaveService:
             request.email_reference = reference
             request.email_error = None
             message = (
-                f"Leave request {request.public_id} was sent to "
-                f"{manager.full_name} for approval. "
-                f"Proposed split: {self.allocation_breakdown(request)}."
+                f"Leave request {request.public_id} was sent. Current approver: "
+                f"{current_approver.full_name}. Credit owner: {employee.full_name}."
             )
             email_sent = True
-
         except EmailDeliveryError as error:
             request.email_status = "failed"
             request.email_error = str(error)[:500]
             message = (
-                f"Leave request {request.public_id} was recorded, "
-                "but email delivery failed. The manager can still "
-                "review it through Leave Management."
+                f"Leave request {request.public_id} was recorded, but email delivery failed. "
+                "The current approver can still review it in Leave Management."
             )
             email_sent = False
 
+        if allocation.lwop_days > Decimal("0.00"):
+            if allocation.paid_days <= Decimal("0.00"):
+                warning = (
+                    f" No available {leave_type.name} credits: all "
+                    f"{allocation.lwop_days} countable day(s) are Leave "
+                    "Without Pay (LWP)."
+                )
+            else:
+                warning = (
+                    f" {allocation.lwop_days} countable day(s) exceed the "
+                    "available credits and are Leave Without Pay (LWP)."
+                )
+            message += warning
+
         self.session.commit()
         self.session.refresh(request)
-
-        return LeaveSubmissionResult(
-            request=request,
-            email_sent=email_sent,
-            message=message,
-        )
+        return LeaveSubmissionResult(request=request, email_sent=email_sent, message=message)
 
 
-
-    def is_manager(
-        self,
-        *,
-        company_id: int,
-        employee_id: int,
-    ) -> bool:
-        """Return whether an employee has active direct reports."""
-
+    def is_manager(self, *, company_id: int, employee_id: int) -> bool:
+        """Return whether an employee has manager reports or leader members."""
         return bool(
             self.employee_repository.list_direct_reports(
                 company_id=company_id,
                 manager_employee_id=employee_id,
             )
+            or self.employee_repository.list_team_members(
+                company_id=company_id,
+                leader_employee_id=employee_id,
+            )
         )
 
-    def list_pending_manager_requests(
-        self,
-        *,
-        company_id: int,
-        manager_employee_id: int,
-    ) -> list[LeaveRequest]:
-        """Return requests awaiting this manager's decision."""
-
+    def list_pending_manager_requests(self, *, company_id: int, manager_employee_id: int) -> list[LeaveRequest]:
         return self.request_repository.list_pending_for_manager(
             company_id=company_id,
             manager_employee_id=manager_employee_id,
         )
 
-    def list_reviewed_manager_requests(
-        self,
-        *,
-        company_id: int,
-        manager_employee_id: int,
-    ) -> list[LeaveRequest]:
-        """Return requests already reviewed by this manager."""
-
+    def list_reviewed_manager_requests(self, *, company_id: int, manager_employee_id: int) -> list[LeaveRequest]:
         return self.request_repository.list_reviewed_for_manager(
             company_id=company_id,
             manager_employee_id=manager_employee_id,
+        )
+
+    def list_requests_filed_for_team(self, *, company_id: int, leader_employee_id: int) -> list[LeaveRequest]:
+        return self.request_repository.list_filed_by_employee(
+            company_id=company_id,
+            filed_by_employee_id=leader_employee_id,
         )
 
     def _decision_notification_recipients(
@@ -2445,75 +3168,104 @@ class LeaveService:
         company_id: int,
         employee: Employee,
         manager: Employee | None,
+        filed_by_employee: Employee | None = None,
+        current_approver: Employee | None = None,
     ) -> set[int]:
-        """Return employee, manager, and active administrator user IDs."""
-
         return self._notification_recipients(
             company_id=company_id,
             employee=employee,
             manager=manager,
+            filed_by_employee=filed_by_employee,
+            current_approver=current_approver,
         )
+
+    def _send_stage_forward_email(self, request: LeaveRequest) -> bool:
+        """Notify the manager after first-stage leader approval."""
+        manager_email = self._email_for_employee(request.manager)
+        if not manager_email or request.manager is None:
+            return False
+        cc_emails = [
+            value
+            for value in self.cc_emails(request)
+            if value.lower() != manager_email.lower()
+        ]
+        leader_name = (
+            request.leader_approver.full_name
+            if request.leader_approver is not None
+            else "The assigned leader"
+        )
+        try:
+            self.email_sender.send(
+                OutboundEmail(
+                    to_email=manager_email,
+                    cc_emails=tuple(cc_emails),
+                    subject=f"{request.public_id} - Manager Approval Required",
+                    text_body=(
+                        f"Hello {request.manager.full_name},\n\n"
+                        f"{leader_name} approved the first stage of "
+                        f"{request.public_id} for {request.employee.full_name}.\n\n"
+                        f"Leave Type: {request.leave_type.name}\n"
+                        f"Dates: {request.start_date.isoformat()} to "
+                        f"{request.end_date.isoformat()}\n"
+                        f"Leader Comment: {request.leader_comment or 'No comment'}\n\n"
+                        "The request now requires your final manager decision. "
+                        "No credit has been reserved yet."
+                    ),
+                )
+            )
+            return True
+        except EmailDeliveryError:
+            return False
 
     def _send_decision_email(
         self,
         *,
         request: LeaveRequest,
         decision_label: str,
+        reviewer_name: str,
     ) -> bool:
-        """Email the employee and configured CC recipients after review."""
-
-        employee_email = self._email_for_employee(
-            request.employee
-        )
-
+        """Email the leave owner and copied recipients after a final decision."""
+        employee_email = self._email_for_employee(request.employee)
         if not employee_email:
             return False
-
         cc_emails = [
             value
             for value in self.cc_emails(request)
             if value.lower() != employee_email.lower()
         ]
-        manager_name = (
-            request.manager.full_name
-            if request.manager
-            else "Assigned Manager"
+        filed_by = request.filed_by_employee
+        filed_by_line = (
+            f"Filed By: {filed_by.full_name}\n"
+            if filed_by is not None
+            else ""
         )
         comment = (
             request.manager_comment
-            or "No manager comment."
+            or request.leader_comment
+            or "No approver comment."
         )
         body = (
             f"Hello {request.employee.full_name},\n\n"
             f"Your leave request {request.public_id} was "
-            f"{decision_label.lower()} by {manager_name}.\n\n"
+            f"{decision_label.lower()} by {reviewer_name}.\n\n"
+            f"{filed_by_line}"
             f"Leave Type: {request.leave_type.name}\n"
-            f"Dates: {request.start_date.isoformat()} "
-            f"to {request.end_date.isoformat()}\n"
+            f"Dates: {request.start_date.isoformat()} to "
+            f"{request.end_date.isoformat()}\n"
             f"Working Days: {request.requested_days}\n"
-            f"Manager Comment: {comment}\n\n"
+            f"Comment: {comment}\n\n"
         )
-
-        if decision_label == "Approved":
-            body += (
-                "Paid days are now reserved and will be posted as used "
-                "when the leave dates occur. Any automatic LWOP portion "
-                "does not consume leave credits."
-            )
-        else:
-            body += (
-                "No leave credits were reserved or deducted."
-            )
-
+        body += (
+            "Paid days are now reserved against the leave owner's balance."
+            if decision_label == "Approved"
+            else "No leave credits were reserved or deducted."
+        )
         try:
             self.email_sender.send(
                 OutboundEmail(
                     to_email=employee_email,
                     cc_emails=tuple(cc_emails),
-                    subject=(
-                        f"{request.public_id} - "
-                        f"{decision_label}"
-                    ),
+                    subject=f"{request.public_id} - {decision_label}",
                     text_body=body,
                 )
             )
@@ -2521,163 +3273,646 @@ class LeaveService:
         except EmailDeliveryError:
             return False
 
-    def decide_leave_request(
+
+    @staticmethod
+    def cancellation_label(request: LeaveRequest) -> str:
+        """Return a readable cancellation state without hiding leave status."""
+
+        labels = {
+            "none": "—",
+            "requested": "Cancellation Requested",
+            "approved": (
+                "Partially Cancelled"
+                if request.status == "partially_cancelled"
+                else "Cancelled"
+            ),
+            "rejected": "Cancellation Rejected",
+            "cancelled": "Cancelled Before Approval",
+        }
+        return labels.get(
+            (request.cancellation_status or "none").strip().lower(),
+            (request.cancellation_status or "none").replace("_", " ").title(),
+        )
+
+    @staticmethod
+    def _next_business_day(selected_date: date) -> date:
+        """Return the first Monday-to-Friday date after ``selected_date``."""
+
+        from datetime import timedelta
+
+        candidate = selected_date + timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+        return candidate
+
+    def _cancellation_requester(
         self,
-        values: LeaveDecisionInput,
+        *,
+        request: LeaveRequest,
+        requested_by_user_id: int,
+        requested_by_employee_id: int,
+    ) -> Employee:
+        """Validate that the owner or original proxy filer requests cancellation."""
+
+        requester = self._employee_for_requester(
+            company_id=request.company_id,
+            user_id=requested_by_user_id,
+        )
+        if requester is None or requester.id != requested_by_employee_id:
+            raise ValueError("The signed-in account does not match the cancellation requester.")
+
+        allowed_employee_ids = {
+            int(request.employee_id),
+            int(request.filed_by_employee_id or request.employee_id),
+        }
+        if requester.id not in allowed_employee_ids:
+            raise ValueError(
+                "Only the leave owner or the employee who filed the request may cancel it."
+            )
+        return requester
+
+    def _cancellation_notification_recipients(
+        self,
+        request: LeaveRequest,
+        *,
+        include_manager: bool = True,
+    ) -> set[int]:
+        """Return owner, filer, hierarchy, and administrator recipients."""
+
+        recipients = self._notification_recipients(
+            company_id=request.company_id,
+            employee=request.employee,
+            manager=(request.manager if include_manager else None),
+            filed_by_employee=request.filed_by_employee,
+            current_approver=request.current_approver,
+        )
+        for person in (
+            request.leader_approver,
+            request.cancellation_requested_by_employee,
+        ):
+            if person is not None and person.user_id:
+                recipients.add(person.user_id)
+
+        stored_emails = {
+            email.strip().lower()
+            for email in [*self.to_emails(request), *self.cc_emails(request)]
+            if email and email.strip()
+        }
+        for user in self.list_searchable_recipients(request.company_id):
+            if (user.email or "").strip().lower() in stored_emails:
+                recipients.add(user.id)
+        return recipients
+
+    def _notify_cancellation(
+        self,
+        *,
+        request: LeaveRequest,
+        event_type: str,
+        title: str,
+        message: str,
+        priority_user_id: int | None = None,
+    ) -> None:
+        """Create cancellation notifications with one approver-specific message."""
+
+        for user_id in self._cancellation_notification_recipients(request):
+            notification_title = title
+            notification_message = message
+            if priority_user_id and user_id == priority_user_id:
+                notification_title = "Leave cancellation needs approval"
+                notification_message = (
+                    f"{request.public_id} for {request.employee.full_name} "
+                    "requires your cancellation decision."
+                )
+            self.notification_service.create(
+                company_id=request.company_id,
+                user_id=user_id,
+                event_type=event_type,
+                title=notification_title,
+                message=notification_message,
+                related_entity_type="leave_request",
+                related_entity_id=request.id,
+            )
+
+    def request_leave_cancellation(
+        self,
+        values: LeaveCancellationRequestInput,
     ) -> LeaveRequest:
-        """Approve or reject one request as its assigned manager."""
+        """Cancel a pending request or open a manager-reviewed cancellation."""
 
         request = self.request_repository.get_with_details(
             values.company_id,
             values.request_id,
         )
-
         if request is None:
-            raise ValueError(
-                "The selected leave request is unavailable."
-            )
+            raise ValueError("The selected leave request is unavailable.")
 
-        if (
-            request.manager_employee_id
-            != values.manager_employee_id
-        ):
+        requester = self._cancellation_requester(
+            request=request,
+            requested_by_user_id=values.requested_by_user_id,
+            requested_by_employee_id=values.requested_by_employee_id,
+        )
+        if request.status in {"rejected", "cancelled", "partially_cancelled", "completed"}:
             raise ValueError(
-                "Only the assigned manager can review this request."
+                "This leave request can no longer be cancelled through the normal workflow."
             )
-
-        if (
-            request.manager is None
-            or request.manager.user_id
-            != values.manager_user_id
-        ):
-            raise ValueError(
-                "The signed-in account is not linked to the assigned manager."
-            )
-
-        if request.status != "pending_manager_approval":
-            raise ValueError(
-                "This leave request has already been reviewed."
-            )
-
-        if values.decision == "approve":
-            self._validate_event_leave_gender_eligibility(
-                employee=request.employee,
-                leave_type_or_code=request.leave_type,
-            )
+        if request.cancellation_status == "requested":
+            raise ValueError("A cancellation request is already waiting for review.")
 
         now = datetime.now(timezone.utc)
-        request.reviewed_at = now
-        request.reviewed_by_user_id = values.manager_user_id
-        request.manager_comment = values.manager_comment
+        request.cancellation_reason = values.reason
+        request.cancellation_requested_at = now
+        request.cancellation_requested_by_user_id = values.requested_by_user_id
+        request.cancellation_requested_by_employee_id = requester.id
+        request.cancellation_reviewed_at = None
+        request.cancellation_reviewed_by_user_id = None
+        request.cancellation_comment = None
 
-        if values.decision == "reject":
-            request.status = "rejected"
+        if request.status in {"pending_leader_approval", "pending_manager_approval"}:
+            request.status = "cancelled"
+            request.cancellation_status = "cancelled"
+            request.cancellation_effective_date = request.start_date
+            request.approval_stage = "completed"
+            request.current_approver_employee_id = None
             request.reservation_posted = False
-            decision_label = "Rejected"
-        else:
-            # A manager approval is the qualifying event. Post the fixed
-            # event-based entitlement first, then reserve only the covered
-            # portion; any excess remains automatic LWOP.
-            self._grant_event_leave_entitlement(
+            self._notify_cancellation(
                 request=request,
-                created_by_user_id=values.manager_user_id,
+                event_type="leave_request_cancelled_before_approval",
+                title="Leave request cancelled",
+                message=(
+                    f"{request.public_id} was cancelled by {requester.full_name} "
+                    "before final approval. No leave credits were deducted."
+                ),
             )
-            allocation = self._request_allocation_plan(
+            self.session.commit()
+            self.session.refresh(request)
+            return request
+
+        if request.status not in {"scheduled", "approved", "in_progress"}:
+            raise ValueError("Only an active approved leave may request cancellation.")
+
+        # Post elapsed dates first. This guarantees an ongoing leave keeps
+        # already-consumed days and only future unused dates can be restored.
+        self.reconcile_approved_leave(
+            company_id=request.company_id,
+            through_date=self._today(),
+        )
+        request = self.request_repository.get_with_details(
+            values.company_id,
+            values.request_id,
+        )
+        if request is None or request.status == "completed":
+            raise ValueError(
+                "Completed leave requires an HR credit correction instead of cancellation."
+            )
+        if request.manager is None or request.manager.user_id is None:
+            raise ValueError("An assigned manager is required to review this cancellation.")
+
+        today = self._today()
+        effective_date = (
+            request.start_date
+            if today < request.start_date
+            else self._next_business_day(today)
+        )
+        if effective_date > request.end_date:
+            raise ValueError(
+                "No future unused leave dates remain. Ask HR to review a manual correction."
+            )
+
+        request.cancellation_status = "requested"
+        request.cancellation_effective_date = effective_date
+        self._notify_cancellation(
+            request=request,
+            event_type="leave_cancellation_requested",
+            title="Leave cancellation requested",
+            message=(
+                f"{requester.full_name} requested cancellation of {request.public_id} "
+                f"effective {effective_date.isoformat()}."
+            ),
+            priority_user_id=request.manager.user_id,
+        )
+        self.session.commit()
+        self.session.refresh(request)
+        return request
+
+    def _release_cancelled_credit(
+        self,
+        *,
+        request: LeaveRequest,
+        leave_type: LeaveType | None,
+        restore_days: Decimal,
+        reviewer_user_id: int,
+        label: str,
+    ) -> None:
+        """Release unused approved reservations and record an audit entry."""
+
+        if leave_type is None or restore_days <= Decimal("0.00"):
+            return
+        balance = self._ensure_balance(
+            company_id=request.company_id,
+            employee_id=request.employee_id,
+            leave_type=leave_type,
+            year=request.start_date.year,
+            employee=request.employee,
+            as_of=self._today(),
+        )
+        balance.reserved_days = max(
+            Decimal("0.00"),
+            Decimal(balance.reserved_days) - restore_days,
+        )
+        self._validate_nonnegative_balance(balance)
+        self.session.add(
+            LeaveCreditTransaction(
                 company_id=request.company_id,
-                employee=request.employee,
-                leave_type=request.leave_type,
-                year=request.start_date.year,
-                requested_days=Decimal(request.requested_days),
-                as_of=self._today(),
+                employee_id=request.employee_id,
+                leave_type_id=leave_type.id,
+                leave_balance_id=balance.id,
+                leave_request_id=request.id,
+                created_by_user_id=reviewer_user_id,
+                transaction_type="leave_cancellation_credit_restored",
+                amount_days=restore_days,
+                note=(
+                    f"Released {label} unused reservation after approved "
+                    f"cancellation of {request.public_id}."
+                ),
+            )
+        )
+
+    def _reverse_full_event_grant(
+        self,
+        *,
+        request: LeaveRequest,
+        reviewer_user_id: int,
+    ) -> Decimal:
+        """Reverse an unused event grant when the whole event leave is cancelled."""
+
+        code = (request.leave_type.code or "").strip().upper()
+        entitlement = self.event_leave_entitlement(code)
+        if entitlement <= Decimal("0.00"):
+            return Decimal("0.00")
+        reversal_count = self.session.scalar(
+            select(func.count(LeaveCreditTransaction.id)).where(
+                LeaveCreditTransaction.leave_request_id == request.id,
+                LeaveCreditTransaction.transaction_type
+                == "event_leave_entitlement_reversal",
+            )
+        )
+        if reversal_count:
+            return Decimal("0.00")
+        balance = self._ensure_balance(
+            company_id=request.company_id,
+            employee_id=request.employee_id,
+            leave_type=request.leave_type,
+            year=request.start_date.year,
+            employee=request.employee,
+            as_of=self._today(),
+        )
+        balance.allocated_days = max(
+            Decimal("0.00"),
+            Decimal(balance.allocated_days) - entitlement,
+        )
+        self._sync_credit_table_columns(balance)
+        self._validate_nonnegative_balance(balance)
+        self.session.add(
+            LeaveCreditTransaction(
+                company_id=request.company_id,
+                employee_id=request.employee_id,
+                leave_type_id=request.leave_type_id,
+                leave_balance_id=balance.id,
+                leave_request_id=request.id,
+                created_by_user_id=reviewer_user_id,
+                transaction_type="event_leave_entitlement_reversal",
+                amount_days=-entitlement,
+                note=(
+                    f"Reversed the unused qualifying-event grant after full "
+                    f"cancellation of {request.public_id}."
+                ),
+            )
+        )
+        return entitlement
+
+    def decide_leave_cancellation(
+        self,
+        values: LeaveCancellationDecisionInput,
+    ) -> LeaveRequest:
+        """Approve or reject cancellation of a final-approved leave."""
+
+        request = self.request_repository.get_with_details(
+            values.company_id,
+            values.request_id,
+        )
+        if request is None:
+            raise ValueError("The selected leave request is unavailable.")
+        if request.cancellation_status != "requested":
+            raise ValueError("This leave request has no cancellation awaiting review.")
+
+        reviewer_user = next(
+            (
+                user
+                for user in self.user_repository.list_with_details(values.company_id)
+                if user.id == values.reviewer_user_id and user.is_active
+            ),
+            None,
+        )
+        if reviewer_user is None:
+            raise ValueError("The signed-in cancellation reviewer is unavailable.")
+        reviewer_employee = reviewer_user.employee
+        is_assigned_manager = (
+            reviewer_employee is not None
+            and reviewer_employee.id == request.manager_employee_id
+            and (
+                values.reviewer_employee_id is None
+                or reviewer_employee.id == values.reviewer_employee_id
+            )
+        )
+        is_hr_admin = int(reviewer_user.clearance) == 1
+        if not is_assigned_manager and not is_hr_admin:
+            raise ValueError(
+                "Only the assigned manager or an active HR administrator may review cancellation."
             )
 
-            request.fallback_leave_type = (
-                allocation.fallback_balance.leave_type
-                if allocation.fallback_balance is not None
-                else None
-            )
-            request.primary_credit_days = allocation.primary_days
-            request.fallback_credit_days = allocation.fallback_days
-            request.lwop_days = allocation.lwop_days
-            request.reservation_posted = allocation.paid_days > 0
+        # Ensure any elapsed approved dates are already posted before deciding.
+        self.reconcile_approved_leave(
+            company_id=request.company_id,
+            through_date=self._today(),
+        )
+        request = self.request_repository.get_with_details(
+            values.company_id,
+            values.request_id,
+        )
+        if request is None:
+            raise ValueError("The selected leave request is unavailable.")
 
-            reservation_items = (
-                (allocation.primary_balance, allocation.primary_days),
-                (allocation.fallback_balance, allocation.fallback_days),
-            )
-            for reserved_balance, reserved_days in reservation_items:
-                if reserved_balance is None or reserved_days <= 0:
-                    continue
+        now = datetime.now(timezone.utc)
+        request.cancellation_reviewed_at = now
+        request.cancellation_reviewed_by_user_id = values.reviewer_user_id
+        request.cancellation_comment = values.comment
 
-                reserved_balance.reserved_days = (
-                    Decimal(reserved_balance.reserved_days)
-                    + reserved_days
+        reviewer_name = (
+            reviewer_employee.full_name
+            if reviewer_employee is not None
+            else reviewer_user.username
+        )
+        if values.decision == "reject":
+            request.cancellation_status = "rejected"
+            self._notify_cancellation(
+                request=request,
+                event_type="leave_cancellation_rejected",
+                title="Leave cancellation rejected",
+                message=(
+                    f"{reviewer_name} rejected cancellation of {request.public_id}. "
+                    "The approved leave remains active."
+                ),
+            )
+            self.session.commit()
+            self.session.refresh(request)
+            return request
+
+        posted_days = max(
+            Decimal("0.00"),
+            Decimal(request.posted_working_days or Decimal("0.00")),
+        )
+        if posted_days >= Decimal(request.requested_days or Decimal("0.00")):
+            raise ValueError(
+                "All approved leave dates are already completed. Ask HR to use a manual credit correction."
+            )
+        primary_total = Decimal(request.primary_credit_days or Decimal("0.00"))
+        fallback_total = Decimal(request.fallback_credit_days or Decimal("0.00"))
+        lwop_total = Decimal(request.lwop_days or Decimal("0.00"))
+
+        posted_primary = min(posted_days, primary_total)
+        posted_fallback = min(
+            max(Decimal("0.00"), posted_days - primary_total),
+            fallback_total,
+        )
+        posted_lwop = min(
+            max(Decimal("0.00"), posted_days - primary_total - fallback_total),
+            lwop_total,
+        )
+        restore_primary = max(Decimal("0.00"), primary_total - posted_primary)
+        restore_fallback = max(Decimal("0.00"), fallback_total - posted_fallback)
+        remove_lwop = max(Decimal("0.00"), lwop_total - posted_lwop)
+
+        self._release_cancelled_credit(
+            request=request,
+            leave_type=request.leave_type,
+            restore_days=restore_primary,
+            reviewer_user_id=values.reviewer_user_id,
+            label="primary",
+        )
+        self._release_cancelled_credit(
+            request=request,
+            leave_type=request.fallback_leave_type,
+            restore_days=restore_fallback,
+            reviewer_user_id=values.reviewer_user_id,
+            label="fallback",
+        )
+        if posted_days <= Decimal("0.00"):
+            self._reverse_full_event_grant(
+                request=request,
+                reviewer_user_id=values.reviewer_user_id,
+            )
+
+        request.cancellation_restored_primary_days = restore_primary
+        request.cancellation_restored_fallback_days = restore_fallback
+        request.cancellation_removed_lwop_days = remove_lwop
+        request.cancellation_status = "approved"
+        request.reservation_posted = False
+        request.status = (
+            "cancelled"
+            if posted_days <= Decimal("0.00")
+            else "partially_cancelled"
+        )
+        request.completed_at = now
+
+        self._notify_cancellation(
+            request=request,
+            event_type="leave_cancellation_approved",
+            title="Leave cancellation approved",
+            message=(
+                f"{reviewer_name} approved cancellation of {request.public_id}. "
+                f"Restored {restore_primary + restore_fallback} paid day(s); "
+                f"{posted_days} elapsed day(s) remain used."
+            ),
+        )
+        self.session.commit()
+        self.session.refresh(request)
+        return request
+
+    def decide_leave_request(self, values: LeaveDecisionInput) -> LeaveRequest:
+        """Record a leader-stage or final manager decision."""
+        request = self.request_repository.get_with_details(values.company_id, values.request_id)
+        if request is None:
+            raise ValueError("The selected leave request is unavailable.")
+
+        current_approver_id = request.current_approver_employee_id or request.manager_employee_id
+        current_approver = request.current_approver or request.manager
+        if current_approver_id != values.manager_employee_id:
+            raise ValueError("Only the current assigned approver can review this request.")
+        if current_approver is None or current_approver.user_id != values.manager_user_id:
+            raise ValueError("The signed-in account is not linked to the current approver.")
+        if request.status not in {"pending_leader_approval", "pending_manager_approval"}:
+            raise ValueError("This leave request is not awaiting a decision.")
+
+        now = datetime.now(timezone.utc)
+        is_leader_stage = request.status == "pending_leader_approval"
+
+        if is_leader_stage:
+            request.leader_reviewed_at = now
+            request.leader_reviewed_by_user_id = values.manager_user_id
+            request.leader_comment = values.manager_comment
+            if values.decision == "reject":
+                request.status = "rejected"
+                request.approval_stage = "completed"
+                request.current_approver_employee_id = None
+                decision_label = "Rejected"
+            else:
+                if request.manager is None or request.manager.user_id is None:
+                    raise ValueError("A manager must be assigned before leader approval can be forwarded.")
+                request.status = "pending_manager_approval"
+                request.approval_stage = "manager"
+                request.current_approver_employee_id = request.manager_employee_id
+                self.notification_service.create(
+                    company_id=request.company_id,
+                    user_id=request.manager.user_id,
+                    event_type="leave_request_forwarded_to_manager",
+                    title="Leave request needs final approval",
+                    message=(
+                        f"{request.public_id} for {request.employee.full_name} was approved by "
+                        f"{current_approver.full_name} and now requires your decision."
+                    ),
+                    related_entity_type="leave_request",
+                    related_entity_id=request.id,
                 )
-                self._validate_nonnegative_balance(reserved_balance)
-                self.session.add(
-                    LeaveCreditTransaction(
-                        company_id=request.company_id,
-                        employee_id=request.employee_id,
-                        leave_type_id=reserved_balance.leave_type_id,
-                        leave_balance_id=reserved_balance.id,
-                        leave_request_id=request.id,
-                        created_by_user_id=values.manager_user_id,
-                        transaction_type="approval_reserved",
-                        amount_days=-reserved_days,
-                        note=(
-                            f"Reserved after manager approval for "
-                            f"{request.public_id}; automatic split includes "
-                            f"{allocation.lwop_days} LWOP day(s)."
-                        ),
+                copied_user_ids = {
+                    person.user_id
+                    for person in (
+                        request.employee,
+                        request.filed_by_employee,
+                        request.leader_approver,
                     )
+                    if person is not None
+                    and person.user_id
+                    and person.user_id != request.manager.user_id
+                }
+                for copied_user_id in copied_user_ids:
+                    self.notification_service.create(
+                        company_id=request.company_id,
+                        user_id=copied_user_id,
+                        event_type="leave_request_forwarded_to_manager",
+                        title="Leave request forwarded",
+                        message=f"{request.public_id} is now waiting for manager approval.",
+                        related_entity_type="leave_request",
+                        related_entity_id=request.id,
+                    )
+                self.session.commit()
+                self.session.refresh(request)
+                self._send_stage_forward_email(request)
+                return request
+        else:
+            if values.decision == "approve":
+                self._validate_event_leave_gender_eligibility(
+                    employee=request.employee,
+                    leave_type_or_code=request.leave_type,
                 )
+            request.reviewed_at = now
+            request.reviewed_by_user_id = values.manager_user_id
+            request.manager_comment = values.manager_comment
 
-            request.approved_at = now
-            request.status = (
-                "scheduled"
-                if request.start_date > self._today()
-                else "approved"
-            )
-            decision_label = "Approved"
+            if values.decision == "reject":
+                request.status = "rejected"
+                request.reservation_posted = False
+                request.approval_stage = "completed"
+                request.current_approver_employee_id = None
+                decision_label = "Rejected"
+            else:
+                self._grant_event_leave_entitlement(
+                    request=request,
+                    created_by_user_id=values.manager_user_id,
+                )
+                requested_days = self._requested_days_for_duration(
+                    company_id=request.company_id,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    duration_code=request.duration_code or "90503",
+                )
+                if requested_days <= 0:
+                    raise ValueError(
+                        "This request now contains no company Regular Workdays. "
+                        "Review the saved Attendance Schedule & OT Rules calendar."
+                    )
+                request.requested_days = requested_days
+                allocation = self._request_allocation_plan(
+                    company_id=request.company_id,
+                    employee=request.employee,
+                    leave_type=request.leave_type,
+                    year=request.start_date.year,
+                    requested_days=requested_days,
+                    as_of=self._today(),
+                )
+                request.fallback_leave_type = (
+                    allocation.fallback_balance.leave_type
+                    if allocation.fallback_balance is not None else None
+                )
+                request.primary_credit_days = allocation.primary_days
+                request.fallback_credit_days = allocation.fallback_days
+                request.lwop_days = allocation.lwop_days
+                request.reservation_posted = allocation.paid_days > 0
 
-        for user_id in self._decision_notification_recipients(
+                for reserved_balance, reserved_days in (
+                    (allocation.primary_balance, allocation.primary_days),
+                    (allocation.fallback_balance, allocation.fallback_days),
+                ):
+                    if reserved_balance is None or reserved_days <= 0:
+                        continue
+                    reserved_balance.reserved_days = Decimal(reserved_balance.reserved_days) + reserved_days
+                    self._validate_nonnegative_balance(reserved_balance)
+                    self.session.add(
+                        LeaveCreditTransaction(
+                            company_id=request.company_id,
+                            employee_id=request.employee_id,
+                            leave_type_id=reserved_balance.leave_type_id,
+                            leave_balance_id=reserved_balance.id,
+                            leave_request_id=request.id,
+                            created_by_user_id=values.manager_user_id,
+                            transaction_type="approval_reserved",
+                            amount_days=-reserved_days,
+                            note=(
+                                f"Reserved after final manager approval for {request.public_id}; "
+                                f"filed by {request.filed_by_employee.full_name if request.filed_by_employee else request.employee.full_name}; "
+                                f"automatic split includes {allocation.lwop_days} LWOP day(s)."
+                            ),
+                        )
+                    )
+                request.approved_at = now
+                request.status = "scheduled" if request.start_date > self._today() else "approved"
+                request.approval_stage = "completed"
+                request.current_approver_employee_id = None
+                decision_label = "Approved"
+
+        recipients = self._decision_notification_recipients(
             company_id=request.company_id,
             employee=request.employee,
             manager=request.manager,
-        ):
+            filed_by_employee=request.filed_by_employee,
+            current_approver=current_approver,
+        )
+        for user_id in recipients:
             if user_id == request.employee.user_id:
-                title = (
-                    f"Leave request {decision_label.lower()}"
-                )
+                title = f"Leave request {decision_label.lower()}"
                 message = (
-                    f"{request.public_id} was "
-                    f"{decision_label.lower()} by "
-                    f"{request.manager.full_name}. "
+                    f"{request.public_id} was {decision_label.lower()} by {current_approver.full_name}. "
                     f"Final split: {self.allocation_breakdown(request)}."
                 )
-            elif user_id == request.manager.user_id:
-                title = "Leave decision recorded"
-                message = (
-                    f"{request.public_id} was "
-                    f"{decision_label.lower()}."
-                )
+            elif request.filed_by_employee is not None and user_id == request.filed_by_employee.user_id:
+                title = "Team leave decision recorded"
+                message = f"{request.public_id} for {request.employee.full_name} was {decision_label.lower()}."
             else:
                 title = "Leave request reviewed"
-                message = (
-                    f"{request.manager.full_name} "
-                    f"{decision_label.lower()} "
-                    f"{request.public_id} for "
-                    f"{request.employee.full_name}."
-                )
-
+                message = f"{current_approver.full_name} {decision_label.lower()} {request.public_id}."
             self.notification_service.create(
                 company_id=request.company_id,
                 user_id=user_id,
-                event_type=(
-                    "leave_request_approved"
-                    if values.decision == "approve"
-                    else "leave_request_rejected"
-                ),
+                event_type=("leave_request_approved" if values.decision == "approve" else "leave_request_rejected"),
                 title=title,
                 message=message,
                 related_entity_type="leave_request",
@@ -2686,23 +3921,16 @@ class LeaveService:
 
         self.session.commit()
         self.session.refresh(request)
-
-        if values.decision == "approve":
-            self.reconcile_approved_leave(
-                company_id=request.company_id,
-                through_date=self._today(),
-            )
-            request = self.request_repository.get_with_details(
-                request.company_id,
-                request.id,
-            )
-
+        if values.decision == "approve" and not is_leader_stage:
+            self.reconcile_approved_leave(company_id=request.company_id, through_date=self._today())
+            request = self.request_repository.get_with_details(request.company_id, request.id)
         self._send_decision_email(
             request=request,
             decision_label=decision_label,
+            reviewer_name=current_approver.full_name,
         )
-
         return request
+
 
     def reconcile_approved_leave(
         self,
@@ -2724,9 +3952,11 @@ class LeaveService:
                 selected_date,
                 request.end_date,
             )
-            elapsed_days = self._business_days(
-                request.start_date,
-                elapsed_end,
+            elapsed_days = self._requested_days_for_duration(
+                company_id=request.company_id,
+                start_date=request.start_date,
+                end_date=elapsed_end,
+                duration_code=request.duration_code or "90503",
             )
             already_posted = Decimal(
                 request.posted_working_days

@@ -1,4 +1,4 @@
-streamlit>=1.50,<2.0
+streamlit>=1.61,<2.0
 streamlit-pdf>=1.0.5,<3.0
 sqlalchemy>=2.0,<3.0
 alembic>=1.13,<2.0
@@ -8,11 +8,22 @@ pydantic-settings>=2.4,<3.0
 python-dotenv>=1.0,<2.0
 argon2-cffi>=23.1,<24.0
 python-docx>=1.1,<2.0
+pdf2docx>=0.5.8,<0.6.0
+# pdf2docx currently imports the legacy fitz API. PyMuPDF 1.27+ emits a
+# terminal deprecation warning for that API, so keep the latest warning-free
+# compatible line until pdf2docx migrates to ``import pymupdf``.
+PyMuPDF>=1.26.7,<1.27.0
 Pillow>=10.0,<12.0
 pypdf>=5.0,<6.0
 openpyxl>=3.1,<4.0
+reportlab>=4.2,<5.0
 pandas>=2.2,<3.0
 email-validator>=2.2,<3.0
 pytest>=8.0,<9.0
 pytest-cov>=5.0,<6.0
 itsdangerous>=2.2,<3.0
+
+# Local Smart AI vector retrieval. Chroma's pre-fix dependency range allowed
+# PostHog 6+, whose keyword-only capture API causes repeated telemetry errors.
+chromadb>=1.0.15,<2.0
+posthog>=2.4,<6.0.0

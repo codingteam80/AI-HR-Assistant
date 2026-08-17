@@ -45,7 +45,7 @@ class AuthService:
     ) -> AuthenticatedUser:
         """Authenticate by company code plus username or email."""
 
-        normalized_company_code = company_code.strip()
+        normalized_company_code = company_code.strip().upper()
         normalized_identifier = login_identifier.strip()
 
         if not normalized_company_code:
@@ -58,7 +58,7 @@ class AuthService:
                 "Username/email and password are required."
             )
 
-        company = self.company_repository.get_by_code(
+        company = self.company_repository.get_by_code_case_insensitive(
             normalized_company_code
         )
 

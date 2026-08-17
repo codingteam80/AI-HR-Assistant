@@ -137,11 +137,11 @@ def test_admin_announcement_title_precedes_image() -> None:
     )
 
 
-def test_dashboard_prioritizes_announcement_opened_from_notification() -> None:
+def test_announcement_workspace_prioritizes_notification_target() -> None:
     source = (
-        ROOT / "ui/pages/user/dashboard_page.py"
+        ROOT / "ui/pages/user/announcements_page.py"
     ).read_text(encoding="utf-8")
 
     assert "def _target_announcement_id(" in source
-    assert 'st.query_params.get(\n        "announcement_id"' in source
+    assert 'st.query_params.get("announcement_id")' in source
     assert '"Opened from Notifications"' in source

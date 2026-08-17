@@ -47,7 +47,7 @@ def render_forgot_password_page() -> None:
 
             submitted = st.form_submit_button(
                 "Send Password Reset Link",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
 
@@ -84,6 +84,6 @@ def render_forgot_password_page() -> None:
 
         if st.button(
             "Back to Sign In",
-            use_container_width=True,
+            width="stretch",
         ):
             return_to_login()

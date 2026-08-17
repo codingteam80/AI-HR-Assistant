@@ -15,6 +15,7 @@ from ui.navigation_state import set_navigation_state
 ADMIN_NAVIGATION = (
     "Admin Dashboard",
     "Chat Assistant",
+    "Attendance Hub",
     "Company Profile",
     "Employees",
     "Policies",
@@ -36,14 +37,12 @@ def render_admin_sidebar(
     render_company_sidebar_logo(current_user)
 
     st.sidebar.markdown(
-        f"<div class='hr-brand'>🤖 {assistant_name}</div>",
+        (
+            f"<div class='hr-brand'>🤖 {assistant_name}</div>"
+            "<div class='hr-admin-nav-spacer' aria-hidden='true'></div>"
+        ),
         unsafe_allow_html=True,
     )
-    st.sidebar.caption("Administration Portal")
-    st.sidebar.caption(
-        current_user.employee_name or current_user.username
-    )
-    st.sidebar.divider()
 
     # Department names are managed directly from Employee Add/Edit.
     # Redirect older refresh-safe Department bookmarks to Employees.
@@ -75,7 +74,7 @@ def render_admin_sidebar(
 
         if st.sidebar.button(
             page_name,
-            use_container_width=True,
+            width="stretch",
             type=button_type,
             key=f"admin_nav_{page_name}",
         ):
@@ -89,7 +88,7 @@ def render_admin_sidebar(
 
     if st.sidebar.button(
         "Employee Portal",
-        use_container_width=True,
+        width="stretch",
         key="employee_portal_button",
     ):
         set_navigation_state(
@@ -100,7 +99,7 @@ def render_admin_sidebar(
 
     if st.sidebar.button(
         "Log Out",
-        use_container_width=True,
+        width="stretch",
         key="admin_logout_button",
     ):
         AuthSessionManager.logout()

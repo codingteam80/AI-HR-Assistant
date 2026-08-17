@@ -36,7 +36,7 @@ def render_sidebar(
 
         if st.sidebar.button(
             page_name,
-            use_container_width=True,
+            width="stretch",
             type=button_type,
             key=f"nav_{page_name}",
         ):
@@ -50,7 +50,7 @@ def render_sidebar(
     if AccessControl.is_admin(current_user):
         if st.sidebar.button(
             "Admin Portal",
-            use_container_width=True,
+            width="stretch",
             key="admin_portal_button",
         ):
             st.session_state.portal_mode = "admin"
@@ -59,7 +59,7 @@ def render_sidebar(
 
     if st.sidebar.button(
         "Log Out",
-        use_container_width=True,
+        width="stretch",
         key="logout_button",
     ):
         AuthSessionManager.logout()

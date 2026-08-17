@@ -20,6 +20,7 @@ from authentication.signed_cookie_auth_service import (
 )
 from database.session import SessionFactory
 from ui.navigation_state import clear_navigation_state
+from ui.components.browser_bridge import render_browser_bridge
 
 
 class AuthSessionManager:
@@ -297,6 +298,20 @@ class AuthSessionManager:
         remove_browser_auth_token(
             wait_for_completion=True
         )
+        st.rerun()
+
+    @classmethod
+    def complete_logout_transition(cls) -> None:
+        """Replace retained portal DOM with a clean public-login document."""
+
+        # A clean browser reload removes the protected portal DOM and its
+        # injected layout CSS before Login is rendered. A normal Streamlit
+        # rerun can briefly retain that old DOM, which previously hid the
+        # Welcome Back heading until the user manually refreshed the page.
+        render_browser_bridge(
+            "<script>window.parent.location.reload();</script>"
+        )
+        st.stop()
 
     @classmethod
     def clear_after_password_reset(cls) -> None:

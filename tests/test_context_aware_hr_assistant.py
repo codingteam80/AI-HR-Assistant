@@ -173,7 +173,7 @@ def test_employee_profile_reads_live_employee_record() -> None:
         assert "Company Administrator" in response.answer
 
 
-def test_document_question_routes_to_my_documents() -> None:
+def test_document_question_routes_to_company_forms_workspace() -> None:
     factory = _factory()
 
     with factory() as session:
@@ -184,7 +184,8 @@ def test_document_question_routes_to_my_documents() -> None:
         )
 
         assert response.intent == "documents"
-        assert response.actions[0].page == "My Documents"
+        assert response.actions[0].page == "Company Form/Documents"
+        assert response.actions[0].query_params == {"form_view": "view"}
         assert "My Documents" in response.answer
 
 
@@ -220,15 +221,19 @@ def test_chat_actions_use_internal_navigation() -> None:
 
 
 def test_leave_page_honors_assistant_deep_links() -> None:
-    source = (
+    page_source = (
         PROJECT_ROOT / "ui/pages/user/leave_management_page.py"
     ).read_text(encoding="utf-8")
+    route_source = (
+        PROJECT_ROOT / "ui/module_view_navigation.py"
+    ).read_text(encoding="utf-8")
 
-    assert "def _assistant_leave_view(" in source
-    assert '"leave_view"' in source
-    assert 'direct_view == "overview"' in source
-    assert 'direct_view == "file"' in source
-    assert 'direct_view == "requests"' in source
+    assert "def _assistant_leave_view(" in page_source
+    assert 'key="employee_leave_management_active_tab"' in page_source
+    assert '("employee", "Leave Management")' in route_source
+    assert '"overview": "My Leave Overview"' in route_source
+    assert '"file": "File Leave Request"' in route_source
+    assert '"requests": "My Requests"' in route_source
 
 
 

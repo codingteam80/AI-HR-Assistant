@@ -166,6 +166,7 @@ _NOTIFICATION_CONTEXT_QUERY_KEYS = (
     "policy_id",
     "company_form_id",
     "form_submission_id",
+    "form_view",
     "employee_id",
 )
 
@@ -228,7 +229,7 @@ def _notification_destination(
         return "employee", "Company Policies"
     if any(
         value in entity
-        for value in ("training", "course", "onboarding")
+        for value in ("training", "course", "onboarding", "benefit")
     ):
         return "employee", "Onboarding"
 
@@ -253,7 +254,10 @@ def _leave_notification_view(
     ).strip().casefold()
 
     if (
-        event_type == "leave_request_submitted"
+        event_type in {
+            "leave_request_submitted",
+            "leave_cancellation_requested",
+        }
         and "needs approval" in title
     ):
         return "pending"
@@ -283,6 +287,8 @@ def _notification_entity_query_key(item) -> str | None:
         return "reminder_id"
     if "announcement" in entity:
         return "announcement_id"
+    if "leave_balance" in entity:
+        return None
     if "leave" in entity:
         return "leave_request_id"
     if "company_form_submission" in entity or "form_submission" in entity:
@@ -343,6 +349,18 @@ def _open_notification(
 
     context_key = _notification_entity_query_key(item)
 
+    entity = str(item.related_entity_type or "").strip().casefold()
+    if "leave_balance" in entity:
+        st.query_params["leave_view"] = "overview"
+        if target_portal == "admin":
+            st.session_state["admin_leave_management_active_tab"] = (
+                "Employee Leave Accounts"
+            )
+        else:
+            st.session_state["employee_leave_management_active_tab"] = (
+                "My Leave Overview"
+            )
+
     if (
         context_key is not None
         and item.related_entity_id is not None
@@ -371,10 +389,26 @@ def _open_notification(
         ] = item.related_entity_id
 
     entity = str(item.related_entity_type or item.event_type or "").strip().casefold()
+    if target_portal == "employee" and "announcement" in entity:
+        st.session_state["employee_dashboard_active_tab"] = "Announcements"
     if "company_form" in entity or "form_submission" in entity:
-        st.session_state["company_forms_next_tab"] = (
-            "Overview" if target_portal == "admin" else "Fill / Submit"
-        )
+        if target_portal == "admin":
+            st.session_state["company_forms_next_tab"] = "Overview"
+        else:
+            employee_target = (
+                "My Documents"
+                if "form_submission" in entity
+                else "View"
+            )
+            st.session_state[
+                "employee_company_forms_next_tab"
+            ] = employee_target
+            st.session_state[
+                "employee_company_forms_active_tab"
+            ] = employee_target
+            st.query_params["form_view"] = (
+                "documents" if employee_target == "My Documents" else "view"
+            )
 
     st.session_state[_NOTIFICATION_PANEL_KEY] = False
     set_navigation_state(
@@ -440,84 +474,96 @@ def _render_notification_dropdown(
             unsafe_allow_html=True,
         )
 
-        if not recent:
-            st.markdown(
-                (
-                    '<div class="hr-notification-empty">'
-                    '<div class="hr-notification-empty-icon">🔔</div>'
-                    '<div class="hr-notification-empty-title">'
-                    'No notifications yet'
-                    '</div>'
-                    '<div class="hr-notification-empty-message">'
-                    'New HR, account, policy, training, leave, '
-                    'announcement, and system updates will appear here.'
-                    '</div>'
-                    '</div>'
-                ),
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="hr-notification-list-label">'
-                'Most recent'
-                '</div>',
-                unsafe_allow_html=True,
-            )
-
-            for item in recent:
-                state_label = (
-                    "unread"
-                    if not item.is_read
-                    else "read"
+        notification_list_height = min(
+            430,
+            max(150, 44 + (len(recent) * 116)),
+        )
+        with st.container(
+            key="notification_scroll_area",
+            height=notification_list_height,
+            border=False,
+        ):
+            if not recent:
+                st.markdown(
+                    (
+                        '<div class="hr-notification-empty">'
+                        '<div class="hr-notification-empty-icon">🔔</div>'
+                        '<div class="hr-notification-empty-title">'
+                        'No notifications yet'
+                        '</div>'
+                        '<div class="hr-notification-empty-message">'
+                        'New HR, account, policy, training, leave, '
+                        'announcement, and system updates will appear here.'
+                        '</div>'
+                        '</div>'
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="hr-notification-list-label">'
+                    'Most recent'
+                    '</div>',
+                    unsafe_allow_html=True,
                 )
 
-                with st.container(
-                    key=(
-                        f"notification_item_{state_label}_{item.id}"
-                    ),
-                ):
-                    if st.button(
-                        _notification_button_label(item),
-                        use_container_width=True,
-                        key=f"open_notification_{item.id}",
-                        help="Open the related HR module",
-                    ):
-                        _open_notification(
-                            item,
-                            current_user=current_user,
-                        )
-
-        action_left, action_right = st.columns(2)
-
-        with action_left:
-            if unread and st.button(
-                "Mark All as Read",
-                use_container_width=True,
-                key="notification_dropdown_mark_all_read",
-            ):
-                with SessionFactory() as session:
-                    NotificationService(
-                        session
-                    ).mark_all_read(
-                        company_id=current_user.company_id,
-                        user_id=current_user.user_id,
+                for item in recent:
+                    state_label = (
+                        "unread"
+                        if not item.is_read
+                        else "read"
                     )
 
-                st.session_state[
-                    _NOTIFICATION_PANEL_KEY
-                ] = True
-                st.rerun()
+                    with st.container(
+                        key=(
+                            f"notification_item_{state_label}_{item.id}"
+                        ),
+                    ):
+                        if st.button(
+                            _notification_button_label(item),
+                            width="stretch",
+                            key=f"open_notification_{item.id}",
+                            help="Open the related HR module",
+                        ):
+                            _open_notification(
+                                item,
+                                current_user=current_user,
+                            )
 
-        with action_right:
-            if st.button(
-                "Close",
-                use_container_width=True,
-                key="notification_dropdown_close",
-            ):
-                st.session_state[
-                    _NOTIFICATION_PANEL_KEY
-                ] = False
-                st.rerun()
+        with st.container(
+            key="notification_action_footer",
+        ):
+            action_left, action_right = st.columns(2)
+
+            with action_left:
+                if unread and st.button(
+                    "Mark All as Read",
+                    width="stretch",
+                    key="notification_dropdown_mark_all_read",
+                ):
+                    with SessionFactory() as session:
+                        NotificationService(
+                            session
+                        ).mark_all_read(
+                            company_id=current_user.company_id,
+                            user_id=current_user.user_id,
+                        )
+
+                    st.session_state[
+                        _NOTIFICATION_PANEL_KEY
+                    ] = True
+                    st.rerun()
+
+            with action_right:
+                if st.button(
+                    "Close",
+                    width="stretch",
+                    key="notification_dropdown_close",
+                ):
+                    st.session_state[
+                        _NOTIFICATION_PANEL_KEY
+                    ] = False
+                    st.rerun()
 
 
 def _render_notification_bell(
@@ -547,7 +593,7 @@ def _render_notification_bell(
         if st.button(
             label,
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="global_notification_button",
             help=(
                 f"{unread} unread notification"

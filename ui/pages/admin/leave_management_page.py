@@ -16,17 +16,24 @@ from zoneinfo import ZoneInfo
 from pydantic import ValidationError
 import json
 import streamlit as st
-import streamlit.components.v1 as components
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
+from core.leave_codes import duration_label, reason_label
 from database.session import SessionFactory
 from schemas.leave_schema import (
     LeaveCreditBalanceSetInput,
     LeaveTypeInput,
 )
 from services.leave_service import LeaveService
+from ui.components.browser_bridge import render_browser_bridge
 from ui.components.data_table import render_admin_table
+from ui.components.live_search import (
+    clear_live_search,
+    live_search_input,
+)
+from ui.pages.admin.leave_change_review import render_hr_change_review
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -49,6 +56,17 @@ def _days(value) -> str:
         .rstrip("0")
         .rstrip(".")
     )
+
+
+def _request_duration(request) -> str:
+    return duration_label(str(getattr(request, "duration_code", "") or "90503"))
+
+
+def _request_reason(request) -> str:
+    code = str(getattr(request, "reason_code", "") or "0")
+    standard = reason_label(code)
+    other = getattr(request, "reason_other", None)
+    return f"{standard} · {other}" if code == "0" and other else standard
 
 
 def _state_revision(key: str) -> int:
@@ -257,27 +275,32 @@ def _low_credit_rows(
 
 
 def _compact_request_rows(requests) -> list[dict[str, str]]:
-    """Build a concise request list for the Overview tab."""
+    """Build a concise request list with proxy-filing and hierarchy data."""
 
     return [
         {
-            "Request ID": (
-                request.public_id
-                or f"LRQ_{request.id:06d}"
+            "Request ID": request.public_id or f"LRQ_{request.id:06d}",
+            "Leave Owner": request.employee.full_name,
+            "Filed By": (
+                request.filed_by_employee.full_name
+                if request.filed_by_employee is not None
+                else request.employee.full_name
             ),
-            "Employee": request.employee.full_name,
             "Leave Type": request.leave_type.name,
             "Leave Dates": (
                 f"{request.start_date.isoformat()} to "
                 f"{request.end_date.isoformat()}"
             ),
+            "Duration": _request_duration(request),
             "Days": _days(request.requested_days),
-            "Credit / LWOP Split": LeaveService.allocation_breakdown(request),
-            "Manager": (
-                request.manager.full_name
-                if request.manager
-                else "—"
+            "Current Reviewer": (
+                request.current_approver.full_name
+                if request.current_approver is not None
+                else request.manager.full_name
+                if request.status.startswith("pending_") and request.manager is not None
+                else "Completed"
             ),
+            "Approval Stage": request.approval_stage.title(),
             "Status": _status_label(request.status),
         }
         for request in requests
@@ -414,6 +437,7 @@ def _render_overview(
                     "240px",
                 ),
                 compact=True,
+                max_height=170,
             )
         else:
             st.success(
@@ -421,10 +445,19 @@ def _render_overview(
                 f"{_days(_LOW_CREDIT_THRESHOLD)} days for {year}."
             )
 
-    st.markdown("### Recent Leave Requests")
+    # Former label: Recent Leave Requests. This panel now intentionally shows
+    # only requests that still need an approval or cancellation decision.
+    st.markdown("### Pending Leave Request")
 
     recent_requests = sorted(
-        requests,
+        (
+            request for request in requests
+            if request.status in {
+                "pending_leader_approval",
+                "pending_manager_approval",
+            }
+            or request.cancellation_status == "requested"
+        ),
         key=lambda item: (
             item.submitted_at,
             item.id,
@@ -438,10 +471,11 @@ def _render_overview(
             key=f"leave-overview-recent-{year}",
             min_width=1050,
             compact=True,
+            max_height=205,
         )
     else:
         st.info(
-            f"No leave requests are available for {year}."
+            f"No pending leave request is available for {year}."
         )
 
 
@@ -450,16 +484,9 @@ def _render_employee_account_summary(
     balances,
     year: int,
 ) -> None:
-    """Render one employee's identity and total account metrics."""
+    """Render the reordered account metrics before selectors."""
 
     totals = _account_totals(balances)
-
-    st.markdown("### Employee Leave Account")
-    st.caption(
-        f"{employee.employee_number} · {employee.full_name} · "
-        f"{employee.department.name if employee.department else 'No Department'} "
-        f"· Leave Year {year}"
-    )
 
     columns = st.columns(4)
     cards = [
@@ -478,6 +505,21 @@ def _render_employee_account_summary(
     ):
         with column:
             st.metric(label, value)
+
+
+def _render_employee_account_identity(employee, year: int) -> None:
+    """Render the selected employee heading before account details."""
+
+    st.markdown("### Employee Leave Account")
+    st.caption(
+        f"{employee.employee_number} · {employee.full_name} · "
+        f"{employee.department.name if employee.department else 'No Department'} "
+        f"· Leave Year {year}"
+    )
+
+
+def _render_employee_account_entitlement(employee, year: int) -> None:
+    """Render hire date, service, and annual-accrual explanation."""
 
     with SessionFactory() as session:
         summary = LeaveService(session).entitlement_summary(
@@ -529,14 +571,10 @@ def _render_credit_breakdown(
                     if item.is_applicable
                     else "N/A"
                 ),
-                # Keep the table simple: Credit shows all net additions for
-                # the selected year. The backend still stores automatic grants
-                # and administrator corrections separately for auditability.
+                # Credit is only the current annual/event allocation. Manual
+                # corrections affect Available Credits and audit history.
                 "Credit": (
-                    _days(
-                        Decimal(item.credit_days)
-                        + Decimal(item.adjustment_days)
-                    )
+                    _days(item.credit_days)
                     if item.is_applicable
                     else "N/A"
                 ),
@@ -548,6 +586,11 @@ def _render_credit_breakdown(
                 "Available Credits": (
                     _days(item.available_credits)
                     if item.is_applicable
+                    else "N/A"
+                ),
+                "Leave Utilization": (
+                    item.leave_utilization.display_text
+                    if item.leave_utilization is not None
                     else "N/A"
                 ),
                 "Converted to Cash": (
@@ -570,13 +613,14 @@ def _render_credit_breakdown(
             for item in table_rows
         ],
         key=f"employee-leave-account-{employee_id}-{year}",
-        min_width=1135,
+        min_width=1350,
         column_widths=(
             "200px",
             "135px",
             "110px",
             "85px",
             "145px",
+            "190px",
             "155px",
             "185px",
         ),
@@ -584,12 +628,14 @@ def _render_credit_breakdown(
     )
     st.caption(
         "Beginning Credit is the carried balance before the current annual "
-        "accrual. Credit shows the net credits added during the selected year, "
-        "including approved annual/event grants and any administrator "
-        "correction. Available Credits is the usable balance after usage, "
+        "accrual. Credit shows only the annual or approved event allocation "
+        "for the selected year. Administrator corrections affect Available "
+        "Credits and remain in audit history. Available Credits is the usable balance after usage, "
         "reservations, and cash conversion. Gender-inapplicable Maternity or "
         "Paternity rows display N/A. Only Vacation and Sick Leave may be "
-        "converted to cash."
+        "converted to cash. Vacation Leave utilization is a monitoring "
+        "target and is not deducted in advance; only an unmet target is "
+        "forfeited at year end."
     )
 
 
@@ -702,7 +748,7 @@ def _render_credit_balance_editor(
         submitted = st.form_submit_button(
             "Save Leave Credits",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not submitted:
@@ -756,7 +802,7 @@ def _render_credit_balance_editor(
         ValidationError,
         ValueError,
     ) as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 
@@ -859,19 +905,10 @@ def _render_employee_accounts(
         }
     )
 
-    filter_column, employee_column = st.columns(
-        [1.1, 2.4]
+    selected_department = st.session_state.get(
+        f"leave_account_department_{year}",
+        "All Departments",
     )
-
-    with filter_column:
-        selected_department = st.selectbox(
-            "Department",
-            options=[
-                "All Departments",
-                *departments,
-            ],
-            key=f"leave_account_department_{year}",
-        )
 
     options = _employee_options(
         grouped,
@@ -884,6 +921,35 @@ def _render_employee_accounts(
         )
         return
 
+    selected_employee_id = st.session_state.get(
+        f"leave_account_employee_{year}",
+        next(iter(options)),
+    )
+    if selected_employee_id not in options:
+        selected_employee_id = next(iter(options))
+
+    balances = grouped[selected_employee_id]
+    employee = balances[0].employee
+
+    _render_employee_account_summary(
+        employee,
+        balances,
+        year,
+    )
+
+    _render_employee_account_identity(employee, year)
+
+    filter_column, employee_column = st.columns([1.1, 2.4])
+    with filter_column:
+        selected_department = st.selectbox(
+            "Department",
+            options=["All Departments", *departments],
+            key=f"leave_account_department_{year}",
+        )
+    options = _employee_options(grouped, department_name=selected_department)
+    if not options:
+        st.info("No employee leave account matches the selected department.")
+        return
     with employee_column:
         selected_employee_id = st.selectbox(
             "Employee",
@@ -894,12 +960,7 @@ def _render_employee_accounts(
 
     balances = grouped[selected_employee_id]
     employee = balances[0].employee
-
-    _render_employee_account_summary(
-        employee,
-        balances,
-        year,
-    )
+    _render_employee_account_entitlement(employee, year)
     _render_credit_breakdown(
         selected_employee_id,
         balances,
@@ -927,6 +988,97 @@ def _render_employee_accounts(
             selected_employee_id,
             year,
         )
+
+
+def _render_leave_history(
+    current_user: AuthenticatedUser,
+    year: int,
+    requests,
+) -> None:
+    """Render company-scoped leave request and immutable credit transactions."""
+
+    search_text = live_search_input(
+        "Search Leave History",
+        placeholder="Search any request, employee, action, status, date, or credit column…",
+        key=f"leave_history_search_{year}",
+    ).strip().casefold()
+
+    rows: list[dict[str, str]] = []
+    for request in requests:
+        events = [(request.submitted_at, "Leave Filed", request.filed_by_employee, _status_label(request.status))]
+        if request.leader_reviewed_at:
+            events.append((request.leader_reviewed_at, "Leader Review", request.leader_approver, request.leader_comment or "Forwarded/Reviewed"))
+        if request.reviewed_at:
+            events.append((request.reviewed_at, "Manager Review", request.manager, request.manager_comment or _status_label(request.status)))
+        if request.cancellation_requested_at:
+            events.append((request.cancellation_requested_at, "Leave Withdrawal Requested", request.cancellation_requested_by_employee, request.cancellation_reason or "—"))
+        if request.cancellation_reviewed_at:
+            events.append((request.cancellation_reviewed_at, "Leave Withdrawal Reviewed", request.manager, request.cancellation_comment or LeaveService.cancellation_label(request)))
+        for event_date, action, actor, details in events:
+            rows.append({
+                "Date": _format_datetime(event_date),
+                "Employee": f"{request.employee.employee_number} · {request.employee.full_name}",
+                "Request ID": request.public_id or f"LRQ_{request.id:06d}",
+                "Actor": actor.full_name if actor is not None else "System",
+                "Action": action,
+                "Leave Type": request.leave_type.name,
+                "Days": _days(request.requested_days),
+                "Credit / LWP": LeaveService.allocation_breakdown(request),
+                "Status / Result": details,
+            })
+
+    with SessionFactory() as session:
+        transactions = LeaveService(session).list_company_credit_history(
+            current_user.company_id,
+            year,
+        )
+    for item in transactions:
+        rows.append({
+            "Date": _format_datetime(item.created_at),
+            "Employee": f"{item.employee.employee_number} · {item.employee.full_name}",
+            "Request ID": (
+                item.leave_request.public_id
+                if item.leave_request is not None
+                else "—"
+            ),
+            "Actor": (
+                item.created_by.employee.full_name
+                if item.created_by is not None and item.created_by.employee is not None
+                else item.created_by.username
+                if item.created_by is not None
+                else "System"
+            ),
+            "Action": _status_label(item.transaction_type),
+            "Leave Type": item.leave_type.name,
+            "Days": _credit_history_entry(item),
+            "Credit / LWP": "Credit Transaction",
+            "Status / Result": item.note or "—",
+        })
+
+    rows.sort(
+        key=lambda row: (
+            datetime.strptime(row["Date"], "%Y-%m-%d %I:%M %p")
+            if row["Date"] != "—"
+            else datetime.min
+        ),
+        reverse=True,
+    )
+    if search_text:
+        rows = [
+            row for row in rows
+            if search_text in " ".join(str(value) for value in row.values()).casefold()
+        ]
+    st.caption(f"{len(rows)} leave process/transaction history record(s) shown.")
+    if not rows:
+        st.info(f"No leave history matches the current search for {year}.")
+        return
+    render_admin_table(
+        rows,
+        key=f"leave-process-history-{year}",
+        min_width=1450,
+        max_height=430,
+        compact=True,
+    )
 
 
 def _filtered_requests(
@@ -971,9 +1123,30 @@ def _filtered_requests(
         if (
             normalized_search
             and normalized_search
-            not in (
-                f"{request.employee.employee_number} "
-                f"{request.employee.full_name}"
+            not in " ".join(
+                str(value)
+                for value in (
+                    request.public_id,
+                    request.employee.employee_number,
+                    request.employee.full_name,
+                    request.filed_by_employee.full_name if request.filed_by_employee else "",
+                    request_department,
+                    request.leave_type.code,
+                    request.leave_type.name,
+                    request.start_date,
+                    request.end_date,
+                    _request_duration(request),
+                    request.requested_days,
+                    _request_reason(request),
+                    request.manager.full_name if request.manager else "",
+                    request.current_approver.full_name if request.current_approver else "",
+                    request.approval_stage,
+                    request_status,
+                    request.cancellation_status,
+                    LeaveService.allocation_breakdown(request),
+                    request.email_status,
+                )
+                if value not in (None, "")
             ).casefold()
         ):
             continue
@@ -1014,6 +1187,35 @@ def _render_request_details(
         st.error("The selected request is unavailable.")
         return
 
+    if Decimal(request.lwop_days or Decimal("0.00")) > Decimal("0.00"):
+        paid_days = (
+            Decimal(request.primary_credit_days or Decimal("0.00"))
+            + Decimal(request.fallback_credit_days or Decimal("0.00"))
+        )
+        st.warning(
+            (
+                f"No available {request.leave_type.name} credits: all "
+                f"{_days(request.lwop_days)} countable day(s) are Leave "
+                "Without Pay (LWP)."
+            )
+            if paid_days <= Decimal("0.00")
+            else (
+                f"Available credits are insufficient; "
+                f"{_days(request.lwop_days)} day(s) are Leave Without Pay (LWP)."
+            )
+        )
+
+    filed_by_employee = request.filed_by_employee
+    if request.filed_on_behalf:
+        filer_role = (
+            filed_by_employee.job_title
+            if filed_by_employee is not None and filed_by_employee.job_title
+            else "Leader/Manager"
+        )
+        filing_source = f"{filer_role} Filed on Behalf"
+    else:
+        filing_source = "Employee Self-Filed"
+
     st.markdown("### Request Details")
 
     render_admin_table(
@@ -1026,10 +1228,40 @@ def _render_request_details(
                 ),
             },
             {
-                "Field": "Employee",
+                "Field": "Leave Owner",
                 "Value": (
                     f"{request.employee.employee_number} · "
                     f"{request.employee.full_name}"
+                ),
+            },
+            {
+                "Field": "Filed By",
+                "Value": (
+                    filed_by_employee.full_name
+                    if filed_by_employee is not None
+                    else request.employee.full_name
+                ),
+            },
+            {
+                "Field": "Filing Source",
+                "Value": filing_source,
+            },
+            {
+                "Field": "Approval Route",
+                "Value": (
+                    f"{request.leader_approver.full_name} → {request.manager.full_name}"
+                    if request.leader_approver is not None and request.manager is not None
+                    else request.manager.full_name
+                    if request.manager is not None
+                    else "—"
+                ),
+            },
+            {
+                "Field": "Current Reviewer",
+                "Value": (
+                    request.current_approver.full_name
+                    if request.current_approver is not None
+                    else "Completed"
                 ),
             },
             {
@@ -1056,14 +1288,19 @@ def _render_request_details(
                 "Value": _days(request.requested_days),
             },
             {
+                "Field": "Duration",
+                "Value": _request_duration(request),
+            },
+            {
                 "Field": "Credit / LWOP Split",
                 "Value": LeaveService.allocation_breakdown(request),
             },
             {
-                "Field": "Manager / To",
+                "Field": "To Recipients",
                 "Value": (
-                    f"{request.manager.full_name if request.manager else '—'} "
-                    f"· {request.manager_email}"
+                    "\n".join(service.to_emails(request))
+                    if service.to_emails(request)
+                    else "—"
                 ),
             },
             {
@@ -1089,12 +1326,20 @@ def _render_request_details(
                 ),
             },
             {
-                "Field": "Reason",
-                "Value": request.reason,
+                "Field": "Reason for Leave",
+                "Value": reason_label(str(request.reason_code or "0")),
+            },
+            {
+                "Field": "Reason for Leave: Others",
+                "Value": request.reason_other or "—",
             },
             {
                 "Field": "Work Handover Plan / Countermeasure",
                 "Value": request.handover_plan or "Not provided",
+            },
+            {
+                "Field": "Leader Comment",
+                "Value": request.leader_comment or "—",
             },
             {
                 "Field": "Manager Comment",
@@ -1129,12 +1374,14 @@ def _render_request_details(
                 request.attachment_mime_type
                 or "application/octet-stream"
             ),
-            use_container_width=True,
+            width="stretch",
         )
 
+    render_hr_change_review(current_user, request)
+
     st.caption(
-        "Department managers approve or reject requests in their "
-        "Employee Portal. This page is view-only."
+        "Assigned leaders perform the first approval when present. The "
+        "assigned manager performs the final decision. This page is view-only."
     )
 
 
@@ -1191,7 +1438,9 @@ def _render_requests(
         st.session_state[f"leave_request_status_{year}"] = (
             "All Statuses"
         )
-        st.session_state[f"leave_request_employee_search_{year}"] = ""
+        clear_live_search(
+            f"leave_request_employee_search_{year}"
+        )
 
     department_column, type_column, status_column = st.columns(3)
 
@@ -1225,11 +1474,24 @@ def _render_requests(
             key=f"leave_request_status_{year}",
         )
 
-    employee_search = st.text_input(
-        "Find Employee",
-        placeholder="Employee number or name...",
+    employee_search = live_search_input(
+        "Search Leave Requests",
+        placeholder="Search any displayed leave-request column…",
         key=f"leave_request_employee_search_{year}",
+        suggestions=(
+            value
+            for request in requests
+            for value in (
+                request.employee.employee_number,
+                request.employee.full_name,
+                request.public_id,
+                request.leave_type.name,
+                _status_label(request.status),
+                request.approval_stage,
+            )
+        ),
     )
+    # Previous label kept only as migration context: "Find Employee".
 
     filtered = _filtered_requests(
         requests,
@@ -1265,7 +1527,9 @@ def _render_requests(
                 "Leave Type": request.leave_type.name,
                 "Start Date": request.start_date.isoformat(),
                 "End Date": request.end_date.isoformat(),
+                "Duration": _request_duration(request),
                 "Days": _days(request.requested_days),
+                "Reason": _request_reason(request),
                 "Manager": (
                     request.manager.full_name
                     if request.manager
@@ -1277,18 +1541,20 @@ def _render_requests(
             for request in filtered
         ],
         key=f"leave-request-monitoring-{year}",
-        min_width=1450,
+        min_width=1735,
         column_widths=(
             "125px",
             "190px",
-            "155px",
-            "145px",
+            "150px",
+            "150px",
             "110px",
             "110px",
-            "75px",
-            "180px",
-            "145px",
-            "90px",
+            "150px",
+            "70px",
+            "250px",
+            "160px",
+            "170px",
+            "100px",
         ),
     )
 
@@ -1453,7 +1719,7 @@ def _render_type_form(
         submitted = st.form_submit_button(
             "Save Leave Rule",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not submitted:
@@ -1509,7 +1775,7 @@ def _render_type_form(
         ValidationError,
         ValueError,
     ) as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_rules(
@@ -1518,10 +1784,10 @@ def _render_rules(
     """Render leave types, allocations, and request requirements."""
 
     st.info(
-        "January annual accrual: Vacation Leave and Sick Leave each receive "
-        "15 days. Employees with at least five completed service years on "
-        "January 1 receive 17 days for each. A mid-year fifth anniversary "
-        "applies on the next January processing. Unused SL/VL becomes the next "
+        "January annual accrual for Vacation and Sick Leave follows completed "
+        "tenure on January 1: 1–5 years = 15 days, 6–10 = 17, 11–15 = 20, "
+        "16–20 = 23, and 21+ = 26. A mid-year bracket change applies on the "
+        "next January processing. Unused SL/VL becomes the next "
         "year's Beginning Credit; cash-conversion limits are added in Phase 3."
     )
 
@@ -1559,11 +1825,11 @@ def _render_rules(
                     else "Inactive"
                 ),
                 "Automatic Rule": (
-                    "Regular Vacation bucket; add Emergency for total entitlement; +2 after 5 years"
+                    "January tenure bracket: 15 / 17 / 20 / 23 / 26 days"
                     if item.code.upper() == "VACATION"
                     else "Included in Vacation total"
                     if item.code.upper() == "EMERGENCY"
-                    else "+2 after 5 completed years"
+                    else "January tenure bracket: 15 / 17 / 20 / 23 / 26 days"
                     if item.code.upper() == "SICK"
                     else "Automatic excess when paid credits are insufficient"
                     if item.code.upper() == "LWOP"
@@ -1670,7 +1936,7 @@ def _activate_leave_tabs(tab_labels: list[str]) -> None:
         "window.setTimeout(activateTargetTabs,450);"
         "</script>"
     )
-    components.html(script, height=0, width=0)
+    render_browser_bridge(script)
 
 
 def _activate_leave_tab(tab_label: str) -> None:
@@ -1727,17 +1993,14 @@ def render_admin_leave_management_page(
 
     if notification_year is not None:
         st.session_state["leave_management_year"] = notification_year
+    elif "leave_management_year" not in st.session_state:
+        st.session_state["leave_management_year"] = _current_leave_year()
 
     selected_year = int(
         st.number_input(
             "Leave Year",
             min_value=2000,
             max_value=2200,
-            value=(
-                notification_year
-                if notification_year is not None
-                else _current_leave_year()
-            ),
             step=1,
             key="leave_management_year",
             help=(
@@ -1760,13 +2023,16 @@ def render_admin_leave_management_page(
 
     grouped = _group_balances(balances)
 
-    overview_tab, accounts_tab, requests_tab, rules_tab = st.tabs(
+    overview_tab, accounts_tab, requests_tab, rules_tab, history_tab = st.tabs(
         [
             "Overview",
             "Employee Leave Accounts",
             "Leave Requests",
             "Leave Rules",
-        ]
+            "History",
+        ],
+        key="admin_leave_management_active_tab",
+        on_change="rerun",
     )
 
     with overview_tab:
@@ -1794,6 +2060,9 @@ def render_admin_leave_management_page(
 
     with rules_tab:
         _render_rules(current_user)
+
+    with history_tab:
+        _render_leave_history(current_user, selected_year, requests)
 
     restored_tabs = st.session_state.pop(
         _ADMIN_LEAVE_NEXT_TABS_KEY,

@@ -8,7 +8,7 @@ Purpose:
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,7 +21,13 @@ def _build_connect_args(database_url: str) -> dict[str, object]:
     # SQLite normally restricts a connection to one thread.
     # Streamlit can use multiple execution contexts, so this is disabled.
     if database_url.startswith("sqlite"):
-        return {"check_same_thread": False}
+        return {
+            "check_same_thread": False,
+            # Give concurrent Streamlit requests time to finish their write
+            # transaction instead of failing immediately with
+            # ``sqlite3.OperationalError: database is locked``.
+            "timeout": 30.0,
+        }
 
     # PostgreSQL and other engines do not need the SQLite option.
     return {}
@@ -37,12 +43,29 @@ def create_database_engine(database_url: str | None = None) -> Engine:
     settings = get_settings()
     selected_url = database_url or settings.database_url
 
-    return create_engine(
+    database_engine = create_engine(
         selected_url,
         connect_args=_build_connect_args(selected_url),
         pool_pre_ping=True,  # Check stale pooled connections before use.
         future=True,
     )
+
+    if selected_url.startswith("sqlite"):
+        @event.listens_for(database_engine, "connect")
+        def _configure_sqlite_connection(
+            dbapi_connection,
+            _connection_record,
+        ) -> None:
+            # SQLite accepts only one writer at a time. ``busy_timeout`` makes
+            # each connection wait for a short-lived writer to finish.
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA busy_timeout = 30000")
+                cursor.execute("PRAGMA foreign_keys = ON")
+            finally:
+                cursor.close()
+
+    return database_engine
 
 
 # Shared application engine.

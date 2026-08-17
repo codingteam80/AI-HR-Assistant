@@ -2,8 +2,8 @@
 
 Purpose:
 - Add the current year's Vacation Leave and Sick Leave credits.
-- Use 15 days for employees below five completed service years on January 1.
-- Use 17 days for employees with at least five completed service years.
+- Use the completed-tenure bracket on January 1:
+  1–5 years = 15, 6–10 = 17, 11–15 = 20, 16–20 = 23, 21+ = 26 days.
 - Carry the previous year's unused SL/VL into Beginning Credit.
 - Avoid duplicate credits when the command is run more than once.
 

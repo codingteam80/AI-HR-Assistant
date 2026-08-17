@@ -12,8 +12,8 @@ data-testid attributes and update only the widget selector section below.
 """
 
 import streamlit as st
-import streamlit.components.v1 as components
 
+from ui.components.browser_bridge import render_browser_bridge
 from ui.theme.design_tokens import DARK_THEME, LIGHT_THEME
 from ui.theme.theme_state import get_active_theme
 
@@ -132,11 +132,7 @@ def _synchronize_theme_with_browser(
         </script>
     """.replace("__ACTIVE_THEME__", active_theme)
 
-    components.html(
-        script,
-        height=0,
-        width=0,
-    )
+    render_browser_bridge(script)
 
 def _enforce_input_value_contrast() -> None:
     """Force white input values after Streamlit/BaseWeb finishes rendering.
@@ -148,7 +144,7 @@ def _enforce_input_value_contrast() -> None:
     to input elements and does not read or transmit their values.
     """
 
-    components.html(
+    render_browser_bridge(
         """
         <script>
         (() => {
@@ -246,9 +242,7 @@ def _enforce_input_value_contrast() -> None:
             );
         })();
         </script>
-        """,
-        height=0,
-        width=0,
+        """
     )
 
 def apply_theme() -> None:

@@ -204,5 +204,3 @@ def remove_browser_auth_token(
             _stop_for_browser_result(
                 "Signing out…"
             )
-
-        st.rerun()

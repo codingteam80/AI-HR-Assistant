@@ -184,6 +184,32 @@ class AdminHRAssistant:
         if cls._contains_any(
             query,
             {
+                "attendance",
+                "dtr",
+                "time in",
+                "time out",
+                "overtime",
+                "work status",
+            },
+        ):
+            return "attendance"
+
+        if cls._contains_any(
+            query,
+            {
+                "company form",
+                "company forms",
+                "form document",
+                "employee submission",
+                "submitted form",
+                "upload form",
+            },
+        ):
+            return "company_forms"
+
+        if cls._contains_any(
+            query,
+            {
                 "add employee",
                 "create employee",
                 "new employee",
@@ -413,11 +439,127 @@ class AdminHRAssistant:
         return contextual if contextual != "not_found" else previous_intent
 
     @staticmethod
-    def _admin_action(label: str, page: str) -> HRAssistantAction:
+    def _admin_action(
+        label: str,
+        page: str,
+        *,
+        query_params: dict[str, str] | None = None,
+    ) -> HRAssistantAction:
+        default_views = {
+            "Employees": {"employee_view": "list"},
+            "Policies": {"policy_view": "library"},
+            "Leave Management": {"leave_view": "overview"},
+            "Announcements": {"announcement_view": "overview"},
+            "Company Form/Documents": {"form_view": "overview"},
+        }
         return HRAssistantAction(
             label=label,
             page=page,
             portal_mode="admin",
+            query_params=(
+                dict(query_params)
+                if query_params is not None
+                else dict(default_views.get(page, {}))
+            ),
+        )
+
+    def _leave_credit_ranking(
+        self,
+        current_user: AuthenticatedUser,
+        normalized_question: str,
+    ) -> HRAssistantResponse:
+        """Rank live employee leave credits for a comparative admin question."""
+
+        year = date.today().year
+        balances = self.leave_service.list_company_balances(
+            current_user.company_id,
+            year,
+        )
+        paid_balances = [
+            balance
+            for balance in balances
+            if bool(balance.leave_type.is_paid)
+        ]
+
+        requested_type = None
+        for balance in paid_balances:
+            aliases = {
+                self.normalize_query(balance.leave_type.name),
+                self.normalize_query(balance.leave_type.code),
+            }
+            if any(alias and alias in normalized_question for alias in aliases):
+                requested_type = balance.leave_type_id
+                break
+
+        if requested_type is not None:
+            paid_balances = [
+                balance
+                for balance in paid_balances
+                if balance.leave_type_id == requested_type
+            ]
+
+        totals: dict[int, Decimal] = {}
+        employees: dict[int, object] = {}
+        for balance in paid_balances:
+            totals[balance.employee_id] = (
+                totals.get(balance.employee_id, Decimal("0.00"))
+                + Decimal(balance.remaining_days)
+            )
+            employees[balance.employee_id] = balance.employee
+
+        if not totals:
+            return HRAssistantResponse(
+                answer=f"No paid leave-credit balances are available for {year}.",
+                intent="leave_summary",
+                actions=[
+                    self._admin_action(
+                        "Open Employee Leave Accounts",
+                        "Leave Management",
+                        query_params={"leave_view": "accounts"},
+                    )
+                ],
+            )
+
+        ascending = self._contains_any(
+            normalized_question,
+            {"lowest", "least", "low", "mababa", "pinakamababa"},
+        )
+        ranked = sorted(
+            totals.items(),
+            key=lambda item: (item[1], employees[item[0]].full_name.casefold()),
+            reverse=not ascending,
+        )[:5]
+
+        leave_label = "paid leave"
+        if requested_type is not None:
+            selected_balance = next(
+                balance
+                for balance in paid_balances
+                if balance.leave_type_id == requested_type
+            )
+            leave_label = selected_balance.leave_type.name
+
+        direction = "Lowest" if ascending else "Highest"
+        lines = [
+            f"{direction} available {leave_label} credits for **{year}**:"
+        ]
+        for index, (employee_id, total) in enumerate(ranked, start=1):
+            employee = employees[employee_id]
+            lines.append(
+                f"{index}. **{employee.employee_number} — {employee.full_name}:** "
+                f"{self._format_days(total)} day(s) available"
+            )
+
+        return HRAssistantResponse(
+            answer="\n".join(lines),
+            intent="leave_summary",
+            actions=[
+                self._admin_action(
+                    "Open Employee Leave Accounts",
+                    "Leave Management",
+                    query_params={"leave_view": "accounts"},
+                )
+            ],
         )
 
     def _employees(self, company_id: int):
@@ -588,6 +730,29 @@ class AdminHRAssistant:
         )
         normalized = self.normalize_query(question)
 
+        comparative_credit_question = (
+            self._contains_any(normalized, {"credit", "credits"})
+            and self._contains_any(
+                normalized,
+                {
+                    "highest",
+                    "most",
+                    "top",
+                    "mataas",
+                    "pinakamataas",
+                    "lowest",
+                    "least",
+                    "low",
+                    "mababa",
+                    "pinakamababa",
+                    "sino",
+                    "who",
+                },
+            )
+        )
+        if comparative_credit_question and not matches:
+            return self._leave_credit_ranking(current_user, normalized)
+
         if matches and any(
             term in normalized
             for term in ("balance", "credit", "credits", "remaining", "left", "ilan")
@@ -614,7 +779,13 @@ class AdminHRAssistant:
             return HRAssistantResponse(
                 answer="\n".join(lines),
                 intent="leave_summary",
-                actions=[self._admin_action("Open Leave Management", "Leave Management")],
+                actions=[
+                    self._admin_action(
+                        "Open Employee Leave Accounts",
+                        "Leave Management",
+                        query_params={"leave_view": "accounts"},
+                    )
+                ],
             )
 
         self.leave_service.reconcile_approved_leave(
@@ -647,7 +818,13 @@ class AdminHRAssistant:
         return HRAssistantResponse(
             answer=answer,
             intent="leave_summary",
-            actions=[self._admin_action("Open Leave Management", "Leave Management")],
+            actions=[
+                self._admin_action(
+                    "Open Leave Overview",
+                    "Leave Management",
+                    query_params={"leave_view": "overview"},
+                )
+            ],
         )
 
     def _policy_summary(self, current_user: AuthenticatedUser) -> HRAssistantResponse:
@@ -735,8 +912,10 @@ class AdminHRAssistant:
                 "- Company leave requests, on-leave totals, and credit summaries\n"
                 "- Published policy summaries and approved-policy questions\n"
                 "- Announcement status summaries\n"
+                "- Attendance / DTR / OT and Company Form/Documents workflows\n"
                 "- Navigation and basic workflows for Employees, Policies, "
-                "Leave Management, Announcements, Company Profile, and Integrations\n"
+                "Leave Management, Announcements, Company Profile, Reports, "
+                "and Integrations\n"
                 "- Personal employee questions such as your own leave balance\n\n"
                 "Passwords, hashes, reset tokens, and secret configuration values "
                 "are never shown."
@@ -817,8 +996,8 @@ class AdminHRAssistant:
                 "Employees",
             ),
             "leave_howto": (
-                "Open **Leave Management**. Use Credit Management for absolute "
-                "balances, Leave Types & Rules for configuration, and Leave "
+                "Open **Leave Management**. Use Employee Leave Accounts for "
+                "balances, Leave Rules for configuration, and Leave "
                 "Requests for company monitoring. Manager approval remains in "
                 "the manager workflow.",
                 "Open Leave Management",
@@ -867,14 +1046,40 @@ class AdminHRAssistant:
                 "Open Admin Dashboard",
                 "Admin Dashboard",
             ),
+            "attendance": (
+                "Open **Admin Dashboard** and use **Attendance / DTR / OT** to "
+                "review monthly attendance, time records, work status, overtime, "
+                "employee edit history, and authorized corrections.",
+                "Open Attendance / DTR / OT",
+                "Admin Dashboard",
+            ),
+            "company_forms": (
+                "Open **Company Form/Documents** to upload or manage company "
+                "templates and review employee form submissions.",
+                "Open Company Form/Documents",
+                "Company Form/Documents",
+            ),
         }
 
         if intent in direct_answers:
             answer, label, page = direct_answers[intent]
+            exact_params = {
+                "employee_howto": {"employee_view": "add"},
+                "leave_howto": {"leave_view": "accounts"},
+                "policy_howto": {"policy_view": "upload"},
+                "announcement_howto": {"announcement_view": "create"},
+                "company_forms": {"form_view": "overview"},
+            }.get(intent)
             return HRAssistantResponse(
                 answer=answer,
                 intent=intent,
-                actions=[self._admin_action(label, page)],
+                actions=[
+                    self._admin_action(
+                        label,
+                        page,
+                        query_params=exact_params,
+                    )
+                ],
             )
 
         # Final approved-policy fallback for a natural HR question.

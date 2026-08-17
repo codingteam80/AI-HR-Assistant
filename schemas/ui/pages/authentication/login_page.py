@@ -56,7 +56,7 @@ def render_login_page(default_company_code: str) -> None:
 
             submitted = st.form_submit_button(
                 "Sign In",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
 

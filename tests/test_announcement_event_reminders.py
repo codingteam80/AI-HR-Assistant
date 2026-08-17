@@ -478,4 +478,4 @@ def test_create_reminder_clears_only_after_success_and_keeps_workspace() -> None
     assert '_remember_reminder_tab("Create Reminder")' in page_source
     assert 'default=reminder_default_tab' in page_source
     assert 'default=announcement_default_tab' in page_source
-    assert 'streamlit>=1.50,<2.0' in requirements
+    assert 'streamlit>=1.61,<2.0' in requirements

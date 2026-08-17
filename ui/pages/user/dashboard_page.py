@@ -1,71 +1,84 @@
-"""Employee landing dashboard with full-width company announcements."""
+"""Employee landing dashboard and attendance workspace."""
 
 import streamlit as st
 
 from authentication.current_user import AuthenticatedUser
-from schemas.announcement_schema import (
-    ANNOUNCEMENT_CATEGORIES,
+from ui.pages.user.attendance_workspace import (
+    render_employee_attendance_workspace,
 )
 from ui.pages.user.announcements_page import (
-    _load_announcements,
-    render_announcement_card,
+    _target_announcement_id,
+    load_employee_announcement_state,
+    render_employee_announcements_page,
 )
 
 
-def _filter_announcements(
-    announcements,
-    *,
-    category: str,
-    search_text: str,
-):
-    """Filter active announcements inside the dashboard."""
-
-    normalized_search = search_text.strip().casefold()
-    filtered = []
-
-    for announcement in announcements:
-        if (
-            category != "All Categories"
-            and announcement.category != category
-        ):
-            continue
-
-        searchable = (
-            f"{announcement.title} "
-            f"{announcement.summary} "
-            f"{announcement.content}"
-        ).casefold()
-
-        if (
-            normalized_search
-            and normalized_search not in searchable
-        ):
-            continue
-
-        filtered.append(announcement)
-
-    return filtered
+_DASHBOARD_TAB_STATE_KEY = "employee_dashboard_active_tab"
+_ANNOUNCEMENT_TARGET_STATE_KEY = "_employee_announcement_target_opened"
 
 
-def _target_announcement_id() -> int | None:
-    """Return a safe announcement ID opened from a notification."""
+def _render_dashboard_tabs(unread_count: int):
+    """Render stateful native tabs matching the Leave Management layout."""
 
-    raw_value = st.query_params.get(
-        "announcement_id"
+    target_id = _target_announcement_id()
+    opened_target_id = st.session_state.get(
+        _ANNOUNCEMENT_TARGET_STATE_KEY
+    )
+    if target_id is not None and target_id != opened_target_id:
+        st.session_state[_DASHBOARD_TAB_STATE_KEY] = "Announcements"
+        st.session_state[_ANNOUNCEMENT_TARGET_STATE_KEY] = target_id
+
+    current = st.session_state.get(
+        _DASHBOARD_TAB_STATE_KEY,
+        "Dashboard",
+    )
+    options = ("Dashboard", "Announcements")
+    if current not in options:
+        st.session_state[_DASHBOARD_TAB_STATE_KEY] = "Dashboard"
+
+    shake_css = (
+        "animation: employeeAnnouncementTabShake .65s ease-in-out 3;"
+        if unread_count > 0
+        else ""
+    )
+    st.markdown(
+        f"""
+        <style>
+        @keyframes employeeAnnouncementTabShake {{
+            0%, 100% {{ transform: translateX(0); }}
+            25% {{ transform: translateX(-2px); }}
+            75% {{ transform: translateX(2px); }}
+        }}
+        .st-key-employee_dashboard_active_tab
+        [data-baseweb="tab-list"] [role="tab"]:nth-child(2)::after {{
+            content: " ({unread_count})";
+        }}
+        .st-key-employee_dashboard_active_tab
+        [data-baseweb="tab-list"] [role="tab"]:nth-child(2) {{
+            {shake_css}
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .st-key-employee_dashboard_active_tab
+            [data-baseweb="tab-list"] [role="tab"]:nth-child(2) {{
+                animation: none !important;
+            }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        return None
-
-    return value if value > 0 else None
+    return st.tabs(
+        options,
+        key=_DASHBOARD_TAB_STATE_KEY,
+        on_change="rerun",
+    )
 
 
 def render_employee_dashboard_page(
     current_user: AuthenticatedUser,
 ) -> None:
-    """Render active company announcements across the dashboard width."""
+    """Render the employee summary and Attendance / DTR workspace."""
 
     display_name = (
         current_user.employee_name
@@ -73,108 +86,23 @@ def render_employee_dashboard_page(
     )
 
     st.title(f"Welcome, {display_name}")
-    st.caption(
-        "Official company updates are available from this dashboard. "
-        "Other HR services remain accessible from the sidebar."
+
+    announcement_state = load_employee_announcement_state(current_user)
+    dashboard_tab, announcements_tab = _render_dashboard_tabs(
+        announcement_state[2]
     )
 
-    announcements, images = _load_announcements(
-        current_user
-    )
-
-    st.markdown("## Company Announcements")
-
-    filter_left, filter_right = st.columns(
-        [1.0, 2.0]
-    )
-
-    with filter_left:
-        selected_category = st.selectbox(
-            "Category",
-            options=[
-                "All Categories",
-                *ANNOUNCEMENT_CATEGORIES,
-            ],
-            key="dashboard_announcement_category",
-        )
-
-    with filter_right:
-        search_text = st.text_input(
-            "Search",
-            placeholder=(
-                "Search company announcements and activities..."
-            ),
-            key="dashboard_announcement_search",
-        )
-
-    filtered = _filter_announcements(
-        announcements,
-        category=selected_category,
-        search_text=search_text,
-    )
-    target_id = _target_announcement_id()
-    target = next(
-        (
-            item
-            for item in announcements
-            if item.id == target_id
-        ),
-        None,
-    )
-
-    if target is not None:
-        filtered = [
-            target,
-            *(
-                item
-                for item in filtered
-                if item.id != target.id
-            ),
-        ]
-        st.info(
-            "Opened from Notifications"
-        )
-
-    st.caption(
-        f"{len(filtered)} active announcement(s)"
-    )
-
-    if not filtered:
-        st.info(
-            "There is no active announcement matching the "
-            "selected filters."
-        )
-        return
-
-    pinned = [
-        item
-        for item in filtered
-        if item.is_pinned
-    ]
-    regular = [
-        item
-        for item in filtered
-        if not item.is_pinned
-    ]
-
-    if pinned:
-        st.markdown("### Featured")
-        for announcement in pinned:
-            render_announcement_card(
-                announcement,
-                image_bytes=images.get(
-                    announcement.id
-                ),
-                expanded=False,
+    if dashboard_tab.open:
+        with dashboard_tab:
+            render_employee_attendance_workspace(
+                current_user,
+                show_punch_controls=True,
+                show_record_management=False,
             )
-
-    if regular:
-        st.markdown("### Latest Updates")
-        for announcement in regular:
-            render_announcement_card(
-                announcement,
-                image_bytes=images.get(
-                    announcement.id
-                ),
-                expanded=False,
+    elif announcements_tab.open:
+        with announcements_tab:
+            render_employee_announcements_page(
+                current_user,
+                announcement_state=announcement_state,
+                show_heading=False,
             )

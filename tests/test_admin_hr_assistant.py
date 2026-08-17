@@ -164,6 +164,22 @@ def test_personal_admin_leave_question_uses_employee_assistant() -> None:
         assert "leave credit breakdown" in response.answer.lower()
 
 
+def test_admin_leave_credit_comparison_returns_live_employee_ranking() -> None:
+    factory = _factory()
+    with factory() as session:
+        seed = seed_initial_data(session, _settings())
+        response = AdminHRAssistant(session).answer(
+            current_user=_current_user(seed),
+            question="Sino sa mga employee ang may pinakamataas na leave credits?",
+        )
+
+        assert response.intent == "leave_summary"
+        assert "Highest available paid leave credits" in response.answer
+        assert seed["admin_employee"].full_name in response.answer
+        assert "Leave overview" not in response.answer
+        assert response.actions[0].query_params == {"leave_view": "accounts"}
+
+
 def test_admin_chat_page_requires_admin_access() -> None:
     source = (
         PROJECT_ROOT / "ui/pages/admin/chat_page.py"

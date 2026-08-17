@@ -35,4 +35,4 @@ def test_employee_notification_selects_correct_tab() -> None:
     assert '"pending": "Pending Approvals"' in source
     assert '"reviewed": "Reviewed Requests"' in source
     assert "_activate_employee_leave_tab(target_label)" in source
-    assert "notification_request_id is None" in source
+    assert 'key="employee_leave_management_active_tab"' in source

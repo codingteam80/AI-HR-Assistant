@@ -362,6 +362,34 @@ class HRAssistant:
         if cls._contains_any(
             query,
             {
+                "attendance",
+                "dtr",
+                "time in",
+                "time out",
+                "overtime",
+                "work status",
+                "login attendance",
+                "logout attendance",
+            },
+        ):
+            return "attendance"
+
+        if cls._contains_any(
+            query,
+            {
+                "company form",
+                "company forms",
+                "download form",
+                "fill form",
+                "submit form",
+                "form submission",
+            },
+        ):
+            return "company_forms"
+
+        if cls._contains_any(
+            query,
+            {
                 "certificate of employment",
                 "coe",
                 "document",
@@ -849,7 +877,7 @@ class HRAssistant:
 
         action = HRAssistantAction(
             label="View My Leave Requests",
-            page="My Requests",
+            page="Leave Management",
             query_params={"leave_view": "requests"},
         )
         if current_user.employee_id is None:
@@ -1043,13 +1071,20 @@ class HRAssistant:
         intent: str,
         label: str,
         page: str,
+        query_params: dict[str, str] | None = None,
     ) -> HRAssistantResponse:
         """Create one direct routing answer for an existing HR module."""
 
         return HRAssistantResponse(
             answer=answer,
             intent=intent,
-            actions=[HRAssistantAction(label=label, page=page)],
+            actions=[
+                HRAssistantAction(
+                    label=label,
+                    page=page,
+                    query_params=dict(query_params or {}),
+                )
+            ],
         )
 
     @classmethod
@@ -1065,8 +1100,9 @@ class HRAssistant:
                 "- Recent leave-request status\n"
                 "- Your employee number, department, manager, job title, and work email\n"
                 "- Approved company HR policies with sources\n"
-                "- Navigation to My Documents, Benefits, Onboarding, HR Contacts, FAQ, "
-                "and company announcements\n\n"
+                "- Attendance / DTR and Company Form/Documents workflows\n"
+                "- Navigation to Company Form/Documents, Onboarding Benefits, "
+                "HR Contacts, FAQ, and company announcements\n\n"
                 "You may use shorthand or full wording. Example: **'Ilan na lang VL ko?'** "
                 "or **'How do I file Vacation Leave?'**"
             ),
@@ -1181,13 +1217,41 @@ class HRAssistant:
         if intent == "documents":
             return self._module_response(
                 answer=(
-                    "Open **My Documents** for employee files and document-related "
-                    "services. Available document actions depend on what your company "
-                    "has configured. For an unavailable document, contact HR."
+                    "Open **Company Form/Documents** to view the forms and documents "
+                    "available from your company. Your completed submissions and their "
+                    "review status are available in its **My Documents** tab. For an "
+                    "unavailable document, contact HR."
                 ),
                 intent="documents",
-                label="Open My Documents",
-                page="My Documents",
+                label="Open Company Form/Documents",
+                page="Company Form/Documents",
+                query_params={"form_view": "view"},
+            )
+
+        if intent == "attendance":
+            return self._module_response(
+                answer=(
+                    "Open **Dashboard** for your Attendance / DTR. You can view "
+                    "your monthly attendance, use Login and Logout for today's "
+                    "record, save Work Status, and edit your own authorized "
+                    "attendance entries."
+                ),
+                intent="attendance",
+                label="Open Attendance / DTR",
+                page="Dashboard",
+                query_params={"dashboard_view": "attendance"},
+            )
+
+        if intent == "company_forms":
+            return self._module_response(
+                answer=(
+                    "Open **Company Form/Documents** to view or download available "
+                    "company forms and submit a completed form when submissions are enabled."
+                ),
+                intent="company_forms",
+                label="Open Company Form/Documents",
+                page="Company Form/Documents",
+                query_params={"form_view": "view"},
             )
 
         if intent == "benefits":
@@ -1198,29 +1262,36 @@ class HRAssistant:
             )
             if policy is not None:
                 policy.actions.append(
-                    HRAssistantAction(label="Open Benefits", page="Benefits")
+                    HRAssistantAction(
+                        label="Open Benefits",
+                        page="Onboarding",
+                        query_params={"onboarding_view": "benefits"},
+                    )
                 )
                 return policy
             return self._module_response(
                 answer=(
-                    "Open **Benefits** for company-configured benefit information. "
+                    "Open **Onboarding → Benefits** for company-configured benefit information. "
                     "Formal eligibility rules are answered only when they exist in "
                     "approved company policies."
                 ),
                 intent="benefits",
                 label="Open Benefits",
-                page="Benefits",
+                page="Onboarding",
+                query_params={"onboarding_view": "benefits"},
             )
 
         if intent == "onboarding":
             return self._module_response(
                 answer=(
-                    "Open **Onboarding** for orientation and training information. "
-                    "Policy-specific requirements are taken only from approved policy files."
+                    "Open **Onboarding** for your progress overview, checklist, and "
+                    "permanent company benefits. Policy-specific requirements are "
+                    "taken only from approved policy files."
                 ),
                 intent="onboarding",
                 label="Open Onboarding",
                 page="Onboarding",
+                query_params={"onboarding_view": "overview"},
             )
 
         if intent == "hr_contacts":
@@ -1241,8 +1312,9 @@ class HRAssistant:
                     "the Employee Dashboard."
                 ),
                 intent="announcements",
-                label="Open Dashboard",
+                label="Open Announcements",
                 page="Dashboard",
+                query_params={"dashboard_view": "announcements"},
             )
 
         if intent == "faq":

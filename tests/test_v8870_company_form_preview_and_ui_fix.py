@@ -14,10 +14,10 @@ def test_pdf_preview_uses_supported_streamlit_viewer() -> None:
     preview = _read("ui/components/file_preview.py")
     requirements = _read("requirements.txt")
 
-    assert "st.pdf(data, height=650)" in preview
-    assert "components.html(" not in preview
-    assert "data:application/pdf;base64" not in preview
-    assert "streamlit>=1.50,<2.0" in requirements
+    assert "st.pdf(data, height=_PREVIEW_WIDGET_HEIGHT)" in preview
+    assert "render_browser_bridge(component)" in preview
+    assert "base64.b64encode(data)" in preview
+    assert "streamlit>=1.61,<2.0" in requirements
     assert "streamlit-pdf>=1.0.5,<3.0" in requirements
 
 
@@ -48,7 +48,7 @@ def test_selectable_tables_use_project_light_table_palette() -> None:
     assert '"background-color": "#FFFFFF"' in table
     assert '("background-color", "#F3F5FA")' in table
     assert '"color": "#5C6680"' in table
-    assert '[theme]' not in config
+    assert '[theme]' in config
 
 
 def test_dialog_text_contrast_and_version() -> None:
@@ -57,4 +57,4 @@ def test_dialog_text_contrast_and_version() -> None:
 
     assert '[data-testid="stDialog"] h2' in theme
     assert '-webkit-text-fill-color: #10172A' in theme
-    assert 'app_version: str = "0.8.8.70"' in settings
+    assert 'app_version: str = "0.8.8.' in settings

@@ -23,7 +23,7 @@ def render_theme_toggle() -> None:
 
     if st.button(
         button_label,
-        use_container_width=True,
+        width="stretch",
         key="theme_toggle",
     ):
         set_active_theme(next_theme)

@@ -9,7 +9,6 @@ The browser uses sessionStorage rather than localStorage:
 import json
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from authentication.access_control import AccessControl
 from authentication.persistent_auth_service import (
@@ -18,6 +17,7 @@ from authentication.persistent_auth_service import (
 )
 from authentication.session_manager import AuthSessionManager
 from database.session import SessionFactory
+from ui.components.browser_bridge import render_browser_bridge
 
 
 TOKEN_QUERY_KEY = "auth_session"
@@ -226,11 +226,7 @@ def _render_browser_bridge(
     for placeholder, replacement in replacements.items():
         script = script.replace(placeholder, replacement)
 
-    components.html(
-        script,
-        height=0,
-        width=0,
-    )
+    render_browser_bridge(script)
 
 
 def prepare_persistent_authentication() -> None:

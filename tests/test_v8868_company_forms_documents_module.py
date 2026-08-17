@@ -80,7 +80,10 @@ def test_admin_and_employee_tabs_and_scroll_boxes_are_present() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'TAB_LABELS = ["Overview", "Upload Form", "Manage Form", "Bin"]' in admin_page
-    assert 'EMPLOYEE_FORM_TABS = ["View", "Download", "Fill / Submit"]' in employee_page
+    assert (
+        'EMPLOYEE_FORM_TABS = ["View", "Download", "Fill / Submit", "My Documents"]'
+        in employee_page
+    )
     assert "st.container(height=" in admin_page
     assert "st.container(height=" in employee_page
     assert "render_selectable_admin_table(" in admin_page

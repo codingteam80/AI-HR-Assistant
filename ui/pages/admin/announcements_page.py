@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -29,6 +30,9 @@ from ui.components.operation_feedback import (
     set_operation_feedback,
 )
 from ui.components.responsive_image import render_responsive_image
+from ui.components.announcement_description import (
+    render_announcement_description,
+)
 
 
 REMINDER_STATUS_LABELS = {
@@ -410,31 +414,47 @@ def _render_preview(
             f"{AnnouncementService.display_status(announcement)} · "
             f"{_display_datetime(announcement.publish_at)}"
         )
-        st.markdown(f"### {announcement.title}")
-        st.write(announcement.summary)
-
-        if announcement.is_pinned:
-            st.info(
-                "Pinned announcement — this receives priority "
-                "on the employee dashboard."
-            )
 
         if image_bytes:
-            render_responsive_image(
-                image_bytes,
-                caption=(
-                    announcement.image_original_filename
-                    or "Announcement cover image"
-                ),
-                max_width=900,
-                max_height=440,
+            image_column, content_column = st.columns(
+                [1.05, 1.35],
+                gap="large",
+                vertical_alignment="top",
             )
+        else:
+            image_column = None
+            content_column = st.container()
 
-        with st.expander(
-            "Read Full Announcement",
-            expanded=True,
-        ):
-            st.markdown(announcement.content)
+        with content_column:
+            st.markdown(f"### {announcement.title}")
+            st.write(announcement.summary)
+
+            if announcement.is_pinned:
+                st.info(
+                    "Pinned announcement — this receives priority "
+                    "on the employee dashboard."
+                )
+
+            with st.container(
+                border=False,
+                height=330,
+            ):
+                render_announcement_description(
+                    announcement.content
+                )
+
+        if image_column is not None:
+            with image_column:
+                render_responsive_image(
+                    image_bytes,
+                    caption=(
+                        announcement.image_original_filename
+                        or "Announcement cover image"
+                    ),
+                    max_width=1200,
+                    max_height=780,
+                    fill_container=True,
+                )
 
 
 def _selected_index(items, target_id: int | None) -> int:
@@ -607,12 +627,12 @@ def _render_create(current_user: AuthenticatedUser) -> None:
 
         draft_clicked = st.form_submit_button(
             "Save as Draft",
-            use_container_width=True,
+            width="stretch",
         )
         publish_clicked = st.form_submit_button(
             "Publish / Schedule",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not draft_clicked and not publish_clicked:
@@ -656,7 +676,7 @@ def _render_create(current_user: AuthenticatedUser) -> None:
         st.rerun()
 
     except (ValidationError, ValueError) as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_manage(
@@ -783,12 +803,12 @@ def _render_manage(
 
         save_clicked = st.form_submit_button(
             "Save Changes",
-            use_container_width=True,
+            width="stretch",
         )
         publish_clicked = st.form_submit_button(
             "Publish / Schedule",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     st.divider()
@@ -803,7 +823,7 @@ def _render_manage(
     )
     delete_clicked = st.button(
         "Delete Announcement",
-        use_container_width=True,
+        width="stretch",
         disabled=not delete_confirmed,
         key=f"delete_announcement_{selected.id}",
     )
@@ -875,7 +895,7 @@ def _render_manage(
         st.rerun()
 
     except (ValidationError, ValueError) as error:
-        st.error(str(error))
+        render_action_warning(error)
 
 
 def _render_reminders(
@@ -946,7 +966,7 @@ def _render_reminders(
             create_clicked = st.form_submit_button(
                 "Save Smart Reminders",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         if create_clicked:
@@ -994,7 +1014,7 @@ def _render_reminders(
                 _remember_reminder_tab("Create Reminder")
                 st.rerun()
             except (ValidationError, ValueError) as error:
-                st.error(str(error))
+                render_action_warning(error)
 
     with manage_tab:
         if not reminders:
@@ -1140,7 +1160,7 @@ def _render_reminders(
                 save_clicked = st.form_submit_button(
                     "Save Reminder Changes",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
             move_confirmed = st.checkbox(
@@ -1150,7 +1170,7 @@ def _render_reminders(
             )
             move_clicked = st.button(
                 "Move Selected Reminder to Bin",
-                use_container_width=True,
+                width="stretch",
                 disabled=not move_confirmed,
                 key=f"bin_event_reminder_{selected.id}",
             )
@@ -1187,7 +1207,7 @@ def _render_reminders(
                     _remember_reminder_tab("Manage Reminders")
                     st.rerun()
                 except (ValidationError, ValueError) as error:
-                    st.error(str(error))
+                    render_action_warning(error)
 
     with bin_tab:
         st.caption(
@@ -1243,7 +1263,7 @@ def _render_reminders(
                 restore_clicked = st.button(
                     "Restore Reminder",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key=f"restore_event_reminder_{archived.id}",
                 )
             with delete_column:
@@ -1254,7 +1274,7 @@ def _render_reminders(
                 )
                 permanent_clicked = st.button(
                     "Permanently Delete",
-                    use_container_width=True,
+                    width="stretch",
                     disabled=not permanent_confirmed,
                     key=f"permanent_delete_event_reminder_{archived.id}",
                 )
@@ -1285,7 +1305,7 @@ def _render_reminders(
                     )
                     st.rerun()
                 except ValueError as error:
-                    st.error(str(error))
+                    render_action_warning(error)
 
 
 def _render_archive(
@@ -1351,7 +1371,7 @@ def _render_archive(
     if st.button(
         "Restore to Draft",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=f"restore_archived_announcement_{selected.id}",
     ):
         try:
@@ -1375,7 +1395,7 @@ def _render_archive(
             st.rerun()
 
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
 
 
 def render_admin_announcements_page(
@@ -1438,6 +1458,8 @@ def render_admin_announcements_page(
     ) = st.tabs(
         announcement_tab_labels,
         default=announcement_default_tab,
+        key="announcements_active_tab",
+        on_change="rerun",
     )
 
     with overview_tab:

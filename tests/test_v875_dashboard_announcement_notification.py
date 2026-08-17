@@ -21,15 +21,14 @@ def test_notification_count_is_visible_without_hover() -> None:
     assert "background: var(--hr-primary) !important;" in theme
 
 
-def test_dashboard_announcements_use_full_width() -> None:
+def test_announcements_use_a_separate_full_width_workspace() -> None:
     source = (
-        ROOT / "ui/pages/user/dashboard_page.py"
+        ROOT / "ui/pages/user/announcements_page.py"
     ).read_text(encoding="utf-8")
 
-    assert "announcement_area, quick_access_area" not in source
-    assert "[1.0, 2.0]" in source
-    assert "with quick_access_area:" not in source
-    assert "Quick Access" not in source
+    assert "Company Announcements" in source
+    assert "render_announcement_card" in source
+    assert "Search Announcements" in source
 
 
 def test_delete_never_calls_repository_hard_delete() -> None:

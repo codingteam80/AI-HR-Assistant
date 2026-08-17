@@ -1,7 +1,7 @@
 """Company-specific database queries.
 
-Company code is the stable tenant identifier. Company name may change,
-but the code should remain unchanged after company creation.
+Company ID is the stable tenant identifier. Company code is the human-facing
+login code and may be changed by an administrator when uniqueness is preserved.
 """
 
 from sqlalchemy import func, select
@@ -18,10 +18,27 @@ class CompanyRepository(BaseRepository[Company]):
         super().__init__(session, Company)
 
     def get_by_code(self, code: str) -> Company | None:
-        """Return a company using its unique stable code."""
+        """Return a company using its exact stored login code."""
 
         return self.session.scalar(
             select(Company).where(Company.code == code)
+        )
+
+    def get_by_code_case_insensitive(
+        self,
+        code: str,
+    ) -> Company | None:
+        """Return a company by normalized code regardless of case."""
+
+        normalized_code = code.strip().upper()
+
+        if not normalized_code:
+            return None
+
+        return self.session.scalar(
+            select(Company).where(
+                func.upper(Company.code) == normalized_code
+            )
         )
 
     def get_active_by_code(
@@ -61,13 +78,34 @@ class CompanyRepository(BaseRepository[Company]):
         return list(
             self.session.scalars(statement).all()
         )
+    def update_profile(
+        self,
+        *,
+        company_id: int,
+        code: str,
+        name: str,
+    ) -> Company | None:
+        """Update editable company identity fields."""
+
+        company = self.get_by_id(company_id)
+
+        if company is None:
+            return None
+
+        company.code = code
+        company.name = name
+        self.session.commit()
+        self.session.refresh(company)
+
+        return company
+
     def update_name(
         self,
         *,
         company_id: int,
         name: str,
     ) -> Company | None:
-        """Update the display name without changing the company code."""
+        """Backward-compatible display-name-only update."""
 
         company = self.get_by_id(company_id)
 
@@ -117,4 +155,21 @@ class CompanyRepository(BaseRepository[Company]):
         self.session.commit()
         self.session.refresh(company)
 
+        return company
+
+    def update_attendance_settings(
+        self,
+        *,
+        company_id: int,
+        values: dict[str, object],
+    ) -> Company | None:
+        """Update company workweek and regular-hours configuration."""
+
+        company = self.get_by_id(company_id)
+        if company is None:
+            return None
+        for field_name, value in values.items():
+            setattr(company, field_name, value)
+        self.session.commit()
+        self.session.refresh(company)
         return company

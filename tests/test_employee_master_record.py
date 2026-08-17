@@ -265,7 +265,8 @@ def test_employees_page_has_no_role_or_user_tabs() -> None:
     assert '"Employee List"' in source
     assert '"Add Employee"' in source
     assert '"Edit Employee"' in source
-    assert '"User Accounts"' not in source
+    assert '"User Accounts"' in source
+    assert '"Active Accounts"' in source
     assert '"Roles & Access"' not in source
     assert '"1 - Admin"' in source
     assert '"2 - User"' in source

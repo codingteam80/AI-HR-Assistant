@@ -5,10 +5,10 @@ identifier. Login data remains in ``users`` while training checklist items
 remain in ``employee_trainings``.
 """
 
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Date, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.base import Base, TimestampMixin
@@ -103,6 +103,13 @@ class Employee(TimestampMixin, Base):
     )
 
     hire_date: Mapped[date | None] = mapped_column(Date)
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    archived_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        index=True,
+    )
     date_of_birth: Mapped[date | None] = mapped_column(Date)
     gender: Mapped[str | None] = mapped_column(String(50))
     civil_status: Mapped[str | None] = mapped_column(String(50))
@@ -111,7 +118,8 @@ class Employee(TimestampMixin, Base):
         back_populates="employees"
     )
     user: Mapped["User | None"] = relationship(
-        back_populates="employee"
+        back_populates="employee",
+        foreign_keys=[user_id],
     )
     department: Mapped["Department | None"] = relationship(
         back_populates="employees"
@@ -180,5 +188,25 @@ class Employee(TimestampMixin, Base):
             - (
                 (today.month, today.day)
                 < (self.date_of_birth.month, self.date_of_birth.day)
+            )
+        )
+
+    @property
+    def years_of_service(self) -> int | None:
+        """Return completed service years from the employee's hire date."""
+
+        if self.hire_date is None:
+            return None
+
+        today = date.today()
+        if self.hire_date > today:
+            return 0
+
+        return (
+            today.year
+            - self.hire_date.year
+            - (
+                (today.month, today.day)
+                < (self.hire_date.month, self.hire_date.day)
             )
         )

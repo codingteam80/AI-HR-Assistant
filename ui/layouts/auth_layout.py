@@ -34,12 +34,11 @@ def render_password_change_layout(
     settings: Settings,
     current_user: AuthenticatedUser,
 ) -> None:
-    """Render branding plus mandatory password replacement."""
+    """Render mandatory password replacement in the login layout."""
 
-    render_auth_sidebar(
-        assistant_name=settings.assistant_name,
-        company_name=current_user.company_name,
-    )
+    # Keep mandatory password replacement visually aligned with Login.
+    # The page itself hides the sidebar and uses the same centered card,
+    # background artwork, spacing, inputs, and primary action styling.
     render_change_password_page(current_user)
 
 

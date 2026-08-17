@@ -10,6 +10,8 @@ user-facing access rule:
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
@@ -18,6 +20,7 @@ from authentication.password_manager import PasswordManager
 from core.constants import CLEARANCE_ADMIN, CLEARANCE_USER
 from models.department import Department
 from models.employee import Employee
+from models.employee_history import EmployeeHistory
 from models.employee_training import EmployeeTraining
 from models.hr_policy import HRPolicy
 from models.hr_policy_document import HRPolicyDocument
@@ -25,6 +28,7 @@ from models.password_reset_token import PasswordResetToken
 from models.user import User
 from repositories.department_repository import DepartmentRepository
 from repositories.employee_repository import EmployeeRepository
+from repositories.employee_history_repository import EmployeeHistoryRepository
 from repositories.employee_training_repository import (
     EmployeeTrainingRepository,
 )
@@ -60,6 +64,7 @@ class AdminManagementService:
         self.session = session
         self.user_repository = UserRepository(session)
         self.employee_repository = EmployeeRepository(session)
+        self.employee_history_repository = EmployeeHistoryRepository(session)
         self.training_repository = EmployeeTrainingRepository(session)
         self.role_repository = RoleRepository(session)
         self.department_repository = DepartmentRepository(session)
@@ -74,9 +79,83 @@ class AdminManagementService:
         self,
         company_id: int,
     ) -> list[Employee]:
-        """Return complete employee master records."""
+        """Return active employee master records for the main workspace."""
 
-        return self.employee_repository.list_with_details(company_id)
+        return self.employee_repository.list_with_details(
+            company_id,
+            archived=False,
+        )
+
+    def list_archived_employees(self, company_id: int) -> list[Employee]:
+        """Return resigned employees retained for archive and restoration."""
+
+        return self.employee_repository.list_with_details(
+            company_id,
+            archived=True,
+        )
+
+    def list_employee_history(self, company_id: int) -> list[EmployeeHistory]:
+        """Return newest-first employee workspace audit events."""
+
+        return self.employee_history_repository.list_for_company(company_id)
+
+    @staticmethod
+    def _employee_snapshot(employee: Employee) -> dict[str, object]:
+        """Return safe audit values without password data."""
+
+        return {
+            "employee_number": employee.employee_number,
+            "first_name": employee.first_name,
+            "middle_name": employee.middle_name,
+            "last_name": employee.last_name,
+            "suffix": employee.suffix,
+            "work_email": employee.work_email,
+            "telephone_mobile_no": employee.telephone_mobile_no,
+            "job_title": employee.job_title,
+            "department_id": employee.department_id,
+            "manager_id": employee.manager_id,
+            "leader_id": employee.leader_id,
+            "hire_date": employee.hire_date.isoformat() if employee.hire_date else None,
+            "date_of_birth": employee.date_of_birth.isoformat() if employee.date_of_birth else None,
+            "gender": employee.gender,
+            "civil_status": employee.civil_status,
+            "employment_status": employee.employment_status,
+            "username": employee.user.username if employee.user else None,
+            "clearance": employee.user.clearance if employee.user else None,
+            "account_active": employee.user.is_active if employee.user else None,
+        }
+
+    def _record_employee_history(
+        self,
+        *,
+        employee: Employee,
+        performed_by_user_id: int | None,
+        action_type: str,
+        summary: str,
+        source: str = "manual",
+        old_values: dict[str, object] | None = None,
+        new_values: dict[str, object] | None = None,
+        upload_batch_id: str | None = None,
+        upload_filename: str | None = None,
+    ) -> None:
+        """Stage one immutable audit entry; caller controls the commit."""
+
+        self.session.add(
+            EmployeeHistory(
+                company_id=employee.company_id,
+                employee_id=employee.id,
+                employee_number=employee.employee_number,
+                employee_name=employee.full_name,
+                performed_by_user_id=performed_by_user_id,
+                action_type=action_type,
+                source=source,
+                summary=summary,
+                old_values_json=(json.dumps(old_values, sort_keys=True) if old_values else None),
+                new_values_json=(json.dumps(new_values, sort_keys=True) if new_values else None),
+                upload_batch_id=upload_batch_id,
+                upload_filename=upload_filename,
+            )
+        )
 
     def list_roles(self, company_id: int):
         """Compatibility helper; roles are no longer shown in the UI."""
@@ -254,6 +333,9 @@ class AdminManagementService:
     def create_employee_with_optional_account(
         self,
         values: EmployeeAccountCreate,
+        *,
+        current_user_id: int | None = None,
+        source: str = "manual",
     ) -> Employee:
         """Create employee, account, department, and training checklist."""
 
@@ -364,6 +446,19 @@ class AdminManagementService:
                 )
                 self.session.commit()
 
+            self._record_employee_history(
+                employee=employee,
+                performed_by_user_id=current_user_id,
+                action_type=("archived" if values.employment_status == "resigned" else "created"),
+                source=source,
+                summary=("Employee created and archived as Resigned." if values.employment_status == "resigned" else "Employee and login account created."),
+                new_values=self._employee_snapshot(employee),
+            )
+            if values.employment_status == "resigned":
+                employee.archived_at = datetime.now(timezone.utc)
+                employee.archived_by_user_id = current_user_id
+            self.session.commit()
+
             # Expire cached relationships before returning the complete
             # newly created master record.
             self.session.expire_all()
@@ -391,6 +486,8 @@ class AdminManagementService:
             company_id=values.company_id,
             employee_id=values.employee_id,
         )
+        old_snapshot = self._employee_snapshot(employee)
+        old_status = employee.employment_status
 
         duplicate_number = (
             self.employee_repository
@@ -557,6 +654,12 @@ class AdminManagementService:
         employee.employment_status = (
             values.employment_status
         )
+        if values.employment_status == "resigned":
+            employee.archived_at = employee.archived_at or datetime.now(timezone.utc)
+            employee.archived_by_user_id = current_user_id
+        elif old_status == "resigned":
+            employee.archived_at = None
+            employee.archived_by_user_id = None
         employee.department_id = (
             department.id
             if department
@@ -585,6 +688,40 @@ class AdminManagementService:
             ),
         )
 
+        self.session.expire_all()
+        refreshed = self.get_employee(
+            company_id=values.company_id,
+            employee_id=employee.id,
+        )
+        new_snapshot = self._employee_snapshot(refreshed)
+        changed_old = {
+            key: value
+            for key, value in old_snapshot.items()
+            if new_snapshot.get(key) != value
+        }
+        changed_new = {
+            key: value
+            for key, value in new_snapshot.items()
+            if old_snapshot.get(key) != value
+        }
+        action_type = "updated"
+        summary = "Employee information or account settings updated."
+        if old_status != "resigned" and values.employment_status == "resigned":
+            action_type = "archived"
+            summary = "Employment status changed to Resigned; account deactivated and record archived."
+        elif old_status == "resigned" and values.employment_status == "employed":
+            action_type = "restored"
+            summary = "Archived employee restored to Employed and account reactivated."
+        self._record_employee_history(
+            employee=refreshed,
+            performed_by_user_id=current_user_id,
+            action_type=action_type,
+            summary=summary,
+            old_values=changed_old or None,
+            new_values=changed_new or None,
+        )
+        self.session.commit()
+
         # Reload all joined relationships after profile, account,
         # department, manager, and training updates.
         self.session.expire_all()
@@ -593,6 +730,41 @@ class AdminManagementService:
             company_id=values.company_id,
             employee_id=employee.id,
         )
+
+    def restore_archived_employee(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        current_user_id: int,
+    ) -> Employee:
+        """Restore one resigned employee without creating duplicate records."""
+
+        employee = self.get_employee(
+            company_id=company_id,
+            employee_id=employee_id,
+        )
+        if employee.employment_status != "resigned":
+            raise ValueError("The selected employee is not archived.")
+        old_snapshot = self._employee_snapshot(employee)
+        employee.employment_status = "employed"
+        employee.archived_at = None
+        employee.archived_by_user_id = None
+        if employee.user is not None:
+            employee.user.is_active = True
+        self.session.flush()
+        new_snapshot = self._employee_snapshot(employee)
+        self._record_employee_history(
+            employee=employee,
+            performed_by_user_id=current_user_id,
+            action_type="restored",
+            summary="Archived employee restored to Employed; linked login account reactivated.",
+            old_values={key: value for key, value in old_snapshot.items() if new_snapshot.get(key) != value},
+            new_values={key: value for key, value in new_snapshot.items() if old_snapshot.get(key) != value},
+        )
+        self.session.commit()
+        self.session.expire_all()
+        return self.get_employee(company_id=company_id, employee_id=employee_id)
 
     def _count_policy_history_for_user(
         self,
@@ -664,6 +836,15 @@ class AdminManagementService:
                 "cannot be permanently deleted. Change the employee "
                 "status to Resigned instead."
             )
+
+        self._record_employee_history(
+            employee=employee,
+            performed_by_user_id=current_user_id,
+            action_type="permanently_deleted",
+            summary="Employee profile and eligible linked login account permanently deleted.",
+            old_values=self._employee_snapshot(employee),
+        )
+        self.session.flush()
 
         direct_report_ids = list(
             self.session.scalars(

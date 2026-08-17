@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -13,6 +14,9 @@ from services.company_form_service import (
     CompanyFormService,
 )
 from ui.components.data_table import render_selectable_admin_table
+from ui.components.company_form_download import (
+    prepare_editable_company_form_download,
+)
 from ui.components.file_preview import render_file_preview_dialog
 from ui.components.operation_feedback import (
     render_operation_feedback,
@@ -134,7 +138,7 @@ def _render_pending_preview(current_user: AuthenticatedUser) -> None:
                 )
     except (ValueError, FileNotFoundError) as error:
         st.session_state[PREVIEW_STATE_KEY] = None
-        st.error(str(error))
+        render_action_warning(error)
         return
 
     render_file_preview_dialog(
@@ -191,7 +195,7 @@ def _render_submission_review(
     preview_column, download_column = st.columns(2)
     if preview_column.button(
         "View Filled Form",
-        use_container_width=True,
+        width="stretch",
         key=f"admin_preview_submission_{selected.id}",
     ):
         _queue_preview(
@@ -205,7 +209,7 @@ def _render_submission_review(
         data=download.data,
         file_name=download.filename,
         mime=download.mime_type,
-        use_container_width=True,
+        width="stretch",
         key=f"admin_download_submission_{selected.id}",
     )
 
@@ -228,7 +232,7 @@ def _render_submission_review(
         submitted = st.form_submit_button(
             "Save Review",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if submitted:
@@ -248,7 +252,7 @@ def _render_submission_review(
             _remember_tab("Overview")
             st.rerun()
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
 
 
 def _render_overview(
@@ -265,31 +269,32 @@ def _render_overview(
     metrics[2].metric("Awaiting Review", overview.pending_submissions)
     metrics[3].metric("In Bin", overview.bin_forms)
 
-    st.subheader("Available Company Forms")
-    with st.container(height=310, border=True):
-        if active_forms:
-            st.caption("Click a form row to open its file preview.")
-            table_version = int(
-                st.session_state.get(OVERVIEW_TABLE_VERSION_KEY, 0)
+    if active_forms:
+        st.caption("Click anywhere on a form row to open its file preview.")
+        table_version = int(
+            st.session_state.get(OVERVIEW_TABLE_VERSION_KEY, 0)
+        )
+        selected_index = render_selectable_admin_table(
+            _form_rows(active_forms),
+            key=f"company_forms_overview_active_{table_version}",
+            height=245,
+        )
+        if selected_index is not None:
+            _queue_preview(
+                kind="form",
+                record_id=active_forms[selected_index].id,
+                table_version_key=OVERVIEW_TABLE_VERSION_KEY,
             )
-            selected_index = render_selectable_admin_table(
-                _form_rows(active_forms),
-                key=f"company_forms_overview_active_{table_version}",
-                height=245,
-            )
-            if selected_index is not None:
-                _queue_preview(
-                    kind="form",
-                    record_id=active_forms[selected_index].id,
-                    table_version_key=OVERVIEW_TABLE_VERSION_KEY,
-                )
-        else:
-            st.info("No active company forms are available.")
+    else:
+        st.info("No active company forms are available.")
 
+    st.divider()
     st.subheader("Employee Filled Forms")
-    with st.container(height=560, border=True):
+    with st.container(height=560, border=False):
         if submissions:
-            st.caption("Click a submission row to preview the filled file.")
+            st.caption(
+                "Click anywhere on a submission row to preview the filled file."
+            )
             table_version = int(
                 st.session_state.get(SUBMISSION_TABLE_VERSION_KEY, 0)
             )
@@ -321,7 +326,7 @@ def _render_upload(current_user: AuthenticatedUser) -> None:
     """Upload one downloadable company form template."""
 
     settings = get_settings()
-    with st.container(height=620, border=True):
+    with st.container(height=620, border=False):
         st.subheader("Upload Company Form")
         st.caption(
             "Upload PDF, Word, Excel, CSV, or TXT templates. Files remain "
@@ -345,7 +350,7 @@ def _render_upload(current_user: AuthenticatedUser) -> None:
             submit = st.form_submit_button(
                 "Upload Form",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         if submit:
@@ -377,7 +382,7 @@ def _render_upload(current_user: AuthenticatedUser) -> None:
                 _remember_tab("Upload Form")
                 st.rerun()
             except ValueError as error:
-                st.error(str(error))
+                render_action_warning(error)
 
 
 def _render_manage(
@@ -386,13 +391,15 @@ def _render_manage(
 ) -> None:
     """Edit metadata, download templates, or move forms to Bin."""
 
-    with st.container(height=660, border=True):
+    with st.container(height=660, border=False):
         st.subheader("Manage Active Forms")
         if not active_forms:
             st.info("No active forms are available to manage.")
             return
 
-        st.caption("Click a form row to preview and select it for editing.")
+        st.caption(
+            "Click anywhere on a form row to preview and select it for editing."
+        )
         table_version = int(
             st.session_state.get(MANAGE_TABLE_VERSION_KEY, 0)
         )
@@ -424,15 +431,32 @@ def _render_manage(
         selected_id = label_map[selected_label]
         selected = next(item for item in active_forms if item.id == selected_id)
 
-        with SessionFactory() as session:
-            download = CompanyFormService(session).get_form_download(
-                company_id=current_user.company_id,
-                form_id=selected.id,
+        try:
+            with SessionFactory() as session:
+                original_download = CompanyFormService(
+                    session
+                ).get_form_download(
+                    company_id=current_user.company_id,
+                    form_id=selected.id,
+                )
+            download = prepare_editable_company_form_download(
+                filename=original_download.filename,
+                mime_type=original_download.mime_type,
+                data=original_download.data,
+            )
+        except (ValueError, FileNotFoundError) as error:
+            render_action_warning(error)
+            return
+
+        if original_download.filename.lower().endswith(".pdf"):
+            st.caption(
+                "The stored PDF remains unchanged. Download Form provides an "
+                "editable Word (.docx) copy."
             )
         preview_column, download_column = st.columns(2)
         if preview_column.button(
             "View Original Form",
-            use_container_width=True,
+            width="stretch",
             key=f"admin_preview_form_{selected.id}",
         ):
             _queue_preview(
@@ -441,11 +465,11 @@ def _render_manage(
                 table_version_key=MANAGE_TABLE_VERSION_KEY,
             )
         download_column.download_button(
-            "Download Original Form",
+            "Download Form",
             data=download.data,
             file_name=download.filename,
             mime=download.mime_type,
-            use_container_width=True,
+            width="stretch",
             key=f"admin_download_form_{selected.id}",
         )
 
@@ -458,7 +482,7 @@ def _render_manage(
             save = st.form_submit_button(
                 "Save Form Details",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         if save:
@@ -481,11 +505,11 @@ def _render_manage(
                 _remember_tab("Manage Form")
                 st.rerun()
             except ValueError as error:
-                st.error(str(error))
+                render_action_warning(error)
 
         if st.button(
             "Move Form to Bin",
-            use_container_width=True,
+            width="stretch",
             key=f"move_company_form_bin_{selected.id}",
         ):
             with SessionFactory() as session:
@@ -515,7 +539,9 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
             st.info("The Company Form/Documents Bin is empty.")
             return
 
-        st.caption("Click a Bin row to preview and select the stored form.")
+        st.caption(
+            "Click anywhere on a Bin row to preview and select the stored form."
+        )
         table_version = int(
             st.session_state.get(BIN_TABLE_VERSION_KEY, 0)
         )
@@ -550,7 +576,7 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
         if action_columns[0].button(
             "Restore Form",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         ):
             with SessionFactory() as session:
                 CompanyFormService(session).restore_from_bin(
@@ -571,7 +597,7 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
         if st.button(
             "Permanently Delete Form",
             disabled=not confirm_delete,
-            use_container_width=True,
+            width="stretch",
             key=f"permanent_company_form_delete_{selected_id}",
         ):
             with SessionFactory() as session:
@@ -606,7 +632,21 @@ def render_company_forms_documents_page(
         bin_forms = service.list_bin_forms(current_user.company_id)
         submissions = service.list_admin_submissions(current_user.company_id)
 
-    tabs = st.tabs(TAB_LABELS, default=_selected_tab())
+    requested_tab = _selected_tab()
+    if (
+        "company_forms_active_tab" not in st.session_state
+        or requested_tab != "Overview"
+    ):
+        # Prime the widget before creation, then omit ``default`` below. This
+        # preserves the requested tab without Streamlit's duplicate
+        # default/session-state warning.
+        st.session_state["company_forms_active_tab"] = requested_tab
+    tabs = st.tabs(
+        TAB_LABELS,
+        key="company_forms_active_tab",
+        on_change="rerun",
+    )
+
     with tabs[0]:
         _render_overview(current_user, overview, active_forms, submissions)
     with tabs[1]:

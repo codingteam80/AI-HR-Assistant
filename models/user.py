@@ -91,5 +91,6 @@ class User(TimestampMixin, Base):
     # One login account may be linked to one employee profile.
     employee: Mapped["Employee | None"] = relationship(
         back_populates="user",
+        foreign_keys="Employee.user_id",
         uselist=False,
     )

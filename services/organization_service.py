@@ -5,11 +5,12 @@ Admin Page -> Pydantic Schema -> OrganizationService -> Repository -> DB
 
 Important rules:
 - Every department and role operation is limited by company_id.
-- Company code is immutable; only the display name may be changed.
+- Company ID is the immutable tenant key; login code may be renamed uniquely.
 - System roles cannot be deactivated.
 - A custom role with assigned users cannot be deactivated.
 """
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
@@ -24,10 +25,12 @@ from repositories.department_repository import DepartmentRepository
 from repositories.role_repository import RoleRepository
 from schemas.organization_schema import (
     CompanyNameUpdate,
+    CompanyProfileUpdate,
     CompanyThemeColorUpdate,
     DepartmentCreate,
     RoleCreateRequest,
 )
+from schemas.attendance_schema import CompanyAttendanceSettingsInput
 
 
 class OrganizationService:
@@ -100,6 +103,41 @@ class OrganizationService:
             return active_companies[0]
 
         return None
+    def update_company_profile(
+        self,
+        values: CompanyProfileUpdate,
+    ) -> Company:
+        """Update company login code and display name safely."""
+
+        current = self.get_company(values.company_id)
+        normalized_code = values.code.strip().upper()
+        normalized_name = values.name.strip()
+        duplicate = self.company_repository.get_by_code_case_insensitive(
+            normalized_code
+        )
+
+        if duplicate is not None and duplicate.id != current.id:
+            raise ValueError(
+                f"Company code '{normalized_code}' is already in use."
+            )
+
+        try:
+            company = self.company_repository.update_profile(
+                company_id=values.company_id,
+                code=normalized_code,
+                name=normalized_name,
+            )
+        except IntegrityError as error:
+            self.session.rollback()
+            raise ValueError(
+                f"Company code '{normalized_code}' is already in use."
+            ) from error
+
+        if company is None:
+            raise ValueError("The company record was not found.")
+
+        return company
+
     def update_company_name(
         self,
         values: CompanyNameUpdate,
@@ -134,6 +172,30 @@ class OrganizationService:
         if company is None:
             raise ValueError("The company record was not found.")
 
+        return company
+
+    def update_attendance_settings(
+        self,
+        values: CompanyAttendanceSettingsInput,
+    ) -> Company:
+        """Save the workweek used by attendance and OT calculations."""
+
+        company = self.company_repository.update_attendance_settings(
+            company_id=values.company_id,
+            values={
+                "attendance_regular_hours": values.regular_hours,
+                "attendance_lunch_minutes": values.lunch_break_minutes,
+                "work_monday": values.work_monday,
+                "work_tuesday": values.work_tuesday,
+                "work_wednesday": values.work_wednesday,
+                "work_thursday": values.work_thursday,
+                "work_friday": values.work_friday,
+                "work_saturday": values.work_saturday,
+                "work_sunday": values.work_sunday,
+            },
+        )
+        if company is None:
+            raise ValueError("The company record was not found.")
         return company
 
     def get_company_logo_bytes(

@@ -27,6 +27,28 @@ class NotificationRepository(BaseRepository[Notification]):
             or 0
         )
 
+    def exists_for_entity_event(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        event_type: str,
+        related_entity_type: str,
+        related_entity_id: int,
+    ) -> bool:
+        """Return whether one idempotent entity notification exists."""
+
+        count = self.session.scalar(
+            select(func.count(Notification.id)).where(
+                Notification.company_id == company_id,
+                Notification.user_id == user_id,
+                Notification.event_type == event_type,
+                Notification.related_entity_type == related_entity_type,
+                Notification.related_entity_id == related_entity_id,
+            )
+        )
+        return bool(count)
+
     def list_recent(self, *, company_id: int, user_id: int, limit: int = 10) -> list[Notification]:
         statement = (
             select(Notification)
@@ -38,6 +60,60 @@ class NotificationRepository(BaseRepository[Notification]):
             .limit(limit)
         )
         return list(self.session.scalars(statement).all())
+
+    def unread_announcement_count(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        announcement_ids: list[int],
+    ) -> int:
+        """Count unread publication notifications for visible announcements."""
+
+        if not announcement_ids:
+            return 0
+        return int(
+            self.session.scalar(
+                select(func.count(Notification.id)).where(
+                    Notification.company_id == company_id,
+                    Notification.user_id == user_id,
+                    Notification.is_read.is_(False),
+                    Notification.event_type == "announcement_published",
+                    Notification.related_entity_type == "announcement",
+                    Notification.related_entity_id.in_(announcement_ids),
+                )
+            )
+            or 0
+        )
+
+    def mark_announcements_read(
+        self,
+        *,
+        company_id: int,
+        user_id: int,
+        announcement_ids: list[int],
+    ) -> int:
+        """Mark visible company-announcement notifications as viewed."""
+
+        if not announcement_ids:
+            return 0
+        result = self.session.execute(
+            update(Notification)
+            .where(
+                Notification.company_id == company_id,
+                Notification.user_id == user_id,
+                Notification.is_read.is_(False),
+                Notification.event_type == "announcement_published",
+                Notification.related_entity_type == "announcement",
+                Notification.related_entity_id.in_(announcement_ids),
+            )
+            .values(
+                is_read=True,
+                read_at=datetime.now(timezone.utc),
+            )
+        )
+        self.session.commit()
+        return int(result.rowcount or 0)
 
     def mark_read(
         self,

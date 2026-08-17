@@ -16,14 +16,15 @@ def test_selectable_table_uses_native_single_row_selection() -> None:
     assert "def render_selectable_admin_table(" in source
     assert 'on_select="rerun"' in source
     assert 'selection_mode="single-row"' in source
-    assert "height=max(180, int(height))" in source
+    assert "height=visible_height" in source
 
 
-def test_preview_uses_large_non_dismissible_streamlit_dialog() -> None:
+def test_preview_uses_large_dismissible_streamlit_dialog() -> None:
     source = _read("ui/components/file_preview.py")
 
-    assert '@st.dialog("File Preview", width="large", dismissible=False)' in source
-    assert '"Close Preview"' in source
+    assert 'width="large"' in source
+    assert "dismissible=True" in source
+    assert "on_dismiss=_dismiss_file_preview" in source
     assert '"Download File"' in source
 
 
@@ -43,10 +44,19 @@ def test_admin_available_form_row_opens_preview_and_filled_form_has_view_action(
     source = _read("ui/pages/admin/company_forms_documents_page.py")
 
     assert "render_selectable_admin_table(" in source
-    assert '"Click a form row to open its file preview."' in source
-    assert '"Click a submission row to preview the filled file."' in source
-    assert '"Click a form row to preview and select it for editing."' in source
-    assert '"Click a Bin row to preview and select the stored form."' in source
+    assert "Click anywhere on a form row to open its file preview." in source
+    assert (
+        "Click anywhere on a submission row to preview the filled file."
+        in source
+    )
+    assert (
+        "Click anywhere on a form row to preview and select it for editing."
+        in source
+    )
+    assert (
+        "Click anywhere on a Bin row to preview and select the stored form."
+        in source
+    )
     assert '"View Filled Form"' in source
     assert '"View Original Form"' in source
     assert "_render_pending_preview(current_user)" in source
@@ -64,7 +74,7 @@ def test_employee_available_form_row_opens_preview_and_own_copy_can_be_viewed() 
     assert "_render_pending_preview(current_user)" in source
 
 
-def test_v8869_release_checkpoint_is_preserved() -> None:
-    assert (PROJECT_ROOT / "RELEASE_v8_8_69.md").is_file()
+def test_company_form_preview_checkpoint_is_preserved() -> None:
     settings = _read("config/settings.py")
     assert 'app_version: str = "0.8.8.' in settings
+    assert "Company Form Preview" in _read("README.md")

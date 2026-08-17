@@ -1,6 +1,7 @@
 """Administrator page for company-scoped login accounts."""
 
 import streamlit as st
+from ui.components.validation_feedback import render_action_warning
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -113,7 +114,7 @@ def render_users_page(
         submitted = st.form_submit_button(
             "Update Account Status",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if submitted:
@@ -136,7 +137,7 @@ def render_users_page(
             st.rerun()
 
         except ValueError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error(
                 "The account status could not be updated."
@@ -185,7 +186,7 @@ def render_users_page(
         reset_submitted = st.form_submit_button(
             "Set Temporary Password",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if reset_submitted:
@@ -214,9 +215,9 @@ def render_users_page(
             st.rerun()
 
         except ValidationError as error:
-            st.error(error.errors()[0]["msg"])
+            render_action_warning(error)
         except PasswordResetError as error:
-            st.error(str(error))
+            render_action_warning(error)
         except Exception:
             st.error(
                 "The temporary password could not be set."

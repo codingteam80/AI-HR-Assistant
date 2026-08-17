@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from models.employee import Employee
@@ -10,6 +10,7 @@ from models.leave_balance import LeaveBalance
 from models.leave_credit_transaction import LeaveCreditTransaction
 from models.leave_request import LeaveRequest
 from models.leave_type import LeaveType
+from models.user import User
 from repositories.base_repository import BaseRepository
 
 
@@ -149,47 +150,30 @@ class LeaveBalanceRepository(BaseRepository[LeaveBalance]):
 
 
 class LeaveRequestRepository(BaseRepository[LeaveRequest]):
-    """Queries for leave request monitoring and employee history."""
+    """Queries for leave request monitoring, ownership, and staged approval."""
 
     def __init__(self, session: Session) -> None:
         super().__init__(session, LeaveRequest)
 
-    def list_company(
-        self,
-        company_id: int,
-        year: int | None = None,
-    ) -> list[LeaveRequest]:
-        """Return company requests, optionally limited by leave year.
-
-        A request is included when its leave period overlaps the selected
-        calendar year. This also handles requests that cross December and
-        January.
-        """
-
-        statement = (
-            select(LeaveRequest)
-            .options(
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.department
-                ),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(LeaveRequest.leave_type),
-                joinedload(LeaveRequest.fallback_leave_type),
-            )
-            .where(LeaveRequest.company_id == company_id)
+    # Centralized eager-load guard for detached UI use: Employee.department.
+    @staticmethod
+    def _detail_options():
+        return (
+            joinedload(LeaveRequest.employee).joinedload(Employee.department),
+            joinedload(LeaveRequest.employee).joinedload(Employee.user),
+            joinedload(LeaveRequest.filed_by_employee).joinedload(Employee.user),
+            joinedload(LeaveRequest.manager).joinedload(Employee.user),
+            joinedload(LeaveRequest.leader_approver).joinedload(Employee.user),
+            joinedload(LeaveRequest.current_approver).joinedload(Employee.user),
+            joinedload(LeaveRequest.cancellation_requested_by_employee).joinedload(Employee.user),
+            joinedload(LeaveRequest.leave_type),
+            joinedload(LeaveRequest.fallback_leave_type),
         )
 
+    def list_company(self, company_id: int, year: int | None = None) -> list[LeaveRequest]:
+        statement = select(LeaveRequest).options(*self._detail_options()).where(
+            LeaveRequest.company_id == company_id
+        )
         if year is not None:
             year_start = date(int(year), 1, 1)
             year_end = date(int(year), 12, 31)
@@ -197,39 +181,13 @@ class LeaveRequestRepository(BaseRepository[LeaveRequest]):
                 LeaveRequest.end_date >= year_start,
                 LeaveRequest.start_date <= year_end,
             )
-
-        statement = statement.order_by(
-            LeaveRequest.submitted_at.desc(),
-            LeaveRequest.id.desc(),
-        )
-
-        return list(
-            self.session.scalars(statement).unique().all()
-        )
+        statement = statement.order_by(LeaveRequest.submitted_at.desc(), LeaveRequest.id.desc())
+        return list(self.session.scalars(statement).unique().all())
 
     def list_employee(self, company_id: int, employee_id: int) -> list[LeaveRequest]:
         statement = (
             select(LeaveRequest)
-            .options(
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.department
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.leave_type
-                ),
-            )
+            .options(*self._detail_options())
             .where(
                 LeaveRequest.company_id == company_id,
                 LeaveRequest.employee_id == employee_id,
@@ -238,177 +196,117 @@ class LeaveRequestRepository(BaseRepository[LeaveRequest]):
         )
         return list(self.session.scalars(statement).unique().all())
 
-    def get_with_details(self, company_id: int, request_id: int) -> LeaveRequest | None:
+    def list_filed_by_employee(self, *, company_id: int, filed_by_employee_id: int) -> list[LeaveRequest]:
         statement = (
             select(LeaveRequest)
-            .options(
-                joinedload(LeaveRequest.employee).joinedload(Employee.department),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(LeaveRequest.leave_type),
-                joinedload(LeaveRequest.fallback_leave_type),
+            .options(*self._detail_options())
+            .where(
+                LeaveRequest.company_id == company_id,
+                LeaveRequest.filed_by_employee_id == filed_by_employee_id,
+                LeaveRequest.filed_on_behalf.is_(True),
             )
+            .order_by(LeaveRequest.submitted_at.desc(), LeaveRequest.id.desc())
+        )
+        return list(self.session.scalars(statement).unique().all())
+
+    def get_with_details(self, company_id: int, request_id: int) -> LeaveRequest | None:
+        return self.session.scalar(
+            select(LeaveRequest)
+            .options(*self._detail_options())
             .where(LeaveRequest.company_id == company_id, LeaveRequest.id == request_id)
         )
-        return self.session.scalar(statement)
 
-
-    def list_pending_for_manager(
+    def list_overlapping(
         self,
         *,
         company_id: int,
-        manager_employee_id: int,
+        employee_id: int,
+        start_date: date,
+        end_date: date,
     ) -> list[LeaveRequest]:
-        """Return requests awaiting this manager's decision."""
+        """Return date-intersecting requests except rejected/full-cancelled rows."""
 
         statement = (
             select(LeaveRequest)
-            .options(
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.department
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(LeaveRequest.leave_type),
-                joinedload(LeaveRequest.fallback_leave_type),
-            )
+            .options(*self._detail_options())
             .where(
                 LeaveRequest.company_id == company_id,
-                LeaveRequest.manager_employee_id
-                == manager_employee_id,
-                LeaveRequest.status
-                == "pending_manager_approval",
+                LeaveRequest.employee_id == employee_id,
+                LeaveRequest.start_date <= end_date,
+                LeaveRequest.end_date >= start_date,
+                LeaveRequest.status.notin_(("rejected", "cancelled")),
             )
-            .order_by(
-                LeaveRequest.submitted_at.asc(),
-                LeaveRequest.id.asc(),
-            )
+            .order_by(LeaveRequest.start_date, LeaveRequest.id)
         )
+        return list(self.session.scalars(statement).unique().all())
 
-        return list(
-            self.session.scalars(statement).unique().all()
-        )
-
-    def list_reviewed_for_manager(
-        self,
-        *,
-        company_id: int,
-        manager_employee_id: int,
-    ) -> list[LeaveRequest]:
-        """Return requests already reviewed by this manager."""
-
+    def list_pending_for_manager(self, *, company_id: int, manager_employee_id: int) -> list[LeaveRequest]:
+        """Return requests awaiting this employee at either approval stage."""
         statement = (
             select(LeaveRequest)
-            .options(
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.department
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(LeaveRequest.leave_type),
-                joinedload(LeaveRequest.fallback_leave_type),
-            )
+            .options(*self._detail_options())
             .where(
                 LeaveRequest.company_id == company_id,
-                LeaveRequest.manager_employee_id
-                == manager_employee_id,
-                LeaveRequest.status.in_(
-                    (
-                        "scheduled",
-                        "approved",
-                        "in_progress",
-                        "completed",
-                        "rejected",
-                    )
+                or_(
+                    and_(
+                        LeaveRequest.status.in_(("pending_leader_approval", "pending_manager_approval")),
+                        or_(
+                            LeaveRequest.current_approver_employee_id == manager_employee_id,
+                            and_(
+                                LeaveRequest.current_approver_employee_id.is_(None),
+                                LeaveRequest.manager_employee_id == manager_employee_id,
+                            ),
+                        ),
+                    ),
+                    and_(
+                        LeaveRequest.cancellation_status == "requested",
+                        LeaveRequest.manager_employee_id == manager_employee_id,
+                    ),
                 ),
             )
-            .order_by(
-                LeaveRequest.reviewed_at.desc(),
-                LeaveRequest.id.desc(),
-            )
+            .order_by(LeaveRequest.submitted_at.asc(), LeaveRequest.id.asc())
         )
+        return list(self.session.scalars(statement).unique().all())
 
-        return list(
-            self.session.scalars(statement).unique().all()
-        )
-
-    def list_reconcilable(
-        self,
-        *,
-        company_id: int,
-        through_date: date,
-    ) -> list[LeaveRequest]:
-        """Return approved requests that may need date-based posting."""
-
+    def list_reviewed_for_manager(self, *, company_id: int, manager_employee_id: int) -> list[LeaveRequest]:
+        """Return final manager reviews plus requests forwarded by this leader."""
         statement = (
             select(LeaveRequest)
-            .options(
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.department
-                ),
-                joinedload(
-                    LeaveRequest.employee
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(
-                    LeaveRequest.manager
-                ).joinedload(
-                    Employee.user
-                ),
-                joinedload(LeaveRequest.leave_type),
-                joinedload(LeaveRequest.fallback_leave_type),
-            )
+            .options(*self._detail_options())
             .where(
                 LeaveRequest.company_id == company_id,
-                LeaveRequest.status.in_(
-                    (
-                        "scheduled",
-                        "approved",
-                        "in_progress",
-                    )
+                or_(
+                    and_(
+                        LeaveRequest.manager_employee_id == manager_employee_id,
+                        LeaveRequest.reviewed_at.is_not(None),
+                        LeaveRequest.cancellation_status != "requested",
+                        LeaveRequest.status.in_((
+                            "scheduled", "approved", "in_progress", "completed",
+                            "rejected", "cancelled", "partially_cancelled"
+                        )),
+                    ),
+                    and_(
+                        LeaveRequest.leader_employee_id == manager_employee_id,
+                        LeaveRequest.leader_reviewed_at.is_not(None),
+                    ),
                 ),
+            )
+            .order_by(LeaveRequest.updated_at.desc(), LeaveRequest.id.desc())
+        )
+        return list(self.session.scalars(statement).unique().all())
+
+    def list_reconcilable(self, *, company_id: int, through_date: date) -> list[LeaveRequest]:
+        statement = (
+            select(LeaveRequest)
+            .options(*self._detail_options())
+            .where(
+                LeaveRequest.company_id == company_id,
+                LeaveRequest.status.in_(("scheduled", "approved", "in_progress")),
                 LeaveRequest.start_date <= through_date,
             )
-            .order_by(
-                LeaveRequest.start_date,
-                LeaveRequest.id,
-            )
+            .order_by(LeaveRequest.start_date, LeaveRequest.id)
         )
-
-        return list(
-            self.session.scalars(statement).unique().all()
-        )
+        return list(self.session.scalars(statement).unique().all())
 
 class LeaveCreditTransactionRepository(BaseRepository[LeaveCreditTransaction]):
     """Queries for immutable leave-credit history."""
@@ -428,3 +326,30 @@ class LeaveCreditTransactionRepository(BaseRepository[LeaveCreditTransaction]):
             .order_by(LeaveCreditTransaction.created_at.desc(), LeaveCreditTransaction.id.desc())
         )
         return list(self.session.scalars(statement).all())
+
+    def list_company_year(
+        self,
+        company_id: int,
+        year: int,
+    ) -> list[LeaveCreditTransaction]:
+        """Return every company credit transaction with display relations."""
+
+        statement = (
+            select(LeaveCreditTransaction)
+            .options(
+                joinedload(LeaveCreditTransaction.employee),
+                joinedload(LeaveCreditTransaction.leave_type),
+                joinedload(LeaveCreditTransaction.leave_request),
+                joinedload(LeaveCreditTransaction.created_by).joinedload(User.employee),
+            )
+            .join(LeaveBalance, LeaveBalance.id == LeaveCreditTransaction.leave_balance_id)
+            .where(
+                LeaveCreditTransaction.company_id == company_id,
+                LeaveBalance.year == year,
+            )
+            .order_by(
+                LeaveCreditTransaction.created_at.desc(),
+                LeaveCreditTransaction.id.desc(),
+            )
+        )
+        return list(self.session.scalars(statement).unique().all())

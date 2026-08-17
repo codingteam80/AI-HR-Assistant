@@ -133,7 +133,7 @@ def test_vacation_leave_converts_only_after_exceeding_45(tmp_path: Path) -> None
         assert Decimal(year_2027["VACATION"].available_credits) == Decimal("45.00")
 
 
-def test_service_bonus_keeps_fixed_cash_limits(tmp_path: Path) -> None:
+def test_six_year_tenure_credit_keeps_fixed_cash_limits(tmp_path: Path) -> None:
     factory = _factory()
     with factory() as session:
         settings = _settings(tmp_path)
@@ -142,7 +142,7 @@ def test_service_bonus_keeps_fixed_cash_limits(tmp_path: Path) -> None:
             session,
             seed,
             number="EMP-BONUS",
-            hire_date=date(2020, 1, 1),
+            hire_date=date(2019, 1, 1),
         )
         service = LeaveService(session, settings=settings)
         balances = _by_code(

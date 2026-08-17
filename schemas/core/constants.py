@@ -22,9 +22,8 @@ SYSTEM_ROLE_DESCRIPTIONS = {
 USER_NAVIGATION = (
     "Chat Assistant",
     "Dashboard",
-    "My Requests",
     "Leave Management",
-    "My Documents",
+    "Company Form/Documents",
     "Company Policies",
     "Benefits",
     "Onboarding",
