@@ -9,7 +9,8 @@ Main sections:
 Department managers remain responsible for approvals outside this portal.
 """
 
-from datetime import datetime
+from datetime import date, datetime
+import calendar
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,7 @@ from config.settings import get_settings
 from core.leave_codes import duration_label, reason_label
 from database.session import SessionFactory
 from schemas.leave_schema import (
+    CompanyLeavePolicyInput,
     LeaveCreditBalanceSetInput,
     LeaveTypeInput,
 )
@@ -116,12 +118,16 @@ def _format_datetime(value) -> str:
     ).strftime("%Y-%m-%d %I:%M %p")
 
 
-def _current_leave_year() -> int:
-    """Return the current year in the configured timezone."""
+def _current_leave_year(company_id: int | None = None) -> int:
+    """Return the current company leave-cycle year."""
 
-    return datetime.now(
+    today = datetime.now(
         ZoneInfo(get_settings().display_timezone)
-    ).year
+    ).date()
+    if company_id is None:
+        return today.year
+    with SessionFactory() as session:
+        return LeaveService(session).leave_cycle_year(company_id, today)
 
 
 def _today():
@@ -321,7 +327,7 @@ def _render_overview(
             year,
         )
 
-    current_year = _current_leave_year()
+    current_year = _current_leave_year(current_user.company_id)
     is_current_year = year == current_year
 
     metric_columns = st.columns(4)
@@ -526,6 +532,8 @@ def _render_employee_account_entitlement(employee, year: int) -> None:
             employee=employee,
             year=year,
         )
+    reset_date = summary["reset_date"]
+    reset_label = reset_date.strftime("%B %d")
 
     hire_date = (
         employee.hire_date.isoformat()
@@ -535,10 +543,12 @@ def _render_employee_account_entitlement(employee, year: int) -> None:
     st.info(
         f"Hire Date: {hire_date} · Completed Service: "
         f"{summary['service_years']} year(s) · {summary['basis']}\n\n"
-        f"January Annual Accrual: Vacation "
+        f"{reset_label} Annual Accrual: Vacation "
         f"{_days(summary['regular_vacation'])} days · "
         f"Sick Leave {_days(summary['sick'])} days. "
-        "Unused SL/VL is shown as Beginning Credit in the next leave year. During January processing, SL retains up to 15 days and VL retains up to 45 days; any excess is moved to Converted to Cash."
+        "Unused SL/VL is shown as Beginning Credit in the next leave cycle. "
+        "During annual reset processing, SL retains up to 15 days and VL "
+        "retains up to 45 days; any excess is moved to Converted to Cash."
     )
 
 
@@ -1783,12 +1793,123 @@ def _render_rules(
 ) -> None:
     """Render leave types, allocations, and request requirements."""
 
+    with SessionFactory() as session:
+        policy_service = LeaveService(session)
+        company = policy_service._company(current_user.company_id)
+        reset_month = int(company.leave_reset_month)
+        reset_day = int(company.leave_reset_day)
+        utilization_enabled = bool(company.leave_utilization_enabled)
+        utilization_percentage = Decimal(company.leave_utilization_percentage)
+        manager_retention = Decimal(company.manager_vl_retention_limit)
+
+    reset_label = date(2024, reset_month, min(reset_day, 29 if reset_month == 2 else 28)).strftime("%B")
+
+    with st.expander("Leave Credit Reset & Utilization Settings", expanded=True):
+        st.caption(
+            "Set the annual leave-cycle reset date and the Vacation Leave "
+            "utilization policy. Existing history is preserved; the settings "
+            "control the applicable annual cycle and future processing."
+        )
+        with st.form("company_leave_policy_form"):
+            reset_columns = st.columns(2)
+            with reset_columns[0]:
+                selected_reset_month = st.selectbox(
+                    "Leave Credit Reset Month",
+                    range(1, 13),
+                    index=reset_month - 1,
+                    format_func=lambda value: date(2024, value, 1).strftime("%B"),
+                )
+            with reset_columns[1]:
+                maximum_day = 29 if selected_reset_month == 2 else calendar.monthrange(
+                    2024, selected_reset_month
+                )[1]
+                selected_reset_day = int(
+                    st.number_input(
+                        "Leave Credit Reset Day",
+                        min_value=1,
+                        max_value=maximum_day,
+                        value=min(reset_day, maximum_day),
+                        step=1,
+                    )
+                )
+
+            selected_utilization_enabled = st.checkbox(
+                "Enable Vacation Leave Utilization",
+                value=utilization_enabled,
+            )
+            utilization_columns = st.columns(2)
+            with utilization_columns[0]:
+                selected_percentage = Decimal(
+                    str(
+                        st.number_input(
+                            "Required VL Utilization (%)",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=float(utilization_percentage),
+                            step=0.5,
+                            disabled=not selected_utilization_enabled,
+                            help="Applied to annual Vacation Leave credit for non-manager employees.",
+                        )
+                    )
+                )
+            with utilization_columns[1]:
+                selected_manager_retention = Decimal(
+                    str(
+                        st.number_input(
+                            "Manager Annual VL Retention",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=float(manager_retention),
+                            step=0.5,
+                            disabled=not selected_utilization_enabled,
+                            help=(
+                                "Managers must utilize the portion of their annual VL "
+                                "credit above this retained amount. This overrides the percentage rule."
+                            ),
+                        )
+                    )
+                )
+            confirm_policy = st.checkbox(
+                "I reviewed the reset date and utilization settings.",
+            )
+            save_policy = st.form_submit_button(
+                "Save Leave Reset & Utilization Settings",
+                type="primary",
+                width="stretch",
+                disabled=not confirm_policy,
+            )
+
+        if save_policy:
+            try:
+                values = CompanyLeavePolicyInput(
+                    company_id=current_user.company_id,
+                    reset_month=selected_reset_month,
+                    reset_day=selected_reset_day,
+                    utilization_enabled=selected_utilization_enabled,
+                    utilization_percentage=selected_percentage,
+                    manager_vl_retention_limit=selected_manager_retention,
+                )
+                with st.spinner("Saving leave policy settings…"):
+                    with SessionFactory() as session:
+                        LeaveService(session).save_company_leave_policy(values)
+                set_operation_feedback(
+                    "Leave reset and utilization settings were saved successfully.",
+                    namespace="leave",
+                )
+                _remember_leave_tabs("Leave Rules")
+                st.rerun()
+            except (ValidationError, ValueError) as error:
+                render_action_warning(error)
+            except Exception:
+                st.error("The leave policy settings could not be saved.")
+
     st.info(
-        "January annual accrual for Vacation and Sick Leave follows completed "
-        "tenure on January 1: 1–5 years = 15 days, 6–10 = 17, 11–15 = 20, "
-        "16–20 = 23, and 21+ = 26. A mid-year bracket change applies on the "
-        "next January processing. Unused SL/VL becomes the next "
-        "year's Beginning Credit; cash-conversion limits are added in Phase 3."
+        f"Annual accrual resets every {reset_label} {reset_day}. Vacation and "
+        "Sick Leave follow completed tenure on the reset date: 1–5 years = "
+        "15 days, 6–10 = 17, 11–15 = 20, 16–20 = 23, and 21+ = 26. "
+        "A later service-bracket change applies on the next reset. Unused "
+        "SL/VL becomes the next cycle's Beginning Credit, subject to the "
+        "retention and cash-conversion rules."
     )
 
     with SessionFactory() as session:
@@ -1825,11 +1946,11 @@ def _render_rules(
                     else "Inactive"
                 ),
                 "Automatic Rule": (
-                    "January tenure bracket: 15 / 17 / 20 / 23 / 26 days"
+                    f"{reset_label} {reset_day} tenure bracket: 15 / 17 / 20 / 23 / 26 days"
                     if item.code.upper() == "VACATION"
                     else "Included in Vacation total"
                     if item.code.upper() == "EMERGENCY"
-                    else "January tenure bracket: 15 / 17 / 20 / 23 / 26 days"
+                    else f"{reset_label} {reset_day} tenure bracket: 15 / 17 / 20 / 23 / 26 days"
                     if item.code.upper() == "SICK"
                     else "Automatic excess when paid credits are insufficient"
                     if item.code.upper() == "LWOP"
@@ -1955,15 +2076,17 @@ def _notification_request_year(
         return None
 
     with SessionFactory() as session:
-        request = LeaveService(session).get_request(
+        service = LeaveService(session)
+        request = service.get_request(
             current_user.company_id,
             request_id,
         )
-
-    if request is None:
-        return None
-
-    return request.start_date.year
+        if request is None:
+            return None
+        return service.leave_cycle_year(
+            current_user.company_id,
+            request.start_date,
+        )
 
 
 def render_admin_leave_management_page(
@@ -1994,7 +2117,9 @@ def render_admin_leave_management_page(
     if notification_year is not None:
         st.session_state["leave_management_year"] = notification_year
     elif "leave_management_year" not in st.session_state:
-        st.session_state["leave_management_year"] = _current_leave_year()
+        st.session_state["leave_management_year"] = _current_leave_year(
+            current_user.company_id
+        )
 
     selected_year = int(
         st.number_input(

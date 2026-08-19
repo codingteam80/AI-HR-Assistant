@@ -1,6 +1,7 @@
 """Register all SQLAlchemy models."""
 
 from models.announcement import Announcement
+from models.audit_event import AuditEvent
 from models.attendance_correction import AttendanceCorrection
 from models.attendance_record import AttendanceRecord
 from models.attendance_session import AttendanceSession
@@ -33,6 +34,7 @@ from models.user import User
 
 __all__ = [
     "Announcement",
+    "AuditEvent",
     "AttendanceCorrection",
     "AttendanceRecord",
     "AttendanceSession",

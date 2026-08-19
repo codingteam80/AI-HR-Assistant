@@ -25,6 +25,11 @@ _LOGIN_REQUIRED_COMPANY_COLUMNS = {
     "work_friday",
     "work_saturday",
     "work_sunday",
+    "leave_reset_month",
+    "leave_reset_day",
+    "leave_utilization_enabled",
+    "leave_utilization_percentage",
+    "manager_vl_retention_limit",
 }
 _REQUIRED_RUNTIME_TABLES = {
     "companies",
@@ -35,10 +40,13 @@ _REQUIRED_RUNTIME_TABLES = {
     "onboarding_checklist_items",
     "employee_onboarding_progress",
     "company_benefits",
+    "audit_events",
 }
 _REQUIRED_EMPLOYEE_COLUMNS = {
     "archived_at",
     "archived_by_user_id",
+    "edit_version",
+    "last_edited_by_user_id",
 }
 _REQUIRED_LEAVE_REQUEST_COLUMNS = {
     "duration_code",

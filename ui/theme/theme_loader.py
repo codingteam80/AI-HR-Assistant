@@ -1783,6 +1783,34 @@ def apply_theme(
         pointer-events: none;
     }}
 
+    .hr-admin-account-divider {{
+        display: block;
+        width: 100%;
+        height: 1px;
+        min-height: 1px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-top: 1px solid rgba(100, 116, 139, 0.88);
+        background: var(--hr-border);
+        box-shadow: 0 0 0 0.5px var(--hr-text-muted);
+        opacity: 0.52;
+        pointer-events: none;
+    }}
+
+    /*
+       Keep the actual separation line. Only reduce the wrapper space so the
+       Audit Trail -> divider -> Employee Portal group stays compact and the
+       sidebar remains no-scroll.
+    */
+    section[data-testid="stSidebar"]
+    [data-testid="stElementContainer"]:has(.hr-admin-account-divider),
+    section[data-testid="stSidebar"]
+    div.element-container:has(.hr-admin-account-divider) {{
+        margin-top: -0.275rem !important;
+        margin-bottom: -0.275rem !important;
+    }}
+
     section[data-testid="stSidebar"] div.stButton > button {{
         box-shadow:
             0 3px 8px rgba(30, 41, 59, 0.09),

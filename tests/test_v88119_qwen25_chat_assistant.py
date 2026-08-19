@@ -1,4 +1,4 @@
-"""Qwen2.5 3B configuration and shared Chat Assistant wiring tests."""
+"""Qwen2.5 shared Chat Assistant wiring regression tests."""
 
 from __future__ import annotations
 
@@ -24,13 +24,13 @@ class _FakeResponse:
         return b'{"response": "Grounded answer"}'
 
 
-def test_qwen25_3b_is_the_default_for_standard_and_quality_requests():
+def test_qwen25_current_model_is_the_default_for_standard_and_quality_requests():
     settings = Settings(_env_file=None)
-    assert settings.smart_ai_ollama_model == "qwen2.5:3b"
-    assert settings.smart_ai_quality_ollama_model == "qwen2.5:3b"
+    assert settings.smart_ai_ollama_model == "qwen2.5:7b"
+    assert settings.smart_ai_quality_ollama_model == "qwen2.5:7b"
 
 
-def test_ollama_payload_uses_qwen25_3b_for_both_request_paths():
+def test_ollama_payload_uses_current_qwen25_model_for_both_request_paths():
     client = OllamaClient()
     captured_models: list[str] = []
 
@@ -44,7 +44,7 @@ def test_ollama_payload_uses_qwen25_3b_for_both_request_paths():
         assert client.generate("Standard prompt") == "Grounded answer"
         assert client.generate("Quality prompt", quality=True) == "Grounded answer"
 
-    assert captured_models == ["qwen2.5:3b", "qwen2.5:3b"]
+    assert captured_models == ["qwen2.5:7b", "qwen2.5:7b"]
 
 
 def test_admin_and_employee_pages_use_the_shared_smart_ai_service():
@@ -57,15 +57,15 @@ def test_admin_and_employee_pages_use_the_shared_smart_ai_service():
     assert 'role_scope="employee"' in employee
 
 
-def test_environment_templates_and_qwen_release_remain_preserved():
+def test_environment_templates_and_qwen_setup_remain_preserved():
     env = (PROJECT_ROOT / ".env").read_text(encoding="utf-8")
     env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
     settings = (PROJECT_ROOT / "config/settings.py").read_text(encoding="utf-8")
 
     for content in (env, env_example):
-        assert "SMART_AI_OLLAMA_MODEL=qwen2.5:3b" in content
-        assert "SMART_AI_QUALITY_OLLAMA_MODEL=qwen2.5:3b" in content
+        assert "SMART_AI_OLLAMA_MODEL=qwen2.5:7b" in content
+        assert "SMART_AI_QUALITY_OLLAMA_MODEL=qwen2.5:7b" in content
     assert 'app_version: str = "0.8.8.' in settings
-    assert "v8.8.119 — Qwen2.5 3B Chat Assistant" in (
+    assert "ollama pull qwen2.5:7b" in (
         PROJECT_ROOT / "README.md"
     ).read_text(encoding="utf-8")

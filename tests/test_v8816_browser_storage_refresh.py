@@ -21,13 +21,17 @@ def test_refresh_uses_bundled_local_storage_component() -> None:
     assert "streamlit_cookies_controller" not in source
 
 
-def test_frontend_reads_and_writes_local_storage_offline() -> None:
+def test_frontend_reads_and_writes_tab_scoped_storage_offline() -> None:
     source = _read(
         "authentication/browser_auth_storage_frontend/index.html"
     )
 
-    assert "window.localStorage.getItem" in source
-    assert "window.localStorage.setItem" in source
+    assert "window.sessionStorage.getItem" in source
+    assert "window.sessionStorage.setItem" in source
+    assert "window.sessionStorage.removeItem" in source
+    # Legacy shared auth is cleanup-only and must never be restored.
+    assert "window.localStorage.getItem" not in source
+    assert "window.localStorage.setItem" not in source
     assert "window.localStorage.removeItem" in source
     assert "streamlit:componentReady" in source
     assert "streamlit:setComponentValue" in source

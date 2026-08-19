@@ -12,13 +12,16 @@ def _read(relative_path: str) -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_integrations_route_is_functional() -> None:
-    """Admin Integrations must no longer be a placeholder."""
+def test_integrations_sidebar_route_is_replaced_by_audit_trail() -> None:
+    """The retired sidebar destination must open the central history."""
 
-    source = _read("ui/layouts/admin_layout.py")
+    layout_source = _read("ui/layouts/admin_layout.py")
+    sidebar_source = _read("ui/components/admin_sidebar.py")
 
-    assert 'page == "Integrations"' in source
-    assert "render_integrations_page(current_user)" in source
+    assert 'page == "Audit Trail"' in layout_source
+    assert "render_audit_trail_page(current_user)" in layout_source
+    assert 'if st.session_state.current_page == "Integrations"' in sidebar_source
+    assert 'current_page="Audit Trail"' in sidebar_source
 
 
 def test_integrations_page_can_send_real_test_email() -> None:

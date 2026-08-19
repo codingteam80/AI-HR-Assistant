@@ -32,6 +32,7 @@ class EmailIntegrationStatus:
     port: int | None
     encryption: str
     username_configured: bool
+    password_configured: bool
     from_email: str
     from_name: str
     reset_base_url: str
@@ -118,6 +119,10 @@ class EmailIntegrationService:
             ),
             encryption=encryption,
             username_configured=bool(username),
+            password_configured=bool(
+                self.settings.smtp_password is not None
+                and self.settings.smtp_password.get_secret_value().strip()
+            ),
             from_email=self.settings.smtp_from_email,
             from_name=self.settings.smtp_from_name,
             reset_base_url=(

@@ -23,7 +23,8 @@ ADMIN_NAVIGATION = (
     "Announcements",
     "Company Form/Documents",
     "Reports",
-    "Integrations",
+    "External Notifications",
+    "Audit Trail",
 )
 
 
@@ -53,12 +54,19 @@ def render_admin_sidebar(
         )
         st.rerun()
 
-    # Audit Logs was replaced by the Company Form/Documents workspace.
-    # Preserve old browser/session bookmarks by redirecting them forward.
+    # Preserve old central-history bookmarks after the unified Audit Trail
+    # replaced both Audit Logs and the standalone Integrations sidebar page.
     if st.session_state.current_page == "Audit Logs":
         set_navigation_state(
             portal_mode="admin",
-            current_page="Company Form/Documents",
+            current_page="Audit Trail",
+        )
+        st.rerun()
+
+    if st.session_state.current_page == "Integrations":
+        set_navigation_state(
+            portal_mode="admin",
+            current_page="Audit Trail",
         )
         st.rerun()
 
@@ -84,7 +92,13 @@ def render_admin_sidebar(
             )
             st.rerun()
 
-    st.sidebar.divider()
+    # Keep the account-group separation line visible. Use an explicit HR
+    # element so the separator cannot collapse into the sidebar background;
+    # theme CSS only compacts the space around it.
+    st.sidebar.markdown(
+        "<hr class='hr-admin-account-divider' aria-hidden='true'>",
+        unsafe_allow_html=True,
+    )
 
     if st.sidebar.button(
         "Employee Portal",

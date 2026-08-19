@@ -1,8 +1,9 @@
 """Backward-compatible aliases for browser authentication storage.
 
-Authentication persistence moved from a third-party cookie component to a
-bundled localStorage component in v8.8.16. New code should import from
-``authentication.browser_auth_storage``.
+Authentication persistence uses the bundled browser-storage component.
+Current authentication tokens are stored in tab-scoped ``sessionStorage``
+so separate browser tabs/windows can use independent accounts. New code
+should import from ``authentication.browser_auth_storage``.
 """
 
 from authentication.browser_auth_storage import (

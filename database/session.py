@@ -80,6 +80,12 @@ SessionFactory = sessionmaker(
     class_=Session,
 )
 
+# The listener writes audit rows inside the same successful transaction, so a
+# rollback never leaves a false "successful" event behind.
+from database.audit_listener import install_audit_listener
+
+install_audit_listener()
+
 
 def get_session() -> Generator[Session, None, None]:
     """Yield a session and always close it afterward.

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import calendar
 from decimal import Decimal, ROUND_HALF_UP
 import json
 from pathlib import Path
@@ -26,6 +27,7 @@ from integrations.email.email_sender import (
     build_email_sender,
 )
 from models.employee import Employee
+from models.company import Company
 from models.leave_balance import LeaveBalance
 from models.leave_credit_transaction import LeaveCreditTransaction
 from models.leave_request import LeaveRequest
@@ -49,6 +51,7 @@ from schemas.leave_schema import (
     LeaveDecisionInput,
     LeaveRequestInput,
     LeaveTypeInput,
+    CompanyLeavePolicyInput,
 )
 from services.notification_service import NotificationService
 
@@ -315,9 +318,12 @@ class LeaveUtilizationSummary:
     used_days: Decimal
     remaining_days: Decimal
     forfeited_days: Decimal = Decimal("0.00")
+    is_enabled: bool = True
 
     @property
     def display_text(self) -> str:
+        if not self.is_enabled:
+            return "Disabled"
         remaining = LeaveService._display_days(self.remaining_days)
         if self.forfeited_days > 0:
             remaining = f"{remaining} — Forfeited"
@@ -364,6 +370,64 @@ class LeaveService:
 
     def _today(self) -> date:
         return datetime.now(ZoneInfo(self.settings.display_timezone)).date()
+
+    def _company(self, company_id: int) -> Company:
+        company = self.session.get(Company, company_id)
+        if company is None:
+            raise ValueError("The company record is unavailable.")
+        return company
+
+    @staticmethod
+    def _safe_annual_date(year: int, month: int, day: int) -> date:
+        """Build an annual policy date, clamping February 29 when needed."""
+
+        maximum = calendar.monthrange(year, month)[1]
+        return date(year, month, min(day, maximum))
+
+    def leave_cycle_start(self, company_id: int, cycle_year: int) -> date:
+        company = self._company(company_id)
+        return self._safe_annual_date(
+            cycle_year,
+            int(company.leave_reset_month),
+            int(company.leave_reset_day),
+        )
+
+    def leave_cycle_end(self, company_id: int, cycle_year: int) -> date:
+        return self.leave_cycle_start(company_id, cycle_year + 1) - timedelta(days=1)
+
+    def leave_cycle_year(self, company_id: int, target_date: date | None = None) -> int:
+        selected = target_date or self._today()
+        start = self.leave_cycle_start(company_id, selected.year)
+        return selected.year if selected >= start else selected.year - 1
+
+    def save_company_leave_policy(
+        self,
+        values: CompanyLeavePolicyInput,
+    ) -> Company:
+        """Persist validated leave-cycle and utilization settings."""
+
+        company = self._company(values.company_id)
+        company.leave_reset_month = values.reset_month
+        company.leave_reset_day = values.reset_day
+        company.leave_utilization_enabled = values.utilization_enabled
+        company.leave_utilization_percentage = values.utilization_percentage
+        company.manager_vl_retention_limit = values.manager_vl_retention_limit
+        self.session.commit()
+        self.session.refresh(company)
+        return company
+
+    def _employee_is_manager(self, employee: Employee) -> bool:
+        """Identify a manager through organization assignment or job title."""
+
+        has_direct_reports = self.session.scalar(
+            select(func.count(Employee.id)).where(
+                Employee.company_id == employee.company_id,
+                Employee.manager_id == employee.id,
+                Employee.employment_status == "employed",
+            )
+        )
+        title = " ".join((employee.job_title or "").strip().casefold().split())
+        return bool(has_direct_reports) or "manager" in title
 
     @staticmethod
     def _business_days(start_date: date, end_date: date) -> Decimal:
@@ -468,24 +532,27 @@ class LeaveService:
     ) -> Decimal:
         """Return the approved VL target for the selected leave year."""
 
-        if balance.year < LEAVE_UTILIZATION_POLICY_START.year:
+        company = self._company(balance.company_id)
+        if not company.leave_utilization_enabled:
             return Decimal("0.00")
 
         annual_credit = Decimal(balance.credit_days).quantize(
             Decimal("0.01")
         )
-        if balance.year == LEAVE_UTILIZATION_POLICY_START.year:
-            exact_target = LEAVE_UTILIZATION_2026_TARGETS.get(
-                annual_credit
-            )
-            if exact_target is not None:
-                return exact_target
-            return self._round_to_half_day(
-                annual_credit / Decimal("2")
-            )
+        employee = self.employee_repository.get_with_details(
+            company_id=balance.company_id,
+            employee_id=balance.employee_id,
+        )
+        if employee is not None and self._employee_is_manager(employee):
+            return max(
+                Decimal("0.00"),
+                annual_credit - Decimal(company.manager_vl_retention_limit),
+            ).quantize(Decimal("0.00"))
 
         return self._round_to_half_day(
-            annual_credit / Decimal("2")
+            annual_credit
+            * Decimal(company.leave_utilization_percentage)
+            / Decimal("100")
         )
 
     def _leave_utilization_used_days(
@@ -502,12 +569,8 @@ class LeaveService:
         Leave utilization, so its posted usage is removed explicitly.
         """
 
-        period_start = (
-            LEAVE_UTILIZATION_POLICY_START
-            if balance.year == LEAVE_UTILIZATION_POLICY_START.year
-            else date(balance.year, 1, 1)
-        )
-        period_end = date(balance.year, 12, 31)
+        period_start = self.leave_cycle_start(balance.company_id, balance.year)
+        period_end = self.leave_cycle_end(balance.company_id, balance.year)
         effective_end = min(as_of, period_end)
         if effective_end < period_start:
             return Decimal("0.00")
@@ -545,8 +608,17 @@ class LeaveService:
         """Return VL-only utilization without mutating available credits."""
 
         code = (balance.leave_type.code or "").strip().upper()
-        if code != "VACATION" or balance.year < 2026:
+        if code != "VACATION":
             return None
+
+        company = self._company(balance.company_id)
+        if not company.leave_utilization_enabled:
+            return LeaveUtilizationSummary(
+                required_days=Decimal("0.00"),
+                used_days=Decimal("0.00"),
+                remaining_days=Decimal("0.00"),
+                is_enabled=False,
+            )
 
         required = self._leave_utilization_required_days(balance=balance)
         used = self._leave_utilization_used_days(
@@ -578,7 +650,8 @@ class LeaveService:
     ) -> LeaveUtilizationSummary | None:
         """Forfeit one unmet VL target once the annual period has ended."""
 
-        if as_of < date(balance.year, 12, 31):
+        period_end = self.leave_cycle_end(balance.company_id, balance.year)
+        if as_of < period_end:
             return None
         existing = self._leave_utilization_year_end_transaction(balance)
         if existing is not None:
@@ -589,10 +662,12 @@ class LeaveService:
 
         summary = self.leave_utilization_summary(
             balance=balance,
-            as_of=date(balance.year, 12, 31),
+            as_of=period_end,
         )
         if summary is None:
             return None
+        if not summary.is_enabled:
+            return summary
 
         forfeited = min(
             summary.remaining_days,
@@ -692,12 +767,15 @@ class LeaveService:
         """Finalize due VL targets and emit non-duplicating reminders."""
 
         selected_date = through_date or self._today()
+        if not self._company(company_id).leave_utilization_enabled:
+            return 0
         changed = 0
+        current_cycle_year = self.leave_cycle_year(company_id, selected_date)
         balances = [
             item
             for item in self.balance_repository.list_company_year(
                 company_id,
-                selected_date.year,
+                current_cycle_year,
             )
             if (item.leave_type.code or "").strip().upper() == "VACATION"
         ]
@@ -705,7 +783,7 @@ class LeaveService:
         # Also finalize any older VL balance that has not yet received its
         # immutable year-end marker. This repairs safe legacy carryover on the
         # next app open without resetting or rewriting historical records.
-        for year in range(2026, selected_date.year):
+        for year in range(2026, current_cycle_year):
             balances.extend(
                 item
                 for item in self.balance_repository.list_company_year(
@@ -723,7 +801,7 @@ class LeaveService:
             if employee is None:
                 continue
 
-            period_end = date(balance.year, 12, 31)
+            period_end = self.leave_cycle_end(company_id, balance.year)
             if selected_date >= period_end:
                 was_finalized = (
                     self._leave_utilization_year_end_transaction(balance)
@@ -759,7 +837,7 @@ class LeaveService:
                 balance=balance,
                 as_of=selected_date,
             )
-            if summary is None or selected_date < LEAVE_UTILIZATION_POLICY_START:
+            if summary is None or not summary.is_enabled:
                 continue
 
             if summary.remaining_days <= 0:
@@ -776,14 +854,19 @@ class LeaveService:
                 )
                 continue
 
+            reminder_schedule = (
+                (92, "leave_utilization_reminder_first", "Leave utilization reminder"),
+                (61, "leave_utilization_reminder_followup", "Leave utilization follow-up"),
+                (30, "leave_utilization_reminder_urgent", "Leave utilization urgent reminder"),
+                (16, "leave_utilization_reminder_final", "Final leave utilization reminder"),
+            )
             due_reminders = [
-                item
-                for item in LEAVE_UTILIZATION_REMINDER_DATES
-                if selected_date >= date(balance.year, item[0], item[1])
+                item for item in reminder_schedule
+                if selected_date >= period_end - timedelta(days=item[0])
             ]
             if not due_reminders:
                 continue
-            _, _, event_type, title = due_reminders[-1]
+            _, event_type, title = due_reminders[-1]
             changed += self._send_leave_utilization_notification(
                 balance=balance,
                 employee=employee,
@@ -793,7 +876,7 @@ class LeaveService:
                     f"{employee.full_name} still needs to consume "
                     f"{self._display_days(summary.remaining_days)} of "
                     f"{self._display_days(summary.required_days)} required "
-                    f"Vacation Leave day(s) before December 31, {balance.year}."
+                    f"Vacation Leave day(s) before {period_end:%B %d, %Y}."
                 ),
             )
 
@@ -801,11 +884,10 @@ class LeaveService:
             self.session.commit()
         return changed
 
-    @staticmethod
-    def _annual_processing_date(year: int) -> date:
-        """Return the effective date of the yearly SL/VL accrual."""
+    def _annual_processing_date(self, year: int, company_id: int | None = None) -> date:
+        """Return the company-configured yearly SL/VL reset date."""
 
-        return date(year, 1, 1)
+        return self.leave_cycle_start(company_id, year) if company_id else date(year, 1, 1)
 
     @staticmethod
     def annual_tenure_credit(completed_service_years: int) -> Decimal:
@@ -854,15 +936,18 @@ class LeaveService:
 
         code = (leave_type.code or "").strip().upper()
         hire_date = employee.hire_date
-        processing_date = self._annual_processing_date(year)
+        processing_date = self._annual_processing_date(year, employee.company_id)
 
         if code not in ANNUAL_ACCRUAL_CODES:
             return Decimal("0.00")
+        if (as_of or self._today()) < processing_date:
+            return Decimal("0.00")
 
+        cycle_end = self.leave_cycle_end(employee.company_id, year)
         if hire_date is not None:
-            if year < hire_date.year:
+            if hire_date > cycle_end:
                 return Decimal("0.00")
-            if as_of is not None and year == hire_date.year and as_of < hire_date:
+            if as_of is not None and as_of < hire_date:
                 return Decimal("0.00")
 
         service_years = self.completed_service_years(
@@ -871,11 +956,17 @@ class LeaveService:
         )
         allocation = self.annual_tenure_credit(service_years)
 
-        if hire_date is not None and year == hire_date.year:
-            remaining_months = 13 - hire_date.month
+        if hire_date is not None and hire_date > processing_date:
+            next_processing = self.leave_cycle_start(employee.company_id, year + 1)
+            remaining_months = max(
+                0,
+                (next_processing.year - hire_date.year) * 12
+                + next_processing.month
+                - hire_date.month,
+            )
             allocation = self._round_to_half_day(
                 allocation
-                * Decimal(remaining_months)
+                * Decimal(min(12, remaining_months))
                 / Decimal("12")
             )
 
@@ -894,7 +985,7 @@ class LeaveService:
             item.code.upper(): item
             for item in self.list_leave_types(employee.company_id)
         }
-        reference_date = self._annual_processing_date(year)
+        reference_date = self._annual_processing_date(year, employee.company_id)
 
         def allocation(code: str) -> Decimal:
             leave_type = leave_types.get(code)
@@ -923,9 +1014,12 @@ class LeaveService:
             "basis": (
                 "Hire-year prorated"
                 if employee.hire_date is not None
-                and year == employee.hire_date.year
-                else "January annual accrual"
+                and employee.hire_date > reference_date
+                and employee.hire_date
+                <= self.leave_cycle_end(employee.company_id, year)
+                else f"{reference_date:%B %d} annual accrual"
             ),
+            "reset_date": reference_date,
         }
 
     def ensure_default_leave_types(self, company_id: int) -> list[LeaveType]:
@@ -1426,7 +1520,7 @@ class LeaveService:
             company_id=request.company_id,
             employee_id=request.employee_id,
             leave_type=request.leave_type,
-            year=request.start_date.year,
+            year=self.leave_cycle_year(request.company_id, request.start_date),
             employee=request.employee,
             as_of=self._today(),
         )
@@ -1483,7 +1577,7 @@ class LeaveService:
             ).strip().upper()
             if (
                 code != "EMERGENCY"
-                or request.start_date.year != int(year)
+                or self.leave_cycle_year(company_id, request.start_date) != int(year)
                 or request.status not in EMERGENCY_ACTIVE_STATUSES
             ):
                 continue
@@ -1739,7 +1833,8 @@ class LeaveService:
                 # A conversion removes days from the usable credit ledger.
                 amount_days=-converted,
                 note=(
-                    f"January {year} cash conversion: retained limit "
+                    f"{self._annual_processing_date(year, balance.company_id):%B %d, %Y} "
+                    "cash conversion: retained limit "
                     f"{retained_limit} day(s); converted excess "
                     f"{converted} day(s)."
                 ),
@@ -1926,7 +2021,7 @@ class LeaveService:
                             corrected_converted - previous_converted
                         ),
                         note=(
-                            f"Cash conversion recalculated after the January "
+                            f"Cash conversion recalculated after the annual "
                             f"tenure credit changed from {current} to "
                             f"{expected} day(s); converted amount changed "
                             f"from {previous_converted} to "
@@ -1943,8 +2038,9 @@ class LeaveService:
                 transaction_type="january_annual_accrual_update",
                 amount_days=difference,
                 note=(
-                    f"January {year} annual accrual recalculated from the "
-                    f"employee's completed service years on January 1; "
+                    f"{self._annual_processing_date(year, balance.company_id):%B %d, %Y} "
+                    "annual accrual recalculated from the employee's completed "
+                    "service years on the configured reset date; "
                     f"credit is now {expected} day(s)."
                 ),
             )
@@ -1977,7 +2073,7 @@ class LeaveService:
         if (
             previous is not None
             and (leave_type.code or "").strip().upper() == "VACATION"
-            and processing_date >= date(year - 1, 12, 31)
+            and processing_date >= self.leave_cycle_end(company_id, year - 1)
         ):
             self._finalize_leave_utilization(
                 balance=previous,
@@ -1994,7 +2090,7 @@ class LeaveService:
             # Historical records remain unchanged. The selected annual ledger
             # is synchronized idempotently to the January rules so databases
             # created by older checkpoints receive the corrected SL/VL credit.
-            if year >= self._today().year or as_of is not None:
+            if year >= self.leave_cycle_year(company_id) or as_of is not None:
                 self._sync_balance_beginning_credit(
                     balance=existing,
                     leave_type=leave_type,
@@ -2065,8 +2161,9 @@ class LeaveService:
                 transaction_type="january_annual_accrual",
                 amount_days=allocation,
                 note=(
-                    f"January {year} annual accrual based on completed "
-                    "service years as of January 1"
+                    f"{self._annual_processing_date(year, company_id):%B %d, %Y} "
+                    "annual accrual based on completed service years as of "
+                    "the configured reset date"
                 ),
             )
         )
@@ -2106,7 +2203,7 @@ class LeaveService:
         has not yet been processed. Running it again never duplicates credits.
         """
 
-        selected_year = year or self._today().year
+        selected_year = year or self.leave_cycle_year(company_id)
         leave_types = self.ensure_default_leave_types(company_id)
         active_types = [item for item in leave_types if item.is_active]
         employees = [
@@ -2169,7 +2266,7 @@ class LeaveService:
         self.session.flush()
 
         if values.apply_annual_credits_to_existing:
-            year = self._today().year
+            year = self.leave_cycle_year(values.company_id)
             balances = self.balance_repository.list_company_year(
                 values.company_id,
                 year,
@@ -2188,12 +2285,12 @@ class LeaveService:
         return leave_type
 
     def list_company_balances(self, company_id: int, year: int | None = None) -> list[LeaveBalance]:
-        selected_year = year or self._today().year
+        selected_year = year or self.leave_cycle_year(company_id)
         self.ensure_current_year_balances(company_id, selected_year)
         return self.balance_repository.list_company_year(company_id, selected_year)
 
     def list_employee_balances(self, company_id: int, employee_id: int, year: int | None = None) -> list[LeaveBalance]:
-        selected_year = year or self._today().year
+        selected_year = year or self.leave_cycle_year(company_id)
         self.ensure_current_year_balances(company_id, selected_year)
         return self.balance_repository.list_employee_year(company_id, employee_id, selected_year)
 
@@ -2382,14 +2479,18 @@ class LeaveService:
         )
 
     def list_credit_history(self, company_id: int, employee_id: int, year: int | None = None):
-        return self.transaction_repository.list_employee_year(company_id, employee_id, year or self._today().year)
+        return self.transaction_repository.list_employee_year(
+            company_id,
+            employee_id,
+            year or self.leave_cycle_year(company_id),
+        )
 
     def list_company_credit_history(self, company_id: int, year: int | None = None):
         """Return immutable credit transactions for the company History tab."""
 
         return self.transaction_repository.list_company_year(
             company_id,
-            year or self._today().year,
+            year or self.leave_cycle_year(company_id),
         )
 
     def _admin_cc_emails(self, company_id: int, *, exclude: set[str]) -> list[str]:
@@ -2913,7 +3014,7 @@ class LeaveService:
             company_id=values.company_id,
             employee=employee,
             leave_type=leave_type,
-            year=values.start_date.year,
+            year=self.leave_cycle_year(values.company_id, values.start_date),
             requested_days=requested_days,
             as_of=today,
             virtual_primary_credit=preview_event_credit,
@@ -3511,7 +3612,7 @@ class LeaveService:
             company_id=request.company_id,
             employee_id=request.employee_id,
             leave_type=leave_type,
-            year=request.start_date.year,
+            year=self.leave_cycle_year(request.company_id, request.start_date),
             employee=request.employee,
             as_of=self._today(),
         )
@@ -3562,7 +3663,7 @@ class LeaveService:
             company_id=request.company_id,
             employee_id=request.employee_id,
             leave_type=request.leave_type,
-            year=request.start_date.year,
+            year=self.leave_cycle_year(request.company_id, request.start_date),
             employee=request.employee,
             as_of=self._today(),
         )
@@ -3845,7 +3946,7 @@ class LeaveService:
                     company_id=request.company_id,
                     employee=request.employee,
                     leave_type=request.leave_type,
-                    year=request.start_date.year,
+                    year=self.leave_cycle_year(request.company_id, request.start_date),
                     requested_days=requested_days,
                     as_of=self._today(),
                 )
@@ -4016,7 +4117,7 @@ class LeaveService:
                         company_id=request.company_id,
                         employee_id=request.employee_id,
                         leave_type=posting_type,
-                        year=request.start_date.year,
+                        year=self.leave_cycle_year(request.company_id, request.start_date),
                         employee=request.employee,
                         as_of=selected_date,
                     )
@@ -4074,9 +4175,12 @@ class LeaveService:
     ):
         """Return monitored requests, optionally filtered by leave year."""
 
+        if year is None:
+            return self.request_repository.list_company(company_id)
         return self.request_repository.list_company(
             company_id,
-            year=year,
+            period_start=self.leave_cycle_start(company_id, int(year)),
+            period_end=self.leave_cycle_end(company_id, int(year)),
         )
 
     def list_employee_requests(self, company_id: int, employee_id: int):
@@ -4117,7 +4221,10 @@ class LeaveService:
         """Return summary metrics for the selected Leave Year."""
 
         today = self._today()
-        selected_year = int(year or today.year)
+        current_cycle_year = self.leave_cycle_year(company_id, today)
+        selected_year = int(year or current_cycle_year)
+        cycle_start = self.leave_cycle_start(company_id, selected_year)
+        cycle_end = self.leave_cycle_end(company_id, selected_year)
         requests = self.list_company_requests(
             company_id,
             selected_year,
@@ -4127,15 +4234,14 @@ class LeaveService:
             for request in requests
             if (
                 request.submitted_at
-                and request.submitted_at.year
-                == selected_year
+                and cycle_start <= request.submitted_at.date() <= cycle_end
             )
         ]
         current_month = [
             request
             for request in requests
             if (
-                selected_year == today.year
+                selected_year == current_cycle_year
                 and request.submitted_at
                 and request.submitted_at.year == today.year
                 and request.submitted_at.month == today.month
@@ -4145,7 +4251,7 @@ class LeaveService:
             request
             for request in requests
             if (
-                selected_year == today.year
+                selected_year == current_cycle_year
                 and request.status in {
                     "scheduled",
                     "approved",

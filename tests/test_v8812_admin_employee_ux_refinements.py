@@ -109,6 +109,7 @@ def test_phone_number_is_saved_and_edited() -> None:
             EmployeeMasterUpdate(
                 company_id=seed["company"].id,
                 employee_id=employee.id,
+                expected_edit_version=employee.edit_version,
                 employee_number=employee.employee_number,
                 first_name=employee.first_name,
                 last_name=employee.last_name,

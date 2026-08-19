@@ -46,9 +46,8 @@ def test_legacy_audit_logs_bookmark_redirects_to_new_workspace() -> None:
     sidebar = _read("ui/components/admin_sidebar.py")
 
     assert 'current_page == "Audit Logs"' in sidebar
-    assert 'current_page="Company Form/Documents"' in sidebar
+    assert 'current_page="Audit Trail"' in sidebar
 
 
-def test_release_checkpoint_v8867_is_preserved() -> None:
-    release = _read("RELEASE_v8_8_67.md")
-    assert "v8.8.67" in release
+def test_release_history_is_not_kept_as_root_release_files() -> None:
+    assert not list(PROJECT_ROOT.glob("RELEASE_*.md"))

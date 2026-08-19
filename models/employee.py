@@ -8,7 +8,7 @@ remain in ``employee_trainings``.
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.base import Base, TimestampMixin
@@ -38,6 +38,30 @@ class Employee(TimestampMixin, Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Increments on every Employee Master Record save. The value is shown to
+    # neither portal, but prevents two administrators from silently
+    # overwriting one another when both opened the same older form.
+    edit_version: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        server_default=text("1"),
+        nullable=False,
+    )
+
+    # Stored on the same versioned row so a stale-save warning can name the
+    # exact administrator even when two saves reach the database almost at
+    # the same time (before the secondary history row is written).
+    last_edited_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+
+    __mapper_args__ = {
+        "version_id_col": edit_version,
+        "version_id_generator": False,
+    }
 
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"),

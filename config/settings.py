@@ -15,8 +15,10 @@ from functools import lru_cache
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from config.chat_assistant_settings import ChatAssistantSettingsCompatibilityMixin
 
-class Settings(BaseSettings):
+
+class Settings(ChatAssistantSettingsCompatibilityMixin, BaseSettings):
     """Environment-driven application settings.
 
     Each class field can be overridden by a matching environment variable.
@@ -27,8 +29,15 @@ class Settings(BaseSettings):
 
     # Application identity and runtime behavior.
     app_name: str = "AI HR Assistant"
-    app_version: str = "0.8.8.158"
-    # Immediate base checkpoint: app_version: str = "0.8.8.157"
+    app_version: str = "0.8.8.168"
+    # Previous table-readability checkpoint: app_version: str = "0.8.8.164.3"
+    # Previous per-tab-auth checkpoint: app_version: str = "0.8.8.164.4"
+    # Immediate base checkpoint: app_version: str = "0.8.8.164"
+    # Previous in-app notification checkpoint: app_version: str = "0.8.8.163"
+    # Immediate base checkpoint: app_version: str = "0.8.8.161"
+    # Immediate base checkpoint: app_version: str = "0.8.8.160"
+    # Earlier base checkpoint: app_version: str = "0.8.8.158"
+    # Earlier base checkpoint: app_version: str = "0.8.8.157"
     # Earlier base checkpoint: app_version: str = "0.8.8.156"
     # Earlier base checkpoint: app_version: str = "0.8.8.155"
     # Earlier base checkpoint: app_version: str = "0.8.8.154"
@@ -56,8 +65,8 @@ class Settings(BaseSettings):
     assistant_name: str = "AI HR Assistant"
 
     # Signed browser authentication token.
-    # The signed token is stored in browser localStorage so it survives F5
-    # refreshes without depending on asynchronous third-party cookie APIs.
+    # The signed token is stored in tab-scoped browser sessionStorage so it
+    # survives F5 refreshes without being shared across separate tabs/windows.
     # Set AUTH_COOKIE_SECRET to a long random value in production. When
     # omitted, a private local secret file is created automatically.
     auth_cookie_secret: SecretStr | None = None
@@ -94,30 +103,9 @@ class Settings(BaseSettings):
 
     display_timezone: str = "Asia/Manila"
 
-    # Shared local Smart AI configuration for both the Admin and Employee
-    # Chat Assistant pages. The deterministic HR services remain authoritative;
-    # Ollama is used only to synthesize grounded answers from approved portal
-    # context. Both normal and complex questions use the same lightweight model
-    # so an installation needs to download only one Ollama model.
-    smart_ai_enabled: bool = True
-    smart_ai_ollama_base_url: str = "http://localhost:11434"
-    smart_ai_ollama_model: str = "qwen2.5:3b"
-    smart_ai_quality_ollama_model: str = "qwen2.5:3b"
-    smart_ai_ollama_timeout_seconds: int = 120
-
-    # Retrieval remains dependency-safe: BM25 always works, while Chroma,
-    # embeddings, and reranking activate only when their optional packages are
-    # installed locally.
-    smart_ai_chunk_size: int = 256
-    smart_ai_chunk_overlap: int = 40
-    smart_ai_bm25_top_k: int = 8
-    smart_ai_vector_top_k: int = 8
-    smart_ai_final_top_k: int = 5
-    smart_ai_chroma_dir: str = "data/smart_ai/chroma"
-    smart_ai_chroma_collection: str = "hr_portal_knowledge"
-    smart_ai_embedding_model: str = "intfloat/multilingual-e5-small"
-    smart_ai_reranker_enabled: bool = False
-    smart_ai_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # Chat Assistant model/generation/retrieval settings live in
+    # config/chat_assistant_settings.py. A compatibility mixin preserves the
+    # older `settings.smart_ai_*` attributes for existing integrations.
 
     # Password-reset links.
     # Set this to the public Streamlit URL in production.
@@ -140,6 +128,25 @@ class Settings(BaseSettings):
     smtp_use_starttls: bool = True
     smtp_use_ssl: bool = False
     smtp_timeout_seconds: int = 20
+
+    # External notification mirroring. The Employee Master Record work_email
+    # and telephone_mobile_no fields are the authoritative destinations.
+    external_email_notifications_enabled: bool = False
+    external_sms_notifications_enabled: bool = False
+
+    # SMS delivery:
+    # - local: write a private development SMS file.
+    # - twilio: send a real SMS using Twilio Programmable Messaging.
+    sms_delivery_mode: str = "local"
+    external_sms_outbox_dir: str = "data/dev_sms_outbox"
+    sms_default_country_code: str = "+63"
+    sms_timeout_seconds: int = 12
+    external_sms_max_chars: int = 320
+
+    twilio_account_sid: str | None = None
+    twilio_auth_token: SecretStr | None = None
+    twilio_from_number: str | None = None
+    twilio_messaging_service_sid: str | None = None
 
     # Initial company values used by the seed script.
     initial_company_code: str = "DEFAULT"

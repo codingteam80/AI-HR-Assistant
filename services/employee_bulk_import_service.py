@@ -130,6 +130,21 @@ def _text(value: object) -> str:
     return str(value).strip()
 
 
+def _normalized_employee_name(
+    first_name: object,
+    middle_name: object,
+    last_name: object,
+    suffix: object,
+) -> str:
+    """Normalize an employee name for duplicate prevention."""
+
+    return " ".join(
+        " ".join(_text(value).split()).casefold()
+        for value in (first_name, middle_name, last_name, suffix)
+        if _text(value)
+    )
+
+
 def _optional_text(value: object) -> str | None:
     normalized = _text(value)
     return normalized or None
@@ -398,9 +413,18 @@ class EmployeeBulkImportService:
         existing_users = list(
             self.session.scalars(select(User).where(User.company_id == company_id)).all()
         )
-        existing_numbers = {employee.employee_number.casefold() for employee in existing_employees}
-        existing_emails = {user.email.casefold() for user in existing_users}
-        reserved_usernames = {user.username.casefold() for user in existing_users}
+        existing_numbers = {employee.employee_number.strip().casefold() for employee in existing_employees}
+        existing_emails = {user.email.strip().casefold() for user in existing_users}
+        reserved_usernames = {user.username.strip().casefold() for user in existing_users}
+        existing_names = {
+            _normalized_employee_name(
+                employee.first_name,
+                employee.middle_name,
+                employee.last_name,
+                employee.suffix,
+            )
+            for employee in existing_employees
+        }
 
         raw_rows: list[dict[str, object]] = []
         for row_number, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
@@ -414,6 +438,15 @@ class EmployeeBulkImportService:
 
         batch_numbers = [_text(row["Employee Number"]).casefold() for row in raw_rows]
         batch_emails = [_text(row["Email"]).casefold() for row in raw_rows]
+        batch_names = [
+            _normalized_employee_name(
+                row["First Name"],
+                row["Middle Name"],
+                row["Last Name"],
+                row["Suffix"],
+            )
+            for row in raw_rows
+        ]
         assignment_candidates = [
             {
                 "employee_number": employee.employee_number,
@@ -451,6 +484,12 @@ class EmployeeBulkImportService:
             first_name = _text(row["First Name"])
             last_name = _text(row["Last Name"])
             email = _text(row["Email"])
+            normalized_name = _normalized_employee_name(
+                row["First Name"],
+                row["Middle Name"],
+                row["Last Name"],
+                row["Suffix"],
+            )
             try:
                 hired_date = _parse_date(row["Hired Date"], required=True, field_name="Hired Date")
                 date_of_birth = _parse_date(row["Date of Birth"], required=False, field_name="Date of Birth")
@@ -471,6 +510,14 @@ class EmployeeBulkImportService:
                 errors.append("First Name is required.")
             if not last_name:
                 errors.append("Last Name is required.")
+            if normalized_name in existing_names:
+                errors.append(
+                    "Possible duplicate employee name already exists in this company."
+                )
+            elif normalized_name and batch_names.count(normalized_name) > 1:
+                errors.append(
+                    "Employee name is duplicated in this file after ignoring case and spacing."
+                )
             if not email:
                 errors.append("Email is required.")
             elif email.casefold() in existing_emails:
@@ -600,6 +647,17 @@ class EmployeeBulkImportService:
                 select(User.username).where(User.company_id == company_id)
             ).all()
         }
+        existing_names = {
+            _normalized_employee_name(
+                employee.first_name,
+                employee.middle_name,
+                employee.last_name,
+                employee.suffix,
+            )
+            for employee in self.session.scalars(
+                select(Employee).where(Employee.company_id == company_id)
+            ).all()
+        }
 
         validated: list[dict[str, object]] = []
         for row in preview_rows:
@@ -618,6 +676,16 @@ class EmployeeBulkImportService:
                 raise ValueError(f"Row {row.get('Row')}: Email already exists.")
             if username.casefold() in existing_usernames:
                 raise ValueError(f"Row {row.get('Row')}: User Name already exists.")
+            normalized_name = _normalized_employee_name(
+                employee.get("first_name"),
+                employee.get("middle_name"),
+                employee.get("last_name"),
+                employee.get("suffix"),
+            )
+            if normalized_name in existing_names:
+                raise ValueError(
+                    f"Row {row.get('Row')}: Possible duplicate employee name already exists."
+                )
             request = EmployeeAccountCreate(
                 company_id=company_id,
                 employee_number=employee_number,
@@ -644,6 +712,7 @@ class EmployeeBulkImportService:
             existing_numbers.add(employee_number.casefold())
             existing_emails.add(email.casefold())
             existing_usernames.add(username.casefold())
+            existing_names.add(normalized_name)
 
         roles = {
             role.name: role

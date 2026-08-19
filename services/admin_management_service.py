@@ -15,6 +15,7 @@ import json
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from authentication.password_manager import PasswordManager
 from core.constants import CLEARANCE_ADMIN, CLEARANCE_USER
@@ -41,6 +42,8 @@ from schemas.admin_management_schema import (
 )
 from schemas.user_schema import EmployeeCreate, UserCreate
 from services.employee_service import EmployeeService
+from services.audit_trail_service import AuditTrailService
+from services.edit_conflict import EditConflictError
 from services.user_service import UserService
 
 
@@ -486,6 +489,13 @@ class AdminManagementService:
             company_id=values.company_id,
             employee_id=values.employee_id,
         )
+
+        if employee.edit_version != values.expected_edit_version:
+            self._record_employee_edit_conflict(
+                employee=employee,
+                current_user_id=current_user_id,
+                submitted_version=values.expected_edit_version,
+            )
         old_snapshot = self._employee_snapshot(employee)
         old_status = employee.employment_status
 
@@ -504,6 +514,38 @@ class AdminManagementService:
             raise ValueError(
                 f"Employee number '{values.employee_number}' "
                 "already exists inside this company."
+            )
+
+        current_name = self.employee_repository.normalized_person_name(
+            employee.first_name,
+            employee.middle_name,
+            employee.last_name,
+            employee.suffix,
+        )
+        submitted_name = self.employee_repository.normalized_person_name(
+            values.first_name,
+            values.middle_name,
+            values.last_name,
+            values.suffix,
+        )
+        duplicate_names = (
+            self.employee_repository.find_normalized_name_matches(
+                company_id=values.company_id,
+                first_name=values.first_name,
+                middle_name=values.middle_name,
+                last_name=values.last_name,
+                suffix=values.suffix,
+                exclude_employee_id=values.employee_id,
+            )
+            if submitted_name != current_name
+            else []
+        )
+        if duplicate_names:
+            duplicate = duplicate_names[0]
+            raise ValueError(
+                "Possible duplicate employee record: "
+                f"{duplicate.employee_number} — {duplicate.full_name}. "
+                "Review the existing employee record before saving."
             )
 
         if (
@@ -678,7 +720,26 @@ class AdminManagementService:
             employment_status=values.employment_status,
         )
 
-        self.session.commit()
+        # Force one Employee-row write even when only account or training
+        # values changed. SQLAlchemy includes the previous edit_version in the
+        # UPDATE predicate, providing an atomic second guard for simultaneous
+        # saves that passed the earlier friendly comparison at the same time.
+        employee.last_edited_by_user_id = current_user_id
+        employee.edit_version += 1
+
+        try:
+            self.session.commit()
+        except StaleDataError:
+            self.session.rollback()
+            latest = self.get_employee(
+                company_id=values.company_id,
+                employee_id=values.employee_id,
+            )
+            self._record_employee_edit_conflict(
+                employee=latest,
+                current_user_id=current_user_id,
+                submitted_version=values.expected_edit_version,
+            )
 
         self.training_repository.replace_for_employee(
             company_id=values.company_id,
@@ -731,6 +792,106 @@ class AdminManagementService:
             employee_id=employee.id,
         )
 
+    @staticmethod
+    def _employee_conflict_snapshot(employee: Employee) -> dict[str, object]:
+        """Return readable latest values for the Admin comparison panel."""
+
+        return {
+            "Employee Number": employee.employee_number,
+            "Last Name": employee.last_name,
+            "First Name": employee.first_name,
+            "Middle Name": employee.middle_name,
+            "Suffix": employee.suffix,
+            "Email": employee.work_email,
+            "Telephone / Mobile No.": employee.telephone_mobile_no,
+            "Job Title / Position": employee.job_title,
+            "Department": employee.department.name if employee.department else None,
+            "Manager": employee.manager.full_name if employee.manager else None,
+            "Leader": employee.leader.full_name if employee.leader else None,
+            "Gender": employee.gender,
+            "Civil Status": employee.civil_status,
+            "Date of Birth": (
+                employee.date_of_birth.isoformat()
+                if employee.date_of_birth
+                else None
+            ),
+            "Employment Status": employee.employment_status,
+            "Hired Date": employee.hire_date.isoformat() if employee.hire_date else None,
+            "Training": "\n".join(
+                f"[{'x' if item.is_completed else ' '}] {item.title}"
+                for item in employee.trainings
+            ),
+            "User Name": employee.user.username if employee.user else None,
+            "Clearance": employee.user.clearance if employee.user else None,
+        }
+
+    def _record_employee_edit_conflict(
+        self,
+        *,
+        employee: Employee,
+        current_user_id: int,
+        submitted_version: int,
+    ) -> None:
+        """Commit the blocked attempt, then raise a structured UI conflict."""
+
+        latest_history = self.employee_history_repository.get_latest_for_employee(
+            company_id=employee.company_id,
+            employee_id=employee.id,
+        )
+        updated_by_user_id = employee.last_edited_by_user_id
+        if updated_by_user_id is None and latest_history is not None:
+            updated_by_user_id = latest_history.performed_by_user_id
+        updated_at = (
+            latest_history.created_at
+            if latest_history is not None
+            else employee.updated_at
+        )
+        updated_by = "another administrator"
+        if updated_by_user_id is not None:
+            user = self.user_repository.get_for_password_change(
+                employee.company_id,
+                updated_by_user_id,
+            )
+            if user is not None:
+                updated_by = (
+                    user.employee.full_name
+                    if user.employee is not None
+                    else user.username
+                )
+
+        latest_values = self._employee_conflict_snapshot(employee)
+        AuditTrailService(self.session).record_event(
+            company_id=employee.company_id,
+            actor_user_id=current_user_id,
+            module="Employees",
+            action="Save Blocked",
+            entity_type="Employee",
+            entity_id=employee.id,
+            entity_label=f"{employee.employee_number} — {employee.full_name}",
+            result="conflict_blocked",
+            summary=(
+                "An outdated Employee edit was blocked before it could "
+                "overwrite a newer administrator change."
+            ),
+            new_values=latest_values,
+            metadata={
+                "submitted_edit_version": submitted_version,
+                "latest_edit_version": employee.edit_version,
+                "latest_updated_by": updated_by,
+                "latest_updated_at": (
+                    updated_at.isoformat() if updated_at is not None else None
+                ),
+            },
+        )
+        raise EditConflictError(
+            module="Employees",
+            entity_label=f"{employee.employee_number} — {employee.full_name}",
+            latest_version=employee.edit_version,
+            latest_values=latest_values,
+            updated_by=updated_by,
+            updated_at=updated_at,
+        )
+
     def restore_archived_employee(
         self,
         *,
@@ -748,6 +909,8 @@ class AdminManagementService:
             raise ValueError("The selected employee is not archived.")
         old_snapshot = self._employee_snapshot(employee)
         employee.employment_status = "employed"
+        employee.last_edited_by_user_id = current_user_id
+        employee.edit_version += 1
         employee.archived_at = None
         employee.archived_by_user_id = None
         if employee.user is not None:

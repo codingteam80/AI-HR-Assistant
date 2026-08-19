@@ -249,6 +249,7 @@ def main() -> None:
 
     updates = {
         "EMAIL_DELIVERY_MODE": "smtp",
+        "EXTERNAL_EMAIL_NOTIFICATIONS_ENABLED": "true",
         "PASSWORD_RESET_BASE_URL": (
             _dotenv_value(base_url)
         ),

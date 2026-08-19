@@ -20,3 +20,25 @@ class EmployeeHistoryRepository(BaseRepository[EmployeeHistory]):
             .order_by(EmployeeHistory.created_at.desc(), EmployeeHistory.id.desc())
         )
         return list(self.session.scalars(statement).all())
+
+    def get_latest_for_employee(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+    ) -> EmployeeHistory | None:
+        """Return the newest successful Employee workspace event."""
+
+        statement = (
+            select(EmployeeHistory)
+            .where(
+                EmployeeHistory.company_id == company_id,
+                EmployeeHistory.employee_id == employee_id,
+            )
+            .order_by(
+                EmployeeHistory.created_at.desc(),
+                EmployeeHistory.id.desc(),
+            )
+            .limit(1)
+        )
+        return self.session.scalar(statement)

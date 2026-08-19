@@ -53,8 +53,17 @@
             let value = null;
 
             if (!error) {
+                // v8.8.164.4 security migration:
+                // authentication is tab-scoped. Remove any legacy shared
+                // localStorage token but never restore from it.
                 try {
-                    value = window.localStorage.getItem(storageKey);
+                    window.localStorage.removeItem(storageKey);
+                } catch (legacyStorageError) {
+                    // Legacy cleanup must not block tab-scoped login.
+                }
+
+                try {
+                    value = window.sessionStorage.getItem(storageKey);
                 } catch (storageError) {
                     error = String(storageError);
                 }
@@ -101,9 +110,9 @@
                     if (!token) {
                         throw new Error("Missing signed token.");
                     }
-                    window.localStorage.setItem(storageKey, token);
+                    window.sessionStorage.setItem(storageKey, token);
                 } else if (action === "remove") {
-                    window.localStorage.removeItem(storageKey);
+                    window.sessionStorage.removeItem(storageKey);
                 } else if (action !== "read") {
                     throw new Error("Unsupported storage action.");
                 }
@@ -126,15 +135,6 @@
             }
 
             execute(data.args);
-        });
-
-        window.addEventListener("storage", (event) => {
-            if (
-                activeStorageKey
-                && event.key === activeStorageKey
-            ) {
-                reply(activeStorageKey);
-            }
         });
 
         post({

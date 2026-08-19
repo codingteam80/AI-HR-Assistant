@@ -260,7 +260,8 @@ def test_notification_deep_links_target_company_forms_workspace() -> None:
     assert '"company_forms_next_tab"' in topbar
 
 
-def test_v8868_release_checkpoint_is_preserved() -> None:
-    assert (PROJECT_ROOT / "RELEASE_v8_8_68.md").is_file()
+def test_company_forms_regression_checkpoint_remains_covered() -> None:
     settings = (PROJECT_ROOT / "config/settings.py").read_text(encoding="utf-8")
     assert 'app_version: str = "0.8.8.' in settings
+    assert (PROJECT_ROOT / "ui/pages/admin/company_forms_documents_page.py").is_file()
+    assert (PROJECT_ROOT / "ui/pages/user/company_forms_documents_page.py").is_file()

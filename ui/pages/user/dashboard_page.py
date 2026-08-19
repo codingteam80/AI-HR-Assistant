@@ -80,12 +80,9 @@ def render_employee_dashboard_page(
 ) -> None:
     """Render the employee summary and Attendance / DTR workspace."""
 
-    display_name = (
-        current_user.employee_name
-        or current_user.username
+    st.title(
+        f"Welcome, {current_user.employee_portal_display_name}"
     )
-
-    st.title(f"Welcome, {display_name}")
 
     announcement_state = load_employee_announcement_state(current_user)
     dashboard_tab, announcements_tab = _render_dashboard_tabs(

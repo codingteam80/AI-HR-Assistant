@@ -142,6 +142,7 @@ def test_edit_all_employee_and_account_fields() -> None:
             EmployeeMasterUpdate(
                 company_id=seed["company"].id,
                 employee_id=employee.id,
+                expected_edit_version=employee.edit_version,
                 employee_number="EMP-201",
                 last_name="Reyes",
                 first_name="Jordan",
@@ -203,6 +204,7 @@ def test_resigned_employee_account_is_inactive() -> None:
             EmployeeMasterUpdate(
                 company_id=seed["company"].id,
                 employee_id=employee.id,
+                expected_edit_version=employee.edit_version,
                 employee_number=employee.employee_number,
                 last_name=employee.last_name,
                 first_name=employee.first_name,

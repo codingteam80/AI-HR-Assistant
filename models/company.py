@@ -95,6 +95,31 @@ class Company(TimestampMixin, Base):
         Boolean, default=False, server_default="0", nullable=False
     )
 
+    # Company leave-cycle and Vacation Leave utilization policy. January 1
+    # and 50% preserve the behavior of existing databases until an
+    # administrator deliberately changes the settings.
+    leave_reset_month: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+    leave_reset_day: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+    leave_utilization_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", nullable=False
+    )
+    leave_utilization_percentage: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        default=Decimal("50.00"),
+        server_default="50.00",
+        nullable=False,
+    )
+    manager_vl_retention_limit: Mapped[Decimal] = mapped_column(
+        Numeric(8, 2),
+        default=Decimal("13.00"),
+        server_default="13.00",
+        nullable=False,
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,

@@ -79,6 +79,7 @@ def _change_status(
         EmployeeMasterUpdate(
             company_id=employee.company_id,
             employee_id=employee.id,
+            expected_edit_version=employee.edit_version,
             employee_number=employee.employee_number,
             first_name=employee.first_name,
             middle_name=employee.middle_name,

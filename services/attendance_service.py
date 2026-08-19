@@ -425,6 +425,50 @@ class AttendanceService:
         self.session.refresh(record)
         return record
 
+    def edit_own_work_status(
+        self,
+        values: AttendanceStatusInput,
+    ) -> AttendanceRecord:
+        """Edit only Work Status without changing any attendance punch."""
+
+        self._require_employee_owner(
+            values.company_id,
+            values.employee_id,
+            values.user_id,
+        )
+        self.sync_approved_leaves(
+            values.company_id,
+            values.attendance_date,
+            values.attendance_date,
+        )
+        company = self._company(values.company_id)
+        record = self._get_or_create(
+            company,
+            values.employee_id,
+            values.attendance_date,
+        )
+        before = self._snapshot(record)
+        record.work_status = values.work_status
+        record.status_source = "employee_status_edit"
+        record.corrected_by_user_id = values.user_id
+        record.corrected_at = datetime.now(timezone.utc)
+        record.correction_reason = "Employee Work Status-only edit"
+        self.session.flush()
+        self.session.add(
+            AttendanceCorrection(
+                company_id=values.company_id,
+                attendance_record_id=record.id,
+                employee_id=values.employee_id,
+                corrected_by_user_id=values.user_id,
+                reason="Employee Work Status-only edit",
+                previous_values_json=json.dumps(before, sort_keys=True),
+                new_values_json=json.dumps(self._snapshot(record), sort_keys=True),
+            )
+        )
+        self.session.commit()
+        self.session.refresh(record)
+        return record
+
     def clock_in(self, values: AttendancePunchInput) -> AttendanceRecord:
         self._require_employee_owner(values.company_id, values.employee_id, values.user_id)
         self.sync_approved_leaves(
@@ -515,6 +559,7 @@ class AttendanceService:
             values.attendance_date,
         )
         before = self._snapshot(record)
+        preserved_work_status = record.work_status
         time_in = (
             self._localize_input(values.time_in)
             if values.time_in is not None
@@ -559,6 +604,11 @@ class AttendanceService:
         record.corrected_at = datetime.now(timezone.utc)
         record.correction_reason = "Employee self-service edit"
         self._recalculate(record)
+        # Session/timestamp maintenance must not silently replace a Work
+        # Status that the employee selected separately. New records still
+        # receive the normal session-derived location.
+        if preserved_work_status is not None:
+            record.work_status = preserved_work_status
         self.session.flush()
         self.session.add(
             AttendanceCorrection(
@@ -754,6 +804,7 @@ class AttendanceService:
                 previous_leave_request_id == request.id
                 and record.status_source in {
                     "employee_edit",
+                    "employee_status_edit",
                     "admin_correction",
                 }
             ):

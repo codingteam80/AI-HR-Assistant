@@ -4,6 +4,7 @@ import streamlit as st
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import Settings
+from services.audit_context import clear_audit_actor
 from ui.components.sidebar import render_sidebar
 from ui.components.topbar import render_topbar
 from ui.components.view_state_preservation import preserve_current_view
@@ -31,6 +32,8 @@ def render_user_layout(
 ) -> None:
     """Render employee sidebar, topbar, and selected page."""
 
+    clear_audit_actor()
+
     render_sidebar(
         assistant_name=settings.assistant_name,
         current_user=current_user,
@@ -38,6 +41,9 @@ def render_user_layout(
     render_topbar(
         company_name=current_user.company_name,
         current_user=current_user,
+        display_name_override=(
+            current_user.employee_portal_display_name
+        ),
     )
 
     current_page = st.session_state.current_page

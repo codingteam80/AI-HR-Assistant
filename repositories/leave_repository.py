@@ -170,11 +170,23 @@ class LeaveRequestRepository(BaseRepository[LeaveRequest]):
             joinedload(LeaveRequest.fallback_leave_type),
         )
 
-    def list_company(self, company_id: int, year: int | None = None) -> list[LeaveRequest]:
+    def list_company(
+        self,
+        company_id: int,
+        year: int | None = None,
+        *,
+        period_start: date | None = None,
+        period_end: date | None = None,
+    ) -> list[LeaveRequest]:
         statement = select(LeaveRequest).options(*self._detail_options()).where(
             LeaveRequest.company_id == company_id
         )
-        if year is not None:
+        if period_start is not None and period_end is not None:
+            statement = statement.where(
+                LeaveRequest.end_date >= period_start,
+                LeaveRequest.start_date <= period_end,
+            )
+        elif year is not None:
             year_start = date(int(year), 1, 1)
             year_end = date(int(year), 12, 31)
             statement = statement.where(

@@ -34,6 +34,7 @@ from ui.layouts.auth_layout import (
 from ui.layouts.user_layout import render_user_layout
 from ui.session_state import initialize_session_state
 from services.announcement_service import AnnouncementService
+from services.audit_context import clear_audit_actor
 from services.event_reminder_service import EventReminderService
 from services.leave_service import LeaveService
 from services.organization_service import OrganizationService
@@ -187,6 +188,11 @@ def main() -> None:
 
     settings = get_settings()
 
+    # Every Streamlit rerun begins without an audit actor. The protected
+    # admin layout sets the authenticated actor immediately before rendering;
+    # public and employee flows therefore cannot inherit an old admin context.
+    clear_audit_actor()
+
     st.set_page_config(
         page_title=settings.app_name,
         page_icon="🤖",
@@ -237,7 +243,7 @@ def main() -> None:
         return
 
     # Browser refresh creates a new Streamlit session. Wait for the
-    # persistent browser token before deciding to show Login.
+    # tab-scoped browser token before deciding to show Login.
     AuthSessionManager.restore_from_browser()
 
     if not AuthSessionManager.is_authenticated():
@@ -258,8 +264,8 @@ def main() -> None:
 
     current_user = AuthSessionManager.get_current_user()
 
-    # A successful form submit enters the portal immediately. Browser-token
-    # persistence is completed non-blockingly from the protected page.
+    # A successful form submit enters the portal immediately. Tab-scoped
+    # browser-token persistence is completed non-blockingly from the page.
     AuthSessionManager.flush_pending_browser_token()
 
     if current_user is None:

@@ -17,14 +17,22 @@ class UserRepository(BaseRepository[User]):
 
     def get_by_username(self, company_id: int, username: str) -> User | None:
         """Find a username inside one company."""
+        normalized = username.strip().casefold()
         return self.session.scalar(
-            select(User).where(User.company_id == company_id, User.username == username)
+            select(User).where(
+                User.company_id == company_id,
+                func.lower(func.trim(User.username)) == normalized,
+            )
         )
 
     def get_by_email(self, company_id: int, email: str) -> User | None:
         """Find an email inside one company."""
+        normalized = email.strip().casefold()
         return self.session.scalar(
-            select(User).where(User.company_id == company_id, User.email == email)
+            select(User).where(
+                User.company_id == company_id,
+                func.lower(func.trim(User.email)) == normalized,
+            )
         )
 
 
@@ -37,10 +45,11 @@ class UserRepository(BaseRepository[User]):
     ) -> User | None:
         """Check username uniqueness while editing one account."""
 
+        normalized = username.strip().casefold()
         return self.session.scalar(
             select(User).where(
                 User.company_id == company_id,
-                User.username == username,
+                func.lower(func.trim(User.username)) == normalized,
                 User.id != user_id,
             )
         )
@@ -54,10 +63,11 @@ class UserRepository(BaseRepository[User]):
     ) -> User | None:
         """Check login-email uniqueness while editing one account."""
 
+        normalized = email.strip().casefold()
         return self.session.scalar(
             select(User).where(
                 User.company_id == company_id,
-                User.email == email,
+                func.lower(func.trim(User.email)) == normalized,
                 User.id != user_id,
             )
         )

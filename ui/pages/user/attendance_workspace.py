@@ -15,6 +15,7 @@ from schemas.attendance_schema import (
     AttendancePunchInput,
     AttendanceSessionInput,
     AttendanceSelfEditInput,
+    AttendanceStatusInput,
 )
 from schemas.overtime_schema import (
     OT_TYPE_OPTIONS,
@@ -716,6 +717,33 @@ def render_employee_attendance_workspace(
             if edit_record is not None
             else f"{edit_date}_new"
         )
+        st.markdown("**Work Status Only**")
+        st.caption(
+            "Correct the selected date's Work Status without changing Time In, "
+            "Time Out, work sessions, or completion state."
+        )
+        status_only_columns = st.columns([2, 1])
+        with status_only_columns[0]:
+            status_only_value = st.selectbox(
+                "Work Status",
+                STATUS_OPTIONS,
+                index=STATUS_OPTIONS.index(
+                    edit_record.work_status
+                    if edit_record is not None
+                    and edit_record.work_status in STATUS_OPTIONS
+                    else "WFO"
+                ),
+                key=f"attendance_status_only_{edit_record_marker}",
+            )
+        with status_only_columns[1]:
+            st.write("")
+            st.write("")
+            save_status_only = st.button(
+                "Save Work Status Only",
+                width="stretch",
+                key=f"save_attendance_status_only_{edit_record_marker}",
+            )
+        st.divider()
         leave_note = ""
         if edit_record is not None and edit_record.leave_duration_code:
             leave_note = (
@@ -805,6 +833,28 @@ def render_employee_attendance_workspace(
             width="stretch",
             key="save_employee_attendance_changes",
         )
+
+    if save_status_only:
+        try:
+            request = AttendanceStatusInput(
+                company_id=current_user.company_id,
+                employee_id=current_user.employee_id,
+                user_id=current_user.user_id,
+                attendance_date=edit_date,
+                work_status=status_only_value,
+            )
+            with SessionFactory() as session:
+                AttendanceService(session).edit_own_work_status(request)
+            set_operation_feedback(
+                f"Work Status for {edit_date:%Y/%m/%d} was updated without changing attendance times.",
+                namespace="attendance",
+            )
+            st.session_state[_EDITOR_SCROLL_STATE_KEY] = True
+            st.rerun()
+        except (ValidationError, ValueError) as error:
+            render_action_warning(error)
+        except Exception:
+            st.error("The Work Status could not be saved.")
 
     if save_time_changes:
         try:

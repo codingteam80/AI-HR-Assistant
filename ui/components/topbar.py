@@ -207,7 +207,7 @@ def _notification_destination(
             value in entity
             for value in ("integration", "email", "system")
         ):
-            return "admin", "Integrations"
+            return "admin", "Audit Trail"
         if any(
             value in entity
             for value in ("security", "password", "login", "session")
@@ -618,11 +618,13 @@ def render_topbar(
     company_name: str,
     current_user: AuthenticatedUser,
     section_name: str = "Employee HR Services",
+    display_name_override: str | None = None,
 ) -> None:
     """Display company, portal section, identity, and notifications."""
 
     display_name = (
-        current_user.employee_name
+        display_name_override
+        or current_user.employee_name
         or current_user.username
     )
     access_label = (

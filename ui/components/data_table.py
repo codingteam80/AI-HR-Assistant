@@ -41,6 +41,75 @@ def _cell_html(value: object) -> str:
     )
 
 
+def _recommended_column_width(header: object) -> int:
+    """Return a readable minimum width for one table column.
+
+    The shared table component may be used by pages with many columns.  A
+    content-aware minimum keeps labels such as ``Cancellation`` or
+    ``Manager`` from collapsing into one-character-per-line columns while the
+    table shell can still scroll horizontally.
+    """
+
+    label = str(header or "").strip().lower()
+
+    wide_terms = (
+        "reason",
+        "summary",
+        "description",
+        "comment",
+        "purpose",
+        "detail",
+        "affected record",
+        "credit / lwop",
+        "handover",
+        "workspace",
+        "route",
+    )
+    medium_terms = (
+        "employee",
+        "manager",
+        "approver",
+        "administrator",
+        "announcement",
+        "cancellation",
+        "leave type",
+        "leave dates",
+        "date / time",
+        "filed by",
+        "checklist",
+    )
+    compact_terms = (
+        "id",
+        "days",
+        "hours",
+        "status",
+        "plan",
+        "order",
+        "required",
+        "pinned",
+        "result",
+    )
+
+    if any(term in label for term in wide_terms):
+        return 220
+    if any(term in label for term in medium_terms):
+        return 160
+    if label in compact_terms or len(label) <= 6:
+        return 100
+    if len(label) <= 12:
+        return 125
+    if len(label) <= 18:
+        return 150
+    return 180
+
+
+def _pixel_width(value: object) -> int | None:
+    """Return the integer part of a simple CSS pixel width when available."""
+
+    match = re.fullmatch(r"\s*(\d+)px\s*", str(value or ""), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def render_admin_table(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -90,25 +159,48 @@ def render_admin_table(
         for row in rows
     )
 
-    width_rules = ""
+    # Every column receives a readable minimum width.  Explicit widths remain
+    # preferred hints, while omitted widths fall back to a header-aware value.
+    # This is especially important when a caller supplies widths for only the
+    # first few columns of a wider table.
+    preferred_widths = list(column_widths or ())
+    column_minimums: list[int] = []
+    rules: list[str] = []
 
-    if column_widths:
-        rules: list[str] = []
+    for index, header in enumerate(headers, start=1):
+        fallback_width = _recommended_column_width(header)
+        explicit_width = (
+            preferred_widths[index - 1]
+            if index - 1 < len(preferred_widths)
+            else None
+        )
+        explicit_pixels = _pixel_width(explicit_width)
+        minimum_pixels = max(
+            fallback_width,
+            explicit_pixels or 0,
+        )
+        column_minimums.append(minimum_pixels)
 
-        for index, width in enumerate(
-            column_widths,
-            start=1,
-        ):
-            rules.append(
-                f"""
-                .{table_class} th:nth-child({index}),
-                .{table_class} td:nth-child({index}) {{
-                    width: {escape(str(width))};
-                }}
-                """
-            )
+        width_declaration = (
+            f"width: {escape(str(explicit_width))};"
+            if explicit_width is not None
+            else ""
+        )
+        rules.append(
+            f"""
+            .{table_class} th:nth-child({index}),
+            .{table_class} td:nth-child({index}) {{
+                {width_declaration}
+                min-width: {minimum_pixels}px;
+            }}
+            """
+        )
 
-        width_rules = "\n".join(rules)
+    width_rules = "\n".join(rules)
+    effective_min_width = max(
+        int(min_width),
+        sum(column_minimums),
+    )
 
     vertical_padding = "9px" if compact else "12px"
     horizontal_padding = "11px" if compact else "14px"
@@ -166,10 +258,10 @@ def render_admin_table(
 
         .{table_class} {{
             width: 100%;
-            min-width: {int(min_width)}px;
+            min-width: {effective_min_width}px;
             border-collapse: separate;
             border-spacing: 0;
-            table-layout: fixed;
+            table-layout: auto;
             color: var(--hr-text-primary);
             background: var(--hr-surface);
             font-size: {font_size};
@@ -187,8 +279,8 @@ def render_admin_table(
             text-align: left;
             vertical-align: top;
             white-space: normal;
-            overflow-wrap: anywhere;
-            word-break: break-word;
+            overflow-wrap: break-word;
+            word-break: normal;
             line-height: 1.35;
             font-weight: 700;
         }}
@@ -202,8 +294,8 @@ def render_admin_table(
             text-align: left;
             vertical-align: top;
             white-space: normal;
-            overflow-wrap: anywhere;
-            word-break: break-word;
+            overflow-wrap: break-word;
+            word-break: normal;
             line-height: 1.45;
             transition:
                 color 0.14s ease,

@@ -96,6 +96,7 @@ class EmployeeMasterUpdate(BaseModel):
 
     company_id: int
     employee_id: int
+    expected_edit_version: int = Field(ge=1)
 
     employee_number: str = Field(min_length=1, max_length=80)
     first_name: str = Field(min_length=1, max_length=100)

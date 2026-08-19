@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from models.notification import Notification
 from repositories.notification_repository import NotificationRepository
+from services.external_notification_service import queue_external_notification
 
 
 class NotificationService:
@@ -30,6 +31,20 @@ class NotificationService:
             is_read=False,
         )
         self.session.add(notification)
+
+        # External channels mirror the same event only after the surrounding
+        # HR transaction commits successfully. Missing/invalid external
+        # delivery never blocks the authoritative in-app notification.
+        queue_external_notification(
+            self.session,
+            company_id=company_id,
+            user_id=user_id,
+            event_type=event_type,
+            title=title,
+            message=message,
+            related_entity_type=related_entity_type,
+            related_entity_id=related_entity_id,
+        )
         return notification
 
     def unread_count(self, *, company_id: int, user_id: int) -> int:

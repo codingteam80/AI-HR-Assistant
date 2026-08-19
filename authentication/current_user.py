@@ -28,6 +28,12 @@ class AuthenticatedUser:
     employee_name: str | None
     must_change_password: bool
 
+    # Employee Portal UI uses only first + last name. Keep the full legal
+    # employee_name separately for official HR records, reports, forms, and
+    # approval/audit workflows.
+    employee_first_name: str | None = None
+    employee_last_name: str | None = None
+
     @classmethod
     def from_model(
         cls,
@@ -63,6 +69,42 @@ class AuthenticatedUser:
                 else None
             ),
             must_change_password=user.must_change_password,
+            employee_first_name=(
+                employee.first_name
+                if employee
+                else None
+            ),
+            employee_last_name=(
+                employee.last_name
+                if employee
+                else None
+            ),
+        )
+
+    @property
+    def employee_portal_display_name(self) -> str:
+        """Return the compact employee-facing name for portal chrome.
+
+        Only first and last names are shown in the Employee Portal header and
+        welcome title. The full legal name remains available in employee_name
+        for official HR records and workflows.
+        """
+
+        compact_parts = [
+            value.strip()
+            for value in (
+                self.employee_first_name,
+                self.employee_last_name,
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+
+        if compact_parts:
+            return " ".join(compact_parts)
+
+        return (
+            self.employee_name
+            or self.username
         )
 
     def to_session_dict(self) -> dict[str, object]:
@@ -78,6 +120,12 @@ class AuthenticatedUser:
         """Restore current and older session dictionaries safely."""
 
         restored = dict(values)
+
+        # Older in-memory sessions created before the compact Employee Portal
+        # display-name fields remain readable until the next signed-token
+        # restore refreshes them from the database.
+        restored.setdefault("employee_first_name", None)
+        restored.setdefault("employee_last_name", None)
 
         if "clearance" not in restored:
             restored["clearance"] = (

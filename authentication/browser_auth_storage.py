@@ -1,11 +1,14 @@
-"""Persistent browser storage for the signed authentication token.
+"""Tab-scoped browser storage for the signed authentication token.
 
 Streamlit creates a new ``st.session_state`` after a full browser refresh.
-This small local component reads the signed token from ``localStorage`` and
-sends it back to Python before the Login page is rendered.
+This bundled component reads the signed token from ``sessionStorage`` and
+sends it back to Python before the Login page is rendered. ``sessionStorage``
+preserves authentication on refresh in the same tab/window but does not
+share the login with separately opened tabs/windows.
 
 The component is bundled with the project and does not require internet or
-a third-party cookie package.
+a third-party cookie package. Legacy shared ``localStorage`` auth values are
+removed by the frontend and are never used for restoration.
 """
 
 from dataclasses import dataclass

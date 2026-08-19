@@ -88,6 +88,11 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                 "work_friday": "BOOLEAN NOT NULL DEFAULT 1",
                 "work_saturday": "BOOLEAN NOT NULL DEFAULT 0",
                 "work_sunday": "BOOLEAN NOT NULL DEFAULT 0",
+                "leave_reset_month": "INTEGER NOT NULL DEFAULT 1",
+                "leave_reset_day": "INTEGER NOT NULL DEFAULT 1",
+                "leave_utilization_enabled": "BOOLEAN NOT NULL DEFAULT 1",
+                "leave_utilization_percentage": "NUMERIC(5, 2) NOT NULL DEFAULT 50.00",
+                "manager_vl_retention_limit": "NUMERIC(8, 2) NOT NULL DEFAULT 13.00",
             }
             for column_name, column_sql in attendance_columns.items():
                 if column_name not in company_columns:
@@ -224,6 +229,22 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                     text(
                         "ALTER TABLE employees "
                         "ADD COLUMN archived_by_user_id INTEGER"
+                    )
+                )
+
+            if "edit_version" not in employee_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employees "
+                        "ADD COLUMN edit_version INTEGER NOT NULL DEFAULT 1"
+                    )
+                )
+
+            if "last_edited_by_user_id" not in employee_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employees "
+                        "ADD COLUMN last_edited_by_user_id INTEGER"
                     )
                 )
 

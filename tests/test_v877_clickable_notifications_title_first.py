@@ -67,7 +67,7 @@ def test_notification_items_are_clickable_and_routed() -> None:
     assert '"Leave Management"' in source
     assert '"Company Policies"' in source
     assert '"Employees"' in source
-    assert '"Integrations"' in source
+    assert '"Audit Trail"' in source
 
 
 def test_notification_panel_is_wide_and_positioned_below_bell() -> None:

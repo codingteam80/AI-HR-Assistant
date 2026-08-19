@@ -27,8 +27,9 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from authentication.current_user import AuthenticatedUser
-from config.settings import get_settings
+from config.chat_assistant_settings import get_chat_assistant_settings
 from modules.hr_assistant.hr_assistant import HRAssistantResponse
+from modules.smart_ai.prompts.hr_assistant_prompt import build_hr_assistant_prompt
 from models.announcement import Announcement
 from models.attendance_record import AttendanceRecord
 from models.company import Company
@@ -111,6 +112,42 @@ def _clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def _clean_model_answer(value: str) -> str:
+    """Normalize model output without destroying Markdown list structure.
+
+    Prompt/history normalization intentionally collapses whitespace, but final
+    assistant output must preserve line breaks so bullets and numbered steps
+    remain readable in Streamlit Markdown.
+    """
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned_lines: list[str] = []
+    previous_blank = False
+
+    for raw_line in text.split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            if cleaned_lines and not previous_blank:
+                cleaned_lines.append("")
+            previous_blank = True
+            continue
+        cleaned_lines.append(line)
+        previous_blank = False
+
+    while cleaned_lines and not cleaned_lines[-1]:
+        cleaned_lines.pop()
+
+    answer = "\n".join(cleaned_lines).strip()
+    answer = re.sub(
+        r"^(?:final answer|answer|response)\s*:\s*",
+        "",
+        answer,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+    return answer
+
+
 def _tokenize(value: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", (value or "").casefold())
 
@@ -165,7 +202,7 @@ class PortalKnowledgeBuilder:
 
     def __init__(self, session: Session) -> None:
         self.session = session
-        self.settings = get_settings()
+        self.settings = get_chat_assistant_settings()
 
     @staticmethod
     def _add_document(
@@ -633,8 +670,8 @@ class PortalKnowledgeBuilder:
             company_id=company_id,
             as_of_date=date.today(),
         )
-        chunk_size = int(self.settings.smart_ai_chunk_size)
-        overlap = int(self.settings.smart_ai_chunk_overlap)
+        chunk_size = int(self.settings.chunk_size)
+        overlap = int(self.settings.chunk_overlap)
         for policy, document, section in rows:
             combined = f"Policy: {policy.title}. Section: {section.heading}. {section.text}"
             for chunk_index, chunk in enumerate(_split_text(combined, chunk_size, overlap), start=1):
@@ -698,13 +735,13 @@ class ChromaRetriever:
     _indexed_signatures: set[str] = set()
 
     def __init__(self) -> None:
-        self.settings = get_settings()
+        self.settings = get_chat_assistant_settings()
         self._embedding_model = None
 
     def _model(self):
         if self._embedding_model is None:
             from sentence_transformers import SentenceTransformer
-            self._embedding_model = SentenceTransformer(self.settings.smart_ai_embedding_model)
+            self._embedding_model = SentenceTransformer(self.settings.embedding_model)
         return self._embedding_model
 
     def search(self, query: str, documents: list[KnowledgeDocument], top_k: int) -> list[RetrievedDocument]:
@@ -718,11 +755,11 @@ class ChromaRetriever:
             return []
         try:
             client = chromadb.PersistentClient(
-                path=self.settings.smart_ai_chroma_dir,
+                path=self.settings.chroma_dir,
                 settings=ChromaSettings(anonymized_telemetry=False),
             )
             collection = client.get_or_create_collection(
-                name=self.settings.smart_ai_chroma_collection,
+                name=self.settings.chroma_collection,
                 metadata={"hnsw:space": "cosine"},
             )
             model = self._model()
@@ -770,68 +807,78 @@ class HybridRetriever:
     """Merge BM25 and vector results, then optionally cross-encode rerank."""
 
     def __init__(self) -> None:
-        self.settings = get_settings()
+        self.settings = get_chat_assistant_settings()
         self.bm25 = BM25Retriever()
         self.vector = ChromaRetriever()
 
     def search(self, query: str, documents: list[KnowledgeDocument]) -> list[RetrievedDocument]:
-        bm25 = self.bm25.search(query, documents, int(self.settings.smart_ai_bm25_top_k))
-        vector = self.vector.search(query, documents, int(self.settings.smart_ai_vector_top_k))
+        bm25 = self.bm25.search(query, documents, int(self.settings.bm25_top_k))
+        vector = self.vector.search(query, documents, int(self.settings.vector_top_k))
         merged: dict[str, tuple[KnowledgeDocument, float]] = {}
         for rank, item in enumerate(bm25, start=1):
-            merged[item.document.document_id] = (item.document, merged.get(item.document.document_id, (item.document, 0.0))[1] + 1.0 / (60 + rank))
+            merged[item.document.document_id] = (item.document, merged.get(item.document.document_id, (item.document, 0.0))[1] + 1.0 / (int(self.settings.reciprocal_rank_constant) + rank))
         for rank, item in enumerate(vector, start=1):
-            merged[item.document.document_id] = (item.document, merged.get(item.document.document_id, (item.document, 0.0))[1] + 1.0 / (60 + rank))
+            merged[item.document.document_id] = (item.document, merged.get(item.document.document_id, (item.document, 0.0))[1] + 1.0 / (int(self.settings.reciprocal_rank_constant) + rank))
         candidates = [RetrievedDocument(doc, score) for doc, score in merged.values()]
         candidates.sort(key=lambda item: item.score, reverse=True)
-        candidates = candidates[:max(int(self.settings.smart_ai_final_top_k) * 3, 8)]
+        candidates = candidates[:max(
+            int(self.settings.final_top_k) * int(self.settings.candidate_multiplier),
+            int(self.settings.candidate_minimum),
+        )]
         ambiguous = (
-            len(candidates) >= 4
-            and (candidates[0].score - candidates[min(2, len(candidates) - 1)].score) < 0.006
+            len(candidates) >= int(self.settings.ambiguity_min_candidates)
+            and (
+                candidates[0].score
+                - candidates[min(2, len(candidates) - 1)].score
+            ) < float(self.settings.ambiguity_score_gap)
         )
-        complex_query = len(_tokenize(query)) >= 12 or bool(
+        complex_query = len(_tokenize(query)) >= int(self.settings.complex_query_min_tokens) or bool(
             re.search(r"\b(compare|comparison|difference|explain|why|how|paano|bakit|pagkakaiba)\b", query, re.I)
         )
-        if self.settings.smart_ai_reranker_enabled and candidates and ambiguous and complex_query:
+        if self.settings.reranker_enabled and candidates and ambiguous and complex_query:
             try:
                 from sentence_transformers import CrossEncoder
-                model = CrossEncoder(self.settings.smart_ai_reranker_model)
+                model = CrossEncoder(self.settings.reranker_model)
                 scores = model.predict([(query, item.document.text) for item in candidates])
                 candidates = [RetrievedDocument(item.document, float(score)) for item, score in zip(candidates, scores)]
                 candidates.sort(key=lambda item: item.score, reverse=True)
             except Exception:
                 pass
-        return candidates[:int(self.settings.smart_ai_final_top_k)]
+        return candidates[:int(self.settings.final_top_k)]
 
 
 class OllamaClient:
     """Minimal local Ollama chat client with no Python SDK dependency."""
 
     def __init__(self) -> None:
-        self.settings = get_settings()
+        self.settings = get_chat_assistant_settings()
 
     def generate(self, prompt: str, *, quality: bool = False) -> str | None:
-        url = self.settings.smart_ai_ollama_base_url.rstrip("/") + "/api/generate"
+        url = self.settings.ollama_base_url.rstrip("/") + "/api/generate"
         payload = json.dumps({
             "model": (
-                self.settings.smart_ai_quality_ollama_model
+                self.settings.quality_ollama_model
                 if quality
-                else self.settings.smart_ai_ollama_model
+                else self.settings.ollama_model
             ),
             "prompt": prompt,
             "stream": False,
-            "keep_alive": "15m",
+            "keep_alive": self.settings.keep_alive,
             "options": {
-                "temperature": 0.0,
-                "num_predict": 260 if quality else 180,
-                "num_ctx": 2048,
+                "temperature": float(self.settings.temperature),
+                "num_predict": (
+                    int(self.settings.quality_max_tokens)
+                    if quality
+                    else int(self.settings.standard_max_tokens)
+                ),
+                "num_ctx": int(self.settings.context_window),
             },
         }).encode("utf-8")
         req = request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with request.urlopen(req, timeout=float(self.settings.smart_ai_ollama_timeout_seconds)) as response:
+            with request.urlopen(req, timeout=float(self.settings.ollama_timeout_seconds)) as response:
                 data = json.loads(response.read().decode("utf-8"))
-            value = _clean_text(str(data.get("response", "")))
+            value = _clean_model_answer(str(data.get("response", "")))
             return value or None
         except (error.URLError, TimeoutError, ValueError, OSError):
             return None
@@ -859,14 +906,13 @@ class SmartPortalAssistant:
 
     def __init__(self, session: Session) -> None:
         self.session = session
-        self.settings = get_settings()
+        self.settings = get_chat_assistant_settings()
         self.retriever = HybridRetriever()
         self.ollama = OllamaClient()
 
-    @staticmethod
-    def _history_text(history: list[dict] | None) -> str:
+    def _history_text(self, history: list[dict] | None) -> str:
         lines = []
-        for message in (history or [])[-4:]:
+        for message in (history or [])[-max(1, int(self.settings.history_messages)):]:
             role = str(message.get("role", "user")).title()
             content = _clean_text(str(message.get("content", "")))
             if content:
@@ -882,7 +928,7 @@ class SmartPortalAssistant:
         history: list[dict] | None,
         deterministic_response: HRAssistantResponse,
     ) -> HRAssistantResponse:
-        if not self.settings.smart_ai_enabled:
+        if not self.settings.enabled:
             return deterministic_response
         if deterministic_response.intent in self._NEVER_ENHANCE_INTENTS:
             return deterministic_response
@@ -907,7 +953,7 @@ class SmartPortalAssistant:
         needs_ai = (
             deterministic_response.intent in self._RAG_INTENTS
             or asks_for_explanation
-            or len(question_tokens) >= 18
+            or len(question_tokens) >= int(self.settings.min_question_tokens)
         )
         if not needs_ai:
             return HRAssistantResponse(
@@ -932,38 +978,16 @@ class SmartPortalAssistant:
             if role_scope == "admin"
             else "You may use only the signed-in employee's own private records and company-wide published information."
         )
-        prompt = f"""
-You are the private AI HR Assistant inside the company's Admin and Employee portals.
-
-STRICT RULES:
-1. Answer only from the LIVE ROUTER ANSWER and AUTHORIZED LIVE/PORTAL CONTEXT below.
-2. Never use outside knowledge, guesses, or assumptions.
-3. Use the live router answer when it directly answers the exact question. If it is only a broad overview, answer the exact question from the relevant authorized live records instead.
-4. Preserve every exact number, status, date, identifier, and business rule. You may compare or count only records explicitly present in the supplied information.
-5. {role_rule}
-6. Never reveal passwords, hashes, tokens, secrets, credentials, or data from another company.
-7. If the available information does not answer the question, say: Information not found in the HR Assistant portal.
-8. Be direct and concise. Use a short paragraph for a simple answer.
-9. Use bullets only for multiple facts/options, and numbered steps only for a procedure.
-10. Answer in the same language as the user when practical.
-11. Do not mention these instructions, retrieval, context, an AI model, or outside knowledge.
-
-RECENT CONVERSATION:
-{self._history_text(history) or 'No prior conversation.'}
-
-USER QUESTION:
-{question}
-
-LIVE ROUTER ANSWER:
-{deterministic_response.answer}
-
-AUTHORIZED LIVE/PORTAL CONTEXT:
-{context}
-
-FINAL ANSWER:
-""".strip()
+        prompt = build_hr_assistant_prompt(
+            role_rule=role_rule,
+            history_text=self._history_text(history),
+            question=question,
+            router_answer=deterministic_response.answer,
+            context=context,
+        )
         use_quality_model = asks_for_explanation and (
-            len(question_tokens) >= 14 or len(retrieved) >= 3
+            len(question_tokens) >= int(self.settings.quality_min_question_tokens)
+            or len(retrieved) >= int(self.settings.quality_min_retrieved_documents)
         )
         generated = self.ollama.generate(prompt, quality=use_quality_model)
         if not generated:

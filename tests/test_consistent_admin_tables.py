@@ -30,8 +30,9 @@ def test_reusable_table_wraps_and_scrolls() -> None:
     )
 
     assert "white-space: normal" in source
-    assert "overflow-wrap: anywhere" in source
-    assert "word-break: break-word" in source
+    assert "overflow-wrap: break-word" in source
+    assert "word-break: normal" in source
+    assert "table-layout: auto" in source
     assert "overflow-x: auto" in source
     assert "position: sticky" in source
 

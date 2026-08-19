@@ -274,6 +274,7 @@ def test_resigned_employee_moves_to_archive_and_restores_same_records() -> None:
             EmployeeMasterUpdate(
                 company_id=seed["company"].id,
                 employee_id=employee.id,
+                expected_edit_version=employee.edit_version,
                 employee_number=employee.employee_number,
                 first_name=employee.first_name,
                 last_name=employee.last_name,

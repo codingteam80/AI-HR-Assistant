@@ -19,8 +19,8 @@ def test_employee_list_uses_wrapped_html_table() -> None:
     assert "_render_wrapped_employee_table" in source
     assert 'class="employee-master-table"' in source
     assert "white-space: normal" in source
-    assert "overflow-wrap: anywhere" in source
-    assert "word-break: break-word" in source
+    assert "overflow-wrap: break-word" in source
+    assert "word-break: normal" in source
 
 
 def test_multiline_values_are_preserved() -> None:

@@ -1,6 +1,6 @@
 """Company-scoped employee master-record queries."""
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from models.employee import Employee
@@ -20,10 +20,11 @@ class EmployeeRepository(BaseRepository[Employee]):
     ) -> Employee | None:
         """Find one employee using its company-scoped number."""
 
+        normalized = employee_number.strip().casefold()
         return self.session.scalar(
             select(Employee).where(
                 Employee.company_id == company_id,
-                Employee.employee_number == employee_number,
+                func.lower(func.trim(Employee.employee_number)) == normalized,
             )
         )
 
@@ -36,13 +37,68 @@ class EmployeeRepository(BaseRepository[Employee]):
     ) -> Employee | None:
         """Check uniqueness while editing one employee."""
 
+        normalized = employee_number.strip().casefold()
         return self.session.scalar(
             select(Employee).where(
                 Employee.company_id == company_id,
-                Employee.employee_number == employee_number,
+                func.lower(func.trim(Employee.employee_number)) == normalized,
                 Employee.id != employee_id,
             )
         )
+
+    @staticmethod
+    def normalized_person_name(
+        first_name: str | None,
+        middle_name: str | None,
+        last_name: str | None,
+        suffix: str | None,
+    ) -> str:
+        """Return a case/spacing-insensitive employee-name identity."""
+
+        return " ".join(
+            part
+            for part in (
+                " ".join((first_name or "").split()).casefold(),
+                " ".join((middle_name or "").split()).casefold(),
+                " ".join((last_name or "").split()).casefold(),
+                " ".join((suffix or "").split()).casefold(),
+            )
+            if part
+        )
+
+    def find_normalized_name_matches(
+        self,
+        *,
+        company_id: int,
+        first_name: str | None,
+        middle_name: str | None,
+        last_name: str | None,
+        suffix: str | None,
+        exclude_employee_id: int | None = None,
+    ) -> list[Employee]:
+        """Find possible duplicate master records without case sensitivity."""
+
+        target = self.normalized_person_name(
+            first_name,
+            middle_name,
+            last_name,
+            suffix,
+        )
+        if not target:
+            return []
+        employees = self.list_with_details(company_id)
+        return [
+            employee
+            for employee in employees
+            if employee.id != exclude_employee_id
+            and self.normalized_person_name(
+                employee.first_name,
+                employee.middle_name,
+                employee.last_name,
+                employee.suffix,
+            )
+            == target
+        ]
 
     def get_with_details(
         self,

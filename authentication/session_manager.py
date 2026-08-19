@@ -1,7 +1,8 @@
 """Streamlit authentication-session management.
 
 Normal widget reruns use Streamlit session_state. Full browser refreshes
-restore the user from a signed token in browser localStorage. The bundled
+restore the user from a signed token in tab-scoped browser sessionStorage.
+Separately opened tabs/windows do not inherit that login. The bundled
 component waits for the browser response before Login can be rendered.
 """
 
@@ -177,23 +178,39 @@ class AuthSessionManager:
 
     @classmethod
     def flush_pending_browser_token(cls) -> None:
-        """Persist a pending token without blocking an authenticated page."""
+        """Ensure this tab's signed token is persisted without blocking.
+
+        The active token is written to tab-scoped sessionStorage. Using the
+        current token as a fallback also migrates an already-open authenticated
+        tab from the former shared localStorage behavior without signing the
+        user out.
+        """
 
         pending = st.session_state.get(
             cls.PENDING_BROWSER_TOKEN_KEY
         )
+        current = st.session_state.get(cls.TOKEN_KEY)
 
-        if not isinstance(pending, str) or not pending:
+        if isinstance(pending, str) and pending:
+            token = pending
+        else:
+            token = current
+
+        if not isinstance(token, str) or not token:
             return
 
         try:
-            if write_browser_auth_token(pending):
+            if (
+                write_browser_auth_token(pending)
+                if isinstance(pending, str) and pending
+                else write_browser_auth_token(token)
+            ):
                 st.session_state[
                     cls.PENDING_BROWSER_TOKEN_KEY
                 ] = None
         except (ValueError, RuntimeError):
-            # Keep the portal usable. Persistence can retry on the next rerun;
-            # the separate full-refresh issue remains tracked independently.
+            # Keep the portal usable. Tab persistence can retry on the next
+            # rerun; the authenticated Streamlit session remains valid.
             return
 
     @classmethod
@@ -213,7 +230,7 @@ class AuthSessionManager:
 
         A full F5 refresh creates a new Streamlit session. The bundled
         component returns ``ready=False`` during its first render, so the
-        application stops before Login and resumes only after localStorage
+        application stops before Login and resumes only after sessionStorage
         has returned the signed token (or confirmed that none exists).
         """
 

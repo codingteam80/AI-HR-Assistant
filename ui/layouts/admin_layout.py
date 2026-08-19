@@ -5,6 +5,7 @@ import streamlit as st
 from authentication.access_control import AccessControl
 from authentication.current_user import AuthenticatedUser
 from config.settings import Settings
+from services.audit_context import set_audit_actor
 from ui.components.admin_sidebar import render_admin_sidebar
 from ui.components.topbar import render_topbar
 from ui.components.view_state_preservation import preserve_current_view
@@ -26,6 +27,7 @@ from ui.pages.admin.company_forms_documents_page import (
 )
 from ui.pages.admin.employees_page import render_employees_page
 from ui.pages.admin.policies_page import render_admin_policies_page
+from ui.pages.admin.audit_trail_page import render_audit_trail_page
 from ui.pages.admin.integrations_page import render_integrations_page
 from ui.pages.admin.leave_management_page import render_admin_leave_management_page
 from ui.pages.admin.reports_page import render_admin_reports_page
@@ -40,6 +42,13 @@ def render_admin_layout(
     # Defense in depth: admin routing and the layout both check access.
     AccessControl.require_admin(current_user)
 
+    page = st.session_state.current_page
+    set_audit_actor(
+        company_id=current_user.company_id,
+        user_id=current_user.user_id,
+        module=page,
+    )
+
     render_admin_sidebar(
         assistant_name=settings.assistant_name,
         current_user=current_user,
@@ -50,7 +59,6 @@ def render_admin_layout(
         section_name="Administration Portal",
     )
 
-    page = st.session_state.current_page
     preserve_current_view(
         current_user=current_user,
         portal_mode="admin",
@@ -82,7 +90,9 @@ def render_admin_layout(
         render_company_forms_documents_page(current_user)
     elif page == "Reports":
         render_admin_reports_page(current_user)
-    elif page == "Integrations":
+    elif page == "External Notifications":
         render_integrations_page(current_user)
+    elif page == "Audit Trail":
+        render_audit_trail_page(current_user)
     else:
         render_admin_placeholder_page(page)

@@ -118,6 +118,13 @@ def _render_balances(
 
     with SessionFactory() as session:
         service = LeaveService(session)
+        current_leave_year = service.leave_cycle_year(current_user.company_id)
+        company = service._company(current_user.company_id)
+        reset_label = date(
+            2024,
+            int(company.leave_reset_month),
+            min(int(company.leave_reset_day), 28),
+        ).strftime("%B") + f" {int(company.leave_reset_day)}"
         service.reconcile_approved_leave(
             company_id=current_user.company_id
         )
@@ -128,7 +135,7 @@ def _render_balances(
         table_rows = service.credit_table_rows(
             company_id=current_user.company_id,
             employee_id=current_user.employee_id,
-            year=date.today().year,
+            year=current_leave_year,
             balances=balances,
         )
         employee = service.employee_repository.get_with_details(
@@ -138,7 +145,7 @@ def _render_balances(
         summary = (
             service.entitlement_summary(
                 employee=employee,
-                year=date.today().year,
+                year=current_leave_year,
             )
             if employee is not None
             else None
@@ -171,12 +178,12 @@ def _render_balances(
         st.info(
             f"Completed Service: {summary['service_years']} year(s) · "
             f"{summary['basis']}\n\n"
-            f"January Annual Accrual: Vacation "
+            f"{reset_label} Annual Accrual: Vacation "
             f"{_days(summary['regular_vacation'])} days · "
             f"Sick Leave {_days(summary['sick'])} days. "
             "Unused SL/VL becomes Beginning Credit in the next leave year. "
             "SL retains up to 15 days and VL retains up to 45 days after "
-            "January cash conversion. Emergency Leave is limited to 3 days "
+            "annual-reset cash conversion. Emergency Leave is limited to 3 days "
             "per year and is deducted from Vacation Leave. Event-based "
             "credits are granted only after manager approval: Honeymoon 5 "
             "days once, Maternity 105, Paternity 7, and Bereavement 7 days "
@@ -277,6 +284,7 @@ def _load_request_context(
     target_employee_id = employee_id or current_user.employee_id
     with SessionFactory() as session:
         service = LeaveService(session)
+        current_leave_year = service.leave_cycle_year(current_user.company_id)
         balances = service.list_employee_balances(
             current_user.company_id,
             target_employee_id,
@@ -288,7 +296,7 @@ def _load_request_context(
         table_rows = service.credit_table_rows(
             company_id=current_user.company_id,
             employee_id=target_employee_id,
-            year=date.today().year,
+            year=current_leave_year,
             balances=balances,
         )
         event_preview_credits = {
@@ -860,16 +868,21 @@ def _render_requests(
     render_admin_table(
         _request_rows(requests),
         key="employee-leave-requests",
-        min_width=1450,
+        min_width=2235,
         column_widths=(
-            "125px",
-            "160px",
-            "210px",
-            "70px",
-            "180px",
-            "190px",
-            "90px",
-            "300px",
+            "125px",  # Request ID
+            "160px",  # Leave Type
+            "200px",  # Filed By
+            "120px",  # Filer Role
+            "190px",  # Leave Dates
+            "90px",   # Days
+            "170px",  # Duration
+            "300px",  # Credit / LWOP Split
+            "180px",  # Manager
+            "130px",  # Status
+            "170px",  # Cancellation
+            "100px",  # Plan
+            "300px",  # Reason
         ),
     )
 

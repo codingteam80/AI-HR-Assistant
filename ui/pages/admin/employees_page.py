@@ -29,6 +29,7 @@ from services.employee_bulk_import_service import (
     ACCOUNT_PREVIEW_COLUMNS,
     EmployeeBulkImportService,
 )
+from services.edit_conflict import EditConflictError
 from ui.components.live_search import live_search_input
 from ui.components.operation_feedback import (
     render_operation_feedback,
@@ -472,8 +473,8 @@ def _render_wrapped_employee_table(
             text-align: left;
             vertical-align: middle;
             white-space: normal;
-            overflow-wrap: anywhere;
-            word-break: break-word;
+            overflow-wrap: break-word;
+            word-break: normal;
             line-height: 1.3;
         }}
 
@@ -490,8 +491,8 @@ def _render_wrapped_employee_table(
             text-align: left;
             vertical-align: top;
             white-space: normal;
-            overflow-wrap: anywhere;
-            word-break: break-word;
+            overflow-wrap: break-word;
+            word-break: normal;
             line-height: 1.4;
             transition:
                 color 0.14s ease,
@@ -617,7 +618,7 @@ def _render_employee_workspace_table(
                 min-width: {min_width}px;
                 border-collapse: separate;
                 border-spacing: 0;
-                table-layout: fixed;
+                table-layout: auto;
                 font-size: 0.84rem;
             }}
             .employee-workspace-table th {{
@@ -638,7 +639,8 @@ def _render_employee_workspace_table(
                 color: var(--hr-text-secondary);
                 vertical-align: top;
                 white-space: normal;
-                overflow-wrap: anywhere;
+                overflow-wrap: break-word;
+                word-break: normal;
                 line-height: 1.4;
             }}
             .employee-workspace-table th:last-child,
@@ -1268,6 +1270,7 @@ def _render_edit_employee(
             employee_id=selected_id,
         )
         values = {
+            "edit_version": selected.edit_version,
             "employee_number": selected.employee_number,
             "last_name": selected.last_name,
             "first_name": selected.first_name,
@@ -1288,6 +1291,8 @@ def _render_edit_employee(
             "user_id": selected.user.id if selected.user else None,
             "username": selected.user.username if selected.user else "",
             "clearance": selected.user.clearance if selected.user else 2,
+            "manager_name": selected.manager.full_name if selected.manager else None,
+            "leader_name": selected.leader.full_name if selected.leader else None,
         }
 
     manager_people = _manager_options(
@@ -1308,6 +1313,142 @@ def _render_edit_employee(
 
     prefix = f"edit_{selected_id}_"
 
+    pending_reset_key = "employee_edit_pending_state_reset"
+    if st.session_state.get(pending_reset_key) == selected_id:
+        for state_key in list(st.session_state):
+            if str(state_key).startswith(prefix):
+                st.session_state.pop(state_key, None)
+        st.session_state.pop(pending_reset_key, None)
+
+    version_key = prefix + "opened_edit_version"
+    original_key = prefix + "opened_values"
+    conflict_key = prefix + "conflict"
+    review_key = prefix + "review_latest"
+    reload_confirm_key = prefix + "reload_confirm"
+
+    original_values = {
+        "Employee Number": values["employee_number"],
+        "Last Name": values["last_name"],
+        "First Name": values["first_name"],
+        "Middle Name": values["middle_name"],
+        "Suffix": values["suffix"],
+        "Email": values["email"],
+        "Telephone / Mobile No.": values["telephone_mobile_no"],
+        "Job Title / Position": values["job_title"],
+        "Department": values["department"],
+        "Manager": values["manager_name"],
+        "Leader": values["leader_name"],
+        "Gender": values["gender"],
+        "Civil Status": values["civil_status"],
+        "Date of Birth": (
+            values["date_of_birth"].isoformat()
+            if values["date_of_birth"]
+            else None
+        ),
+        "Employment Status": values["status"],
+        "Hired Date": values["hire_date"].isoformat() if values["hire_date"] else None,
+        "Training": values["training"],
+        "User Name": values["username"],
+        "Clearance": values["clearance"],
+    }
+    st.session_state.setdefault(version_key, int(values["edit_version"]))
+    st.session_state.setdefault(original_key, original_values)
+
+    conflict = st.session_state.get(conflict_key)
+    conflict_active = isinstance(conflict, dict)
+
+    def _reload_latest_record() -> None:
+        """Discard this browser's stale form state and load current values."""
+
+        # Clear on the next rerun before any keyed form widget is instantiated.
+        # This avoids Streamlit's "cannot modify after widget creation" error.
+        st.session_state[pending_reset_key] = selected_id
+        st.rerun()
+
+    if conflict_active:
+        st.warning(str(conflict.get("message") or "This record changed while you were editing."))
+        st.caption(
+            "The form is temporarily read-only. No pending value was saved "
+            "and the newer administrator update was not overwritten."
+        )
+        review_column, reload_column = st.columns(2)
+        with review_column:
+            if st.button(
+                "Review Latest Information",
+                type="primary",
+                width="stretch",
+                key=prefix + "review_latest_button",
+            ):
+                st.session_state[review_key] = True
+        with reload_column:
+            if st.button(
+                "Reload Latest Record",
+                width="stretch",
+                key=prefix + "reload_latest_button",
+            ):
+                st.session_state[reload_confirm_key] = True
+
+        if st.session_state.get(reload_confirm_key):
+            st.warning(
+                "Reloading will discard your pending unsaved changes and "
+                "replace the form with the latest saved record."
+            )
+            confirm_column, keep_column = st.columns(2)
+            with confirm_column:
+                if st.button(
+                    "Confirm Reload",
+                    type="primary",
+                    width="stretch",
+                    key=prefix + "confirm_reload_button",
+                ):
+                    _reload_latest_record()
+            with keep_column:
+                if st.button(
+                    "Keep Reviewing",
+                    width="stretch",
+                    key=prefix + "keep_reviewing_button",
+                ):
+                    st.session_state[reload_confirm_key] = False
+                    st.rerun()
+
+        if st.session_state.get(review_key):
+            st.markdown("### Review Latest Information")
+            previous_values = conflict.get("previous_values") or {}
+            pending_values = conflict.get("pending_values") or {}
+            latest_values = conflict.get("latest_values") or {}
+            fields = list(
+                dict.fromkeys(
+                    [*previous_values, *pending_values, *latest_values]
+                )
+            )
+            comparison_rows = [
+                {
+                    "Field": field,
+                    "Opened Value": _display_value(previous_values.get(field)),
+                    "My Pending Change": _display_value(pending_values.get(field)),
+                    "Latest Saved Value": _display_value(latest_values.get(field)),
+                }
+                for field in fields
+            ]
+            _render_employee_workspace_table(
+                comparison_rows,
+                aria_label="Employee edit conflict comparison",
+                min_width=1250,
+                max_height=420,
+            )
+            st.caption(
+                "Continue Editing Latest Version reloads the latest record "
+                "as the new editable base. Review and reapply only the "
+                "changes that are still needed."
+            )
+            if st.button(
+                "Continue Editing Latest Version",
+                type="primary",
+                width="stretch",
+                key=prefix + "continue_latest_button",
+            ):
+                _reload_latest_record()
+
     with st.container(border=True, key=f"employee_edit_information_card_{selected_id}"):
         st.markdown("### Employee Information")
 
@@ -1318,24 +1459,29 @@ def _render_edit_employee(
                 value=values["employee_number"],
                 max_chars=80,
                 key=prefix + "employee_number",
+                disabled=conflict_active,
             )
 
         last_column, first_column, middle_column, suffix_column = st.columns(4)
         with last_column:
             last_name = st.text_input(
-                "Last Name *", value=values["last_name"], max_chars=100, key=prefix + "last_name"
+                "Last Name *", value=values["last_name"], max_chars=100, key=prefix + "last_name",
+                disabled=conflict_active,
             )
         with first_column:
             first_name = st.text_input(
-                "First Name *", value=values["first_name"], max_chars=100, key=prefix + "first_name"
+                "First Name *", value=values["first_name"], max_chars=100, key=prefix + "first_name",
+                disabled=conflict_active,
             )
         with middle_column:
             middle_name = st.text_input(
-                "Middle Name", value=values["middle_name"], max_chars=100, key=prefix + "middle_name"
+                "Middle Name", value=values["middle_name"], max_chars=100, key=prefix + "middle_name",
+                disabled=conflict_active,
             )
         with suffix_column:
             suffix = st.text_input(
-                "Suffix", value=values["suffix"], max_chars=30, key=prefix + "suffix"
+                "Suffix", value=values["suffix"], max_chars=30, key=prefix + "suffix",
+                disabled=conflict_active,
             )
 
         gender_column, civil_column, birth_column, age_column = st.columns(4)
@@ -1345,6 +1491,7 @@ def _render_edit_employee(
                 options=GENDER_OPTIONS,
                 index=GENDER_OPTIONS.index(values["gender"]) if values["gender"] in GENDER_OPTIONS else 0,
                 key=prefix + "gender",
+                disabled=conflict_active,
             )
         with civil_column:
             civil_status_label = st.selectbox(
@@ -1352,6 +1499,7 @@ def _render_edit_employee(
                 options=CIVIL_STATUS_OPTIONS,
                 index=CIVIL_STATUS_OPTIONS.index(values["civil_status"]) if values["civil_status"] in CIVIL_STATUS_OPTIONS else 0,
                 key=prefix + "civil_status",
+                disabled=conflict_active,
             )
         with birth_column:
             date_of_birth = st.date_input(
@@ -1360,6 +1508,7 @@ def _render_edit_employee(
                 min_value=date(1900, 1, 1),
                 max_value=date.today(),
                 key=prefix + "date_of_birth",
+                disabled=conflict_active,
             )
         with age_column:
             st.text_input(
@@ -1372,7 +1521,8 @@ def _render_edit_employee(
         email_column, telephone_column, _ = st.columns([2.0, 2.0, 2.0])
         with email_column:
             email = st.text_input(
-                "Email *", value=values["email"], max_chars=255, key=prefix + "email"
+                "Email *", value=values["email"], max_chars=255, key=prefix + "email",
+                disabled=conflict_active,
             )
         with telephone_column:
             telephone_mobile_no = st.text_input(
@@ -1380,6 +1530,7 @@ def _render_edit_employee(
                 value=values["telephone_mobile_no"],
                 max_chars=50,
                 key=prefix + "telephone_mobile",
+                disabled=conflict_active,
             )
 
         department_column, manager_column, leader_column, position_column = st.columns(4)
@@ -1389,6 +1540,7 @@ def _render_edit_employee(
                 value=values["department"],
                 max_chars=150,
                 key=prefix + "department",
+                disabled=conflict_active,
                 help=(
                     "Edit the department directly. Existing names are "
                     "reused case-insensitively; new names create department records automatically."
@@ -1400,6 +1552,7 @@ def _render_edit_employee(
                 options=list(manager_people),
                 index=option_index(manager_people, values["manager_id"]),
                 key=prefix + "manager",
+                disabled=conflict_active,
             )
         with leader_column:
             leader_label = st.selectbox(
@@ -1407,6 +1560,7 @@ def _render_edit_employee(
                 options=list(leader_people),
                 index=option_index(leader_people, values["leader_id"]),
                 key=prefix + "leader",
+                disabled=conflict_active,
             )
         with position_column:
             job_title = st.text_input(
@@ -1414,6 +1568,7 @@ def _render_edit_employee(
                 value=values["job_title"],
                 max_chars=150,
                 key=prefix + "job_title",
+                disabled=conflict_active,
             )
 
         status_labels = list(EMPLOYMENT_STATUS_OPTIONS)
@@ -1429,6 +1584,7 @@ def _render_edit_employee(
                 options=status_labels,
                 index=status_labels.index(current_status_label),
                 key=prefix + "employment_status",
+                disabled=conflict_active,
                 help=(
                     "Changing to Resigned deactivates the login account. "
                     "Changing back to Employed reactivates it."
@@ -1436,7 +1592,8 @@ def _render_edit_employee(
             )
         with hire_column:
             hire_date = st.date_input(
-                "Hired Date", value=values["hire_date"], key=prefix + "hire_date"
+                "Hired Date", value=values["hire_date"], key=prefix + "hire_date",
+                disabled=conflict_active,
             )
 
         st.markdown("### Training Checklist")
@@ -1446,6 +1603,7 @@ def _render_edit_employee(
             height=180,
             key=prefix + "training",
             help="Use [x] for completed and [ ] for pending.",
+            disabled=conflict_active,
         )
 
     with st.container(border=True, key=f"employee_edit_account_card_{selected_id}"):
@@ -1464,12 +1622,14 @@ def _render_edit_employee(
                 options=["1 - Admin", "2 - User"],
                 index=0 if values["clearance"] == 1 else 1,
                 key=prefix + "clearance",
+                disabled=conflict_active,
             )
 
         username_column, password_column = st.columns(2)
         with username_column:
             username = st.text_input(
-                "User Name *", value=values["username"], max_chars=100, key=prefix + "username"
+                "User Name *", value=values["username"], max_chars=100, key=prefix + "username",
+                disabled=conflict_active,
             )
         with password_column:
             new_password = st.text_input(
@@ -1478,6 +1638,7 @@ def _render_edit_employee(
                 max_chars=128,
                 key=prefix + "new_password",
                 help="Leave blank to keep the current password.",
+                disabled=conflict_active,
             )
 
     submitted = st.button(
@@ -1485,6 +1646,7 @@ def _render_edit_employee(
         type="primary",
         width="stretch",
         key=prefix + "submit",
+        disabled=conflict_active,
     )
 
     if not submitted:
@@ -1494,6 +1656,7 @@ def _render_edit_employee(
         request = EmployeeMasterUpdate(
             company_id=current_user.company_id,
             employee_id=selected_id,
+            expected_edit_version=int(st.session_state[version_key]),
             employee_number=(employee_number or "").strip(),
             last_name=(last_name or "").strip(),
             first_name=(first_name or "").strip(),
@@ -1516,6 +1679,39 @@ def _render_edit_employee(
             new_temporary_password=new_password or None,
         )
 
+        manager_id = manager_people[manager_label]
+        leader_id = leader_people[leader_label]
+        employee_by_id = {employee.id: employee for employee in employees}
+        pending_values = {
+            "Employee Number": (employee_number or "").strip(),
+            "Last Name": (last_name or "").strip(),
+            "First Name": (first_name or "").strip(),
+            "Middle Name": _optional_value(middle_name),
+            "Suffix": _optional_value(suffix),
+            "Email": (email or "").strip(),
+            "Telephone / Mobile No.": _optional_value(telephone_mobile_no),
+            "Job Title / Position": _optional_value(job_title),
+            "Department": _optional_value(department_name),
+            "Manager": (
+                employee_by_id[manager_id].full_name
+                if manager_id in employee_by_id
+                else None
+            ),
+            "Leader": (
+                employee_by_id[leader_id].full_name
+                if leader_id in employee_by_id
+                else None
+            ),
+            "Gender": _optional_value(gender_label),
+            "Civil Status": _optional_value(civil_status_label),
+            "Date of Birth": date_of_birth.isoformat() if date_of_birth else None,
+            "Employment Status": EMPLOYMENT_STATUS_OPTIONS[status_label],
+            "Hired Date": hire_date.isoformat() if hire_date else None,
+            "Training": training_text or "",
+            "User Name": (username or "").strip(),
+            "Clearance": int(clearance_label[0]),
+        }
+
         with st.spinner("Saving employee changes…"):
             with SessionFactory() as session:
                 employee = AdminManagementService(session).update_employee_master_record(
@@ -1526,6 +1722,24 @@ def _render_edit_employee(
             "Employee record updated successfully: "
             f"{employee.employee_number} — {employee.full_name}"
         )
+        st.session_state[pending_reset_key] = selected_id
+        st.rerun()
+    except EditConflictError as error:
+        st.session_state[conflict_key] = {
+            "message": str(error),
+            "previous_values": st.session_state.get(original_key, {}),
+            "pending_values": pending_values,
+            "latest_values": error.latest_values,
+            "latest_version": error.latest_version,
+            "updated_by": error.updated_by,
+            "updated_at": (
+                error.updated_at.isoformat()
+                if error.updated_at is not None
+                else None
+            ),
+        }
+        st.session_state[review_key] = False
+        st.session_state[reload_confirm_key] = False
         st.rerun()
     except ValidationError as error:
         render_action_warning(error)

@@ -1,6 +1,7 @@
 """Validated leave-management input contracts."""
 
 from datetime import date
+import calendar
 from decimal import Decimal
 from typing import Literal
 
@@ -222,3 +223,26 @@ class LeaveCancellationDecisionInput(BaseModel):
             return None
         cleaned = " ".join(value.strip().split())
         return cleaned or None
+
+
+class CompanyLeavePolicyInput(BaseModel):
+    """Company leave-cycle and Vacation Leave utilization settings."""
+
+    company_id: int
+    reset_month: int = Field(ge=1, le=12)
+    reset_day: int = Field(ge=1, le=31)
+    utilization_enabled: bool = True
+    utilization_percentage: Decimal = Field(ge=0, le=100)
+    manager_vl_retention_limit: Decimal = Field(ge=0, le=100)
+
+    @model_validator(mode="after")
+    def validate_reset_date(self):
+        # February 29 is accepted as an annual setting and is safely clamped
+        # to February 28 in non-leap years by the service. All other invalid
+        # month/day combinations are rejected before any database write.
+        maximum_day = 29 if self.reset_month == 2 else calendar.monthrange(
+            2024, self.reset_month
+        )[1]
+        if self.reset_day > maximum_day:
+            raise ValueError("The selected leave reset day is invalid for that month.")
+        return self
