@@ -29,7 +29,7 @@ class Settings(ChatAssistantSettingsCompatibilityMixin, BaseSettings):
 
     # Application identity and runtime behavior.
     app_name: str = "AI HR Assistant"
-    app_version: str = "0.8.8.168"
+    app_version: str = "0.8.8.169"
     # Previous table-readability checkpoint: app_version: str = "0.8.8.164.3"
     # Previous per-tab-auth checkpoint: app_version: str = "0.8.8.164.4"
     # Immediate base checkpoint: app_version: str = "0.8.8.164"

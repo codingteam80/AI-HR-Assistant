@@ -20,17 +20,18 @@ def test_company_forms_documents_replaces_audit_logs_in_sidebar() -> None:
     assert '"Audit Logs"' not in navigation
 
 
-def test_company_forms_documents_is_after_announcements_before_reports() -> None:
+def test_company_forms_documents_is_after_announcements_in_current_sidebar() -> None:
     source = _read("ui/components/admin_sidebar.py")
     navigation = source.split("ADMIN_NAVIGATION =", 1)[1].split(
         "def render_admin_sidebar", 1
     )[0]
 
+    reports = navigation.index('"Reports"')
     announcements = navigation.index('"Announcements"')
     company_documents = navigation.index('"Company Form/Documents"')
-    reports = navigation.index('"Reports"')
+    policies = navigation.index('"Policies"')
 
-    assert announcements < company_documents < reports
+    assert reports < announcements < company_documents < policies
 
 
 def test_company_forms_documents_has_dedicated_admin_route() -> None:
