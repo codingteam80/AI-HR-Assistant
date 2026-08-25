@@ -18,6 +18,7 @@ from pydantic import ValidationError
 import json
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -31,6 +32,10 @@ from schemas.leave_schema import (
 from services.leave_service import LeaveService
 from ui.components.browser_bridge import render_browser_bridge
 from ui.components.data_table import render_admin_table
+from ui.components.confirmation_guard import (
+    clear_confirmation_tracking,
+    invalidate_confirmation_on_change,
+)
 from ui.components.live_search import (
     clear_live_search,
     live_search_input,
@@ -977,11 +982,12 @@ def _render_employee_accounts(
         year,
     )
 
-    adjust_tab, history_tab = st.tabs(
+    adjust_tab, history_tab = persistent_tabs(
         [
             "Set Leave Credits",
             "Transaction History",
-        ]
+        ],
+        key="admin_leave_accounts_detail_tab",
     )
 
     with adjust_tab:
@@ -1810,74 +1816,111 @@ def _render_rules(
             "utilization policy. Existing history is preserved; the settings "
             "control the applicable annual cycle and future processing."
         )
-        with st.form("company_leave_policy_form"):
-            reset_columns = st.columns(2)
-            with reset_columns[0]:
-                selected_reset_month = st.selectbox(
-                    "Leave Credit Reset Month",
-                    range(1, 13),
-                    index=reset_month - 1,
-                    format_func=lambda value: date(2024, value, 1).strftime("%B"),
-                )
-            with reset_columns[1]:
-                maximum_day = 29 if selected_reset_month == 2 else calendar.monthrange(
-                    2024, selected_reset_month
-                )[1]
-                selected_reset_day = int(
-                    st.number_input(
-                        "Leave Credit Reset Day",
-                        min_value=1,
-                        max_value=maximum_day,
-                        value=min(reset_day, maximum_day),
-                        step=1,
-                    )
-                )
+        # These settings intentionally live outside st.form. A form defers
+        # widget changes until submit, which would allow a stale review
+        # checkbox to remain checked after the values it confirmed changed.
+        # Normal widgets rerun immediately so confirmation can be invalidated.
+        policy_key_prefix = f"company_leave_policy_{current_user.company_id}"
+        month_key = f"{policy_key_prefix}_reset_month"
+        day_key = f"{policy_key_prefix}_reset_day"
+        utilization_key = f"{policy_key_prefix}_utilization_enabled"
+        percentage_key = f"{policy_key_prefix}_utilization_percentage"
+        retention_key = f"{policy_key_prefix}_manager_retention"
+        confirmation_key = f"{policy_key_prefix}_reviewed"
 
-            selected_utilization_enabled = st.checkbox(
-                "Enable Vacation Leave Utilization",
-                value=utilization_enabled,
+        reset_columns = st.columns(2)
+        with reset_columns[0]:
+            selected_reset_month = st.selectbox(
+                "Leave Credit Reset Month",
+                range(1, 13),
+                index=reset_month - 1,
+                format_func=lambda value: date(2024, value, 1).strftime("%B"),
+                key=month_key,
             )
-            utilization_columns = st.columns(2)
-            with utilization_columns[0]:
-                selected_percentage = Decimal(
-                    str(
-                        st.number_input(
-                            "Required VL Utilization (%)",
-                            min_value=0.0,
-                            max_value=100.0,
-                            value=float(utilization_percentage),
-                            step=0.5,
-                            disabled=not selected_utilization_enabled,
-                            help="Applied to annual Vacation Leave credit for non-manager employees.",
-                        )
+        with reset_columns[1]:
+            maximum_day = (
+                29
+                if selected_reset_month == 2
+                else calendar.monthrange(2024, selected_reset_month)[1]
+            )
+            if day_key not in st.session_state:
+                st.session_state[day_key] = min(reset_day, maximum_day)
+            else:
+                st.session_state[day_key] = min(
+                    maximum_day,
+                    max(1, int(st.session_state[day_key])),
+                )
+            selected_reset_day = int(
+                st.number_input(
+                    "Leave Credit Reset Day",
+                    min_value=1,
+                    max_value=maximum_day,
+                    step=1,
+                    key=day_key,
+                )
+            )
+
+        selected_utilization_enabled = st.checkbox(
+            "Enable Vacation Leave Utilization",
+            value=utilization_enabled,
+            key=utilization_key,
+        )
+        utilization_columns = st.columns(2)
+        with utilization_columns[0]:
+            selected_percentage = Decimal(
+                str(
+                    st.number_input(
+                        "Required VL Utilization (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(utilization_percentage),
+                        step=0.5,
+                        disabled=not selected_utilization_enabled,
+                        help="Applied to annual Vacation Leave credit for non-manager employees.",
+                        key=percentage_key,
                     )
                 )
-            with utilization_columns[1]:
-                selected_manager_retention = Decimal(
-                    str(
-                        st.number_input(
-                            "Manager Annual VL Retention",
-                            min_value=0.0,
-                            max_value=100.0,
-                            value=float(manager_retention),
-                            step=0.5,
-                            disabled=not selected_utilization_enabled,
-                            help=(
-                                "Managers must utilize the portion of their annual VL "
-                                "credit above this retained amount. This overrides the percentage rule."
-                            ),
-                        )
+            )
+        with utilization_columns[1]:
+            selected_manager_retention = Decimal(
+                str(
+                    st.number_input(
+                        "Manager Annual VL Retention",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=float(manager_retention),
+                        step=0.5,
+                        disabled=not selected_utilization_enabled,
+                        help=(
+                            "Managers must utilize the portion of their annual VL "
+                            "credit above this retained amount. This overrides the percentage rule."
+                        ),
+                        key=retention_key,
                     )
                 )
-            confirm_policy = st.checkbox(
-                "I reviewed the reset date and utilization settings.",
             )
-            save_policy = st.form_submit_button(
-                "Save Leave Reset & Utilization Settings",
-                type="primary",
-                width="stretch",
-                disabled=not confirm_policy,
-            )
+
+        invalidate_confirmation_on_change(
+            confirmation_key=confirmation_key,
+            dependencies={
+                "reset_month": selected_reset_month,
+                "reset_day": selected_reset_day,
+                "utilization_enabled": selected_utilization_enabled,
+                "utilization_percentage": selected_percentage,
+                "manager_vl_retention": selected_manager_retention,
+            },
+        )
+        confirm_policy = st.checkbox(
+            "I reviewed the reset date and utilization settings.",
+            key=confirmation_key,
+        )
+        save_policy = st.button(
+            "Save Leave Reset & Utilization Settings",
+            type="primary",
+            width="stretch",
+            disabled=not confirm_policy,
+            key=f"{policy_key_prefix}_save",
+        )
 
         if save_policy:
             try:
@@ -1896,6 +1939,7 @@ def _render_rules(
                     "Leave reset and utilization settings were saved successfully.",
                     namespace="leave",
                 )
+                clear_confirmation_tracking(confirmation_key)
                 _remember_leave_tabs("Leave Rules")
                 st.rerun()
             except (ValidationError, ValueError) as error:
@@ -1964,11 +2008,12 @@ def _render_rules(
         max_height=360,
     )
 
-    add_tab, edit_tab = st.tabs(
+    add_tab, edit_tab = persistent_tabs(
         [
             "Add Leave Rule",
             "Edit Leave Rule",
-        ]
+        ],
+        key="admin_leave_rules_editor_tab",
     )
 
     with add_tab:
@@ -2148,7 +2193,7 @@ def render_admin_leave_management_page(
 
     grouped = _group_balances(balances)
 
-    overview_tab, accounts_tab, requests_tab, rules_tab, history_tab = st.tabs(
+    overview_tab, accounts_tab, requests_tab, rules_tab, history_tab = persistent_tabs(
         [
             "Overview",
             "Employee Leave Accounts",
@@ -2157,7 +2202,6 @@ def render_admin_leave_management_page(
             "History",
         ],
         key="admin_leave_management_active_tab",
-        on_change="rerun",
     )
 
     with overview_tab:

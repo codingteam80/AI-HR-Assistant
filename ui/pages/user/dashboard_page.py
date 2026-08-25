@@ -3,6 +3,8 @@
 import streamlit as st
 
 from authentication.current_user import AuthenticatedUser
+from ui.components.persistent_tabs import persistent_tabs
+from ui.components.employee_profile_photo import render_profile_photo_manager
 from ui.pages.user.attendance_workspace import (
     render_employee_attendance_workspace,
 )
@@ -68,10 +70,9 @@ def _render_dashboard_tabs(unread_count: int):
         unsafe_allow_html=True,
     )
 
-    return st.tabs(
+    return persistent_tabs(
         options,
         key=_DASHBOARD_TAB_STATE_KEY,
-        on_change="rerun",
     )
 
 
@@ -91,6 +92,16 @@ def render_employee_dashboard_page(
 
     if dashboard_tab.open:
         with dashboard_tab:
+            if current_user.employee_id is not None:
+                with st.expander("Profile Photo", expanded=False):
+                    render_profile_photo_manager(
+                        current_user=current_user,
+                        employee_id=current_user.employee_id,
+                        employee_display_name=current_user.employee_portal_display_name,
+                        employee_number=current_user.employee_number,
+                        key_prefix=f"employee_self_{current_user.employee_id}",
+                        admin_mode=False,
+                    )
             render_employee_attendance_workspace(
                 current_user,
                 show_punch_controls=True,

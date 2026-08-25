@@ -27,6 +27,7 @@ class ChatAssistantSettings(BaseSettings):
     ollama_model: str = "qwen2.5:7b"
     quality_ollama_model: str = "qwen2.5:7b"
     ollama_timeout_seconds: int = 120
+    ollama_health_timeout_seconds: float = 2.0
 
     # Grounded generation controls.
     temperature: float = 0.0
@@ -106,6 +107,10 @@ class ChatAssistantSettingsCompatibilityMixin:
     @property
     def smart_ai_ollama_timeout_seconds(self) -> int:
         return get_chat_assistant_settings().ollama_timeout_seconds
+
+    @property
+    def smart_ai_ollama_health_timeout_seconds(self) -> float:
+        return get_chat_assistant_settings().ollama_health_timeout_seconds
 
     @property
     def smart_ai_chunk_size(self) -> int:

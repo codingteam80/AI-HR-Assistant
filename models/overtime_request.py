@@ -47,6 +47,19 @@ class OvertimeRequest(TimestampMixin, Base):
     ot_time_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ot_time_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     estimated_hours: Mapped[Decimal] = mapped_column(Numeric(8, 2), nullable=False)
+    # Gross submitted/rendered OT remains in ``estimated_hours`` so the
+    # shifting-credit rules can qualify 4-hour/8-hour blocks.  Payable hours
+    # are stored separately after dinner-break and shifting-credit deductions.
+    payable_hours: Mapped[Decimal] = mapped_column(
+        Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
+    )
+    shifting_credit_hours: Mapped[Decimal] = mapped_column(
+        Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
+    )
+    shifting_credit_group: Mapped[str | None] = mapped_column(String(80), index=True)
+    additional_vl_days: Mapped[Decimal] = mapped_column(
+        Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
+    )
     ot_type: Mapped[str] = mapped_column(String(80), nullable=False)
     ot_purpose: Mapped[str] = mapped_column(Text, nullable=False)
     travel_fare: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))

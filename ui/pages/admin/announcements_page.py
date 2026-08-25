@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from pydantic import ValidationError
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -23,8 +24,13 @@ from schemas.event_reminder_schema import (
     parse_smart_reminder_entry,
 )
 from services.announcement_service import AnnouncementService
+from services.event_reminder_bulk_import_service import (
+    EVENT_REMINDER_PREVIEW_COLUMNS,
+    EventReminderBulkImportService,
+)
 from services.event_reminder_service import EventReminderService
 from ui.components.data_table import render_admin_table
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -47,6 +53,8 @@ REMINDER_STATUS_LABELS = {
 ANNOUNCEMENTS_NEXT_TAB_KEY = "announcements_next_tab"
 REMINDERS_NEXT_TAB_KEY = "reminders_next_tab"
 CREATE_REMINDER_FORM_REVISION_KEY = "create_reminder_form_revision"
+REMINDER_BULK_PREVIEW_KEY = "reminder_bulk_import_preview"
+REMINDER_BULK_FILENAME_KEY = "reminder_bulk_import_filename"
 
 
 def _consume_tab_target(state_key: str, labels: list[str]) -> str | None:
@@ -812,10 +820,15 @@ def _render_manage(
         )
 
     st.divider()
+    delete_confirmation_key = f"confirm_delete_announcement_{selected.id}"
+    invalidate_confirmation_on_change(
+        confirmation_key=delete_confirmation_key,
+        dependencies={"announcement_id": selected.id},
+        tracker_key="__announcement_delete_target_confirmation",
+    )
     delete_confirmed = st.checkbox(
         "I understand that Delete moves this announcement to Archive.",
-        value=False,
-        key=f"confirm_delete_announcement_{selected.id}",
+        key=delete_confirmation_key,
         help=(
             "The announcement is retained in the database and can be "
             "restored later from the Archive tab."
@@ -898,6 +911,134 @@ def _render_manage(
         render_action_warning(error)
 
 
+def _render_bulk_reminder_upload(current_user: AuthenticatedUser) -> None:
+    """Render Reminder Excel template, preview, and atomic batch import."""
+
+    with st.expander("Upload Reminders via Excel", expanded=False):
+        st.caption(
+            "Download the Reminder template, enter one reminder per row, then "
+            "validate and preview before importing. Hover Excel column headers "
+            "for field guidance; Category shows the complete current selections "
+            "and also provides a dropdown."
+        )
+        template_data = EventReminderBulkImportService.build_template()
+        st.download_button(
+            "Download Reminder Excel Template",
+            data=template_data,
+            file_name="Reminder_Import_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="content",
+            key="reminder_bulk_template_download",
+        )
+
+        uploaded_file = st.file_uploader(
+            "Upload Completed Reminder Template",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            key="reminder_bulk_upload_file",
+            help="Only the downloadable .xlsx template is accepted.",
+        )
+        validate_clicked = st.button(
+            "Validate and Preview Reminders",
+            width="stretch",
+            disabled=uploaded_file is None,
+            key="reminder_bulk_validate",
+        )
+        if validate_clicked and uploaded_file is not None:
+            try:
+                if uploaded_file.size > 10 * 1024 * 1024:
+                    raise ValueError(
+                        "The Reminder Excel file must not exceed 10 MB."
+                    )
+                with st.spinner("Validating reminder information…"):
+                    with SessionFactory() as session:
+                        preview = EventReminderBulkImportService(
+                            session
+                        ).prepare_preview(
+                            uploaded_file.getvalue(),
+                            filename=uploaded_file.name,
+                            company_id=current_user.company_id,
+                        )
+                st.session_state[REMINDER_BULK_PREVIEW_KEY] = preview
+                st.session_state[REMINDER_BULK_FILENAME_KEY] = uploaded_file.name
+            except ValueError as error:
+                st.session_state.pop(REMINDER_BULK_PREVIEW_KEY, None)
+                st.session_state.pop(REMINDER_BULK_FILENAME_KEY, None)
+                render_action_warning(error)
+
+        preview_rows = st.session_state.get(REMINDER_BULK_PREVIEW_KEY)
+        if isinstance(preview_rows, list) and preview_rows:
+            st.markdown("#### Reminder Preview")
+            st.caption(
+                "One Excel row creates one reminder. Review every row before "
+                "importing; invalid rows must be corrected in Excel and "
+                "validated again."
+            )
+            display_rows = [
+                {
+                    column: row.get(column, "")
+                    for column in EVENT_REMINDER_PREVIEW_COLUMNS
+                }
+                for row in preview_rows
+            ]
+            st.data_editor(
+                display_rows,
+                width="stretch",
+                hide_index=True,
+                disabled=list(EVENT_REMINDER_PREVIEW_COLUMNS),
+                key="reminder_bulk_preview_editor",
+            )
+
+            invalid_count = sum(
+                str(row.get("Validation", "")) != "Ready"
+                for row in preview_rows
+            )
+            if invalid_count:
+                st.error(
+                    f"{invalid_count} row(s) contain validation errors. "
+                    "Correct the Excel file and validate it again."
+                )
+
+            import_clicked = st.button(
+                "Import Reminders",
+                type="primary",
+                width="stretch",
+                disabled=invalid_count > 0,
+                key="reminder_bulk_import_submit",
+            )
+            if import_clicked:
+                try:
+                    with st.spinner("Importing reminders…"):
+                        with SessionFactory() as session:
+                            created = EventReminderBulkImportService(
+                                session
+                            ).import_preview_rows(
+                                preview_rows,
+                                company_id=current_user.company_id,
+                                actor_user_id=current_user.user_id,
+                            )
+                    st.session_state.pop(REMINDER_BULK_PREVIEW_KEY, None)
+                    st.session_state.pop(REMINDER_BULK_FILENAME_KEY, None)
+                    set_operation_feedback(
+                        (
+                            f"Successfully imported {len(created)} reminder(s). "
+                            "Admin reminder milestones were scheduled "
+                            "automatically for 1 month, 2 weeks, and 1 week "
+                            "before each event."
+                        ),
+                        namespace="announcements",
+                    )
+                    _remember_reminder_tab("Create Reminder")
+                    st.rerun()
+                except ValueError as error:
+                    render_action_warning(error)
+                except Exception:
+                    st.error(
+                        "The Reminder batch could not be imported. No reminder "
+                        "from this batch was saved."
+                    )
+
+
 def _render_reminders(
     current_user: AuthenticatedUser,
     reminders,
@@ -921,12 +1062,18 @@ def _render_reminders(
         REMINDERS_NEXT_TAB_KEY,
         reminder_tab_labels,
     )
-    create_tab, manage_tab, bin_tab = st.tabs(
+    if reminder_default_tab is not None:
+        st.session_state["admin_reminders_active_tab"] = reminder_default_tab
+    create_tab, manage_tab, bin_tab = persistent_tabs(
         reminder_tab_labels,
-        default=reminder_default_tab,
+        key="admin_reminders_active_tab",
     )
 
     with create_tab:
+        _render_bulk_reminder_upload(current_user)
+        st.divider()
+        st.markdown("#### Create Reminder Manually")
+
         form_revision = int(
             st.session_state.get(CREATE_REMINDER_FORM_REVISION_KEY, 0)
         )
@@ -1163,10 +1310,15 @@ def _render_reminders(
                     width="stretch",
                 )
 
+            move_confirmation_key = f"confirm_bin_event_reminder_{selected.id}"
+            invalidate_confirmation_on_change(
+                confirmation_key=move_confirmation_key,
+                dependencies={"reminder_id": selected.id},
+                tracker_key="__event_reminder_bin_target_confirmation",
+            )
             move_confirmed = st.checkbox(
                 "I confirm that the selected reminder should move to the Reminder Bin.",
-                value=False,
-                key=f"confirm_bin_event_reminder_{selected.id}",
+                key=move_confirmation_key,
             )
             move_clicked = st.button(
                 "Move Selected Reminder to Bin",
@@ -1267,10 +1419,15 @@ def _render_reminders(
                     key=f"restore_event_reminder_{archived.id}",
                 )
             with delete_column:
+                permanent_confirmation_key = f"confirm_permanent_event_reminder_{archived.id}"
+                invalidate_confirmation_on_change(
+                    confirmation_key=permanent_confirmation_key,
+                    dependencies={"archived_reminder_id": archived.id},
+                    tracker_key="__event_reminder_permanent_delete_target_confirmation",
+                )
                 permanent_confirmed = st.checkbox(
                     "Confirm permanent deletion",
-                    value=False,
-                    key=f"confirm_permanent_event_reminder_{archived.id}",
+                    key=permanent_confirmation_key,
                 )
                 permanent_clicked = st.button(
                     "Permanently Delete",
@@ -1449,17 +1606,18 @@ def render_admin_announcements_page(
         ANNOUNCEMENTS_NEXT_TAB_KEY,
         announcement_tab_labels,
     )
+    if announcement_default_tab is not None:
+        st.session_state["announcements_active_tab"] = announcement_default_tab
+
     (
         overview_tab,
         create_tab,
         manage_tab,
         calendar_tab,
         archive_tab,
-    ) = st.tabs(
+    ) = persistent_tabs(
         announcement_tab_labels,
-        default=announcement_default_tab,
         key="announcements_active_tab",
-        on_change="rerun",
     )
 
     with overview_tab:

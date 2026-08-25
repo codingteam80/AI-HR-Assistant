@@ -1660,18 +1660,232 @@ def apply_theme(
     /* =========================================================
        SHARED HR COMPONENTS
     ========================================================= */
+    /* =========================================================
+       ORIGINAL-LAYOUT FIXED PORTAL UPPER BANNER — v8.8.190
+       Preserve the v8.8.186 banner geometry/visuals, but use viewport-fixed
+       positioning because both earlier sticky approaches were cancelled by
+       Streamlit's real browser scroll hierarchy.  The same geometry is
+       applied whether Streamlit puts the st-key class on the element wrapper
+       itself or on a nested keyed container.
+    ========================================================= */
+    .st-key-hr_global_topbar_shell,
+    div[data-testid="stElementContainer"]:has(.st-key-hr_global_topbar_shell),
+    div.element-container:has(.st-key-hr_global_topbar_shell) {{
+        --hr-topbar-sidebar-width: 285px;
+        --hr-topbar-inline-gutter: max(
+            2rem,
+            calc(50vw - 892.5px + 2rem)
+        );
+
+        position: fixed !important;
+        /* Pin the host to the viewport top so scrolled page headings cannot
+           peek through above the banner.  The 2.5rem top padding keeps the
+           original card geometry while moving it only slightly upward. */
+        top: 0 !important;
+        left: var(--hr-topbar-sidebar-width) !important;
+        right: 0 !important;
+        width: auto !important;
+        max-width: none !important;
+        z-index: 9000 !important;
+        isolation: isolate !important;
+        overflow: visible !important;
+        box-sizing: border-box !important;
+
+        margin: 0 !important;
+        padding: 2.5rem var(--hr-topbar-inline-gutter) 8px !important;
+
+        background: var(--hr-bg) !important;
+        border: 0 !important;
+        border-bottom: 0 !important;
+    }}
+
+    /* If Streamlit wraps the keyed container in stElementContainer, pin only
+       that outer wrapper.  The nested keyed shell stays in normal flow inside
+       the fixed host so we never double-apply fixed positioning or gutters. */
+    div[data-testid="stElementContainer"]:has(.st-key-hr_global_topbar_shell)
+    .st-key-hr_global_topbar_shell,
+    div.element-container:has(.st-key-hr_global_topbar_shell)
+    .st-key-hr_global_topbar_shell {{
+        position: relative !important;
+        inset: auto !important;
+        width: 100% !important;
+        max-width: none !important;
+        z-index: auto !important;
+        isolation: auto !important;
+        overflow: visible !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: 0 !important;
+    }}
+
+    .st-key-hr_global_topbar_shell > div[data-testid="stVerticalBlock"],
+    .st-key-hr_global_topbar_shell
+    [data-testid="stVerticalBlockBorderWrapper"] > div[data-testid="stVerticalBlock"] {{
+        gap: 0 !important;
+        overflow: visible !important;
+    }}
+
+    .hr-topbar-flow-spacer {{
+        display: block !important;
+        width: 100% !important;
+        height: 3.00rem !important;
+        min-height: 3.00rem !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }}
+
+    .st-key-hr_global_topbar_shell .hr-topbar {{
+        margin-bottom: 0 !important;
+    }}
+
+    /* Keep the original v8.8.186 card appearance untouched. */
     .hr-topbar {{
         display: flex;
         align-items: center;
         justify-content: space-between;
+        gap: 18px;
+        min-width: 0;
 
         margin-bottom: 20px;
-        padding: 16px 20px;
+        padding: 14px 18px;
 
         background: var(--hr-surface);
         border: 1px solid var(--hr-border);
         border-radius: 18px;
         box-shadow: var(--hr-shadow);
+    }}
+
+    .hr-topbar-company {{
+        min-width: 0;
+        overflow: hidden;
+    }}
+
+    .hr-topbar-company .hr-brand,
+    .hr-topbar-section {{
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }}
+
+    .hr-topbar-identity {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        min-width: 0;
+    }}
+
+    .hr-topbar-avatar {{
+        width: 38px;
+        height: 38px;
+        flex: 0 0 38px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        border: 1px solid var(--hr-border);
+        border-radius: 50%;
+        background: var(--hr-primary-soft);
+        color: var(--hr-primary-text);
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+    }}
+
+    .hr-topbar-avatar img {{
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
+    }}
+
+    .hr-topbar-account {{
+        min-width: 0;
+        max-width: 280px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }}
+
+    @media (max-width: 1100px) {{
+        .hr-topbar-flow-spacer {{
+            height: 2.75rem !important;
+            min-height: 2.75rem !important;
+        }}
+
+        .hr-topbar {{
+            gap: 12px;
+            padding: 12px 14px;
+        }}
+
+        .hr-topbar-account {{
+            max-width: 160px;
+        }}
+    }}
+
+    @media (max-width: 900px) {{
+        .st-key-hr_global_topbar_shell,
+        div[data-testid="stElementContainer"]:has(.st-key-hr_global_topbar_shell),
+        div.element-container:has(.st-key-hr_global_topbar_shell) {{
+            --hr-topbar-sidebar-width: 250px;
+            --hr-topbar-inline-gutter: max(
+                2rem,
+                calc(50vw - 875px + 2rem)
+            );
+        }}
+    }}
+
+    @media (max-width: 760px) {{
+        .hr-topbar-flow-spacer {{
+            height: 2.50rem !important;
+            min-height: 2.50rem !important;
+        }}
+
+        .hr-topbar {{
+            padding: 10px 12px;
+        }}
+
+        .hr-topbar-account {{
+            display: none;
+        }}
+
+        .hr-topbar-avatar {{
+            width: 34px;
+            height: 34px;
+            flex-basis: 34px;
+        }}
+    }}
+
+    div[class*="_profile_photo_compact"] [data-testid="stVerticalBlock"] {{
+        gap: 0.45rem !important;
+    }}
+
+    div[class*="_profile_photo_compact"]
+    [data-testid="stFileUploaderDropzoneInstructions"] small {{
+        display: none !important;
+    }}
+
+    div[class*="_profile_photo_compact"] [data-testid="stImage"] {{
+        margin-bottom: 0 !important;
+    }}
+
+    .hr-profile-photo-large {{
+        width: 124px;
+        height: 124px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--hr-border);
+        border-radius: 50%;
+        background: var(--hr-primary-soft);
+        color: var(--hr-primary-text);
+        font-size: 1.85rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
     }}
 
     .hr-card {{
@@ -1812,6 +2026,7 @@ def apply_theme(
     }}
 
     section[data-testid="stSidebar"] div.stButton > button {{
+        border-radius: 20px !important;
         box-shadow:
             0 3px 8px rgba(30, 41, 59, 0.09),
             0 1px 2px rgba(30, 41, 59, 0.06) !important;

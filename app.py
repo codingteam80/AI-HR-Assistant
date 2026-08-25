@@ -38,6 +38,11 @@ from services.audit_context import clear_audit_actor
 from services.event_reminder_service import EventReminderService
 from services.leave_service import LeaveService
 from services.organization_service import OrganizationService
+from services.runtime_connection_service import (
+    classify_runtime_connection_issue,
+    log_runtime_connection_issue,
+)
+from ui.components.runtime_connection_notice import render_runtime_connection_notice
 from ui.theme.theme_loader import apply_theme
 
 
@@ -334,4 +339,22 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        issue = classify_runtime_connection_issue(exc)
+        if issue is None:
+            raise
+        log_runtime_connection_issue(
+            exc,
+            issue,
+            context="streamlit_top_level",
+        )
+        render_runtime_connection_notice(issue, popup=True)
+        if st.button(
+            "Retry Connection",
+            type="primary",
+            key="runtime_connection_retry",
+        ):
+            st.rerun()
+        st.stop()

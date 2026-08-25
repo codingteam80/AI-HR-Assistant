@@ -21,6 +21,7 @@ import streamlit.components.v1 as components
 AUTH_STORAGE_KEY = "ai_hr_signed_auth"
 READER_COMPONENT_KEY = "ai_hr_auth_storage_reader"
 WRITER_COMPONENT_KEY = "ai_hr_auth_storage_writer"
+PASSWORD_CHANGE_WRITER_COMPONENT_KEY = "ai_hr_auth_storage_password_change_writer"
 REMOVER_COMPONENT_KEY = "ai_hr_auth_storage_remover"
 
 _FRONTEND_DIR = (
@@ -175,11 +176,24 @@ def replace_browser_auth_token_and_continue(token: str) -> None:
             "The signed authentication token is invalid."
         )
 
+    # The normal authenticated rerun may already have rendered the regular
+    # writer component through ``flush_pending_browser_token`` earlier in
+    # this same Streamlit run. Password replacement therefore needs its own
+    # component key; reusing WRITER_COMPONENT_KEY here raises Streamlit's
+    # duplicate-element-key exception after the database password update,
+    # which previously showed a false failure and forced another interaction.
     result = _invoke_storage(
         action="set",
         token=cleaned,
-        component_key=WRITER_COMPONENT_KEY,
+        component_key=PASSWORD_CHANGE_WRITER_COMPONENT_KEY,
     )
+
+    if result.error:
+        st.error(
+            "Browser session storage is unavailable. "
+            "Please allow site storage for localhost and reload."
+        )
+        st.stop()
 
     if not result.ready or result.value != cleaned:
         _stop_for_browser_result(

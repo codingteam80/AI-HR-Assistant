@@ -2294,6 +2294,73 @@ class LeaveService:
         self.ensure_current_year_balances(company_id, selected_year)
         return self.balance_repository.list_employee_year(company_id, employee_id, selected_year)
 
+    def grant_overtime_additional_vl(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        overtime_public_id: str,
+        overtime_date: date,
+        days: Decimal,
+        created_by_user_id: int,
+    ) -> LeaveBalance:
+        """Stage an automatic VL grant earned from one qualifying OT day.
+
+        The caller owns the transaction so OT approval, the immutable leave
+        credit history, and the employee notification commit atomically.
+        """
+
+        grant_days = Decimal(days).quantize(Decimal("0.01"))
+        if grant_days <= Decimal("0.00"):
+            raise ValueError("Additional VL days must be greater than zero.")
+
+        self.ensure_default_leave_types(company_id)
+        leave_type = self.leave_type_repository.get_by_code(company_id, "VACATION")
+        employee = self.employee_repository.get_with_details(
+            company_id=company_id, employee_id=employee_id
+        )
+        if leave_type is None or employee is None:
+            raise ValueError(
+                "Vacation Leave or the selected employee is unavailable for "
+                "the overtime credit."
+            )
+
+        year = self.leave_cycle_year(company_id, overtime_date)
+        balance = self._ensure_balance(
+            company_id=company_id,
+            employee_id=employee_id,
+            leave_type=leave_type,
+            year=year,
+            employee=employee,
+            as_of=overtime_date,
+        )
+        balance.adjustment_days = Decimal(balance.adjustment_days) + grant_days
+        self._sync_credit_table_columns(balance)
+        self._enforce_cash_conversion_limit(
+            balance=balance,
+            leave_type=leave_type,
+            created_by_user_id=created_by_user_id,
+            source="Automatic OT additional VL",
+        )
+        self._validate_nonnegative_balance(balance)
+        self.session.add(
+            LeaveCreditTransaction(
+                company_id=company_id,
+                employee_id=employee_id,
+                leave_type_id=leave_type.id,
+                leave_balance_id=balance.id,
+                created_by_user_id=created_by_user_id,
+                transaction_type="overtime_additional_vl",
+                amount_days=grant_days,
+                note=(
+                    f"Automatic additional VL from qualifying overtime "
+                    f"{overtime_public_id} on {overtime_date.isoformat()}."
+                ),
+            )
+        )
+        self.session.flush()
+        return balance
+
     def adjust_credit(self, values: LeaveCreditAdjustmentInput) -> LeaveBalance:
         leave_type = self.leave_type_repository.get_by_id(values.leave_type_id, values.company_id)
         employee = self.employee_repository.get_with_details(company_id=values.company_id, employee_id=values.employee_id)

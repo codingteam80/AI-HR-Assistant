@@ -81,6 +81,14 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
             attendance_columns = {
                 "attendance_regular_hours": "NUMERIC(6, 2) NOT NULL DEFAULT 8.00",
                 "attendance_lunch_minutes": "INTEGER NOT NULL DEFAULT 60",
+                "ot_dinner_break_deduction_hours": "NUMERIC(5, 2) NOT NULL DEFAULT 0.75",
+                "shifting_credits_enabled": "BOOLEAN NOT NULL DEFAULT 1",
+                "shifting_credit_block_hours": "NUMERIC(5, 2) NOT NULL DEFAULT 4.00",
+                "shifting_credit_required_blocks": "INTEGER NOT NULL DEFAULT 2",
+                "shifting_credit_cutoff_day": "INTEGER NOT NULL DEFAULT 15",
+                "shifting_credit_additional_vl_threshold_hours": "NUMERIC(5, 2) NOT NULL DEFAULT 8.00",
+                "shifting_credit_additional_vl_days": "NUMERIC(5, 2) NOT NULL DEFAULT 0.50",
+                "shifting_credit_excluded_positions_json": "TEXT NOT NULL DEFAULT '[\"Trainee\", \"Design Engineer I\", \"Design Engineer II\"]'",
                 "work_monday": "BOOLEAN NOT NULL DEFAULT 1",
                 "work_tuesday": "BOOLEAN NOT NULL DEFAULT 1",
                 "work_wednesday": "BOOLEAN NOT NULL DEFAULT 1",
@@ -123,6 +131,47 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                         "OR trim(theme_primary_color) = ''"
                     )
                 )
+
+    if "overtime_requests" in table_names:
+        overtime_columns = {
+            column["name"]
+            for column in inspector.get_columns("overtime_requests")
+        }
+        payable_hours_added = "payable_hours" not in overtime_columns
+        with engine.begin() as connection:
+            overtime_additions = {
+                "payable_hours": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
+                "shifting_credit_hours": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
+                "shifting_credit_group": "VARCHAR(80)",
+                "additional_vl_days": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
+            }
+            for column_name, column_sql in overtime_additions.items():
+                if column_name not in overtime_columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE overtime_requests ADD COLUMN "
+                            f"{column_name} {column_sql}"
+                        )
+                    )
+
+            # Existing approved/pending requests predate the dinner/shift rule.
+            # Preserve their historical submitted amount as payable OT instead
+            # of silently turning those rows into zero-hour requests.
+            if payable_hours_added:
+                connection.execute(
+                    text(
+                        "UPDATE overtime_requests "
+                        "SET payable_hours = estimated_hours "
+                        "WHERE payable_hours IS NULL OR payable_hours = 0"
+                    )
+                )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_overtime_requests_shifting_credit_group "
+                    "ON overtime_requests (shifting_credit_group)"
+                )
+            )
 
     if "users" in table_names:
         user_columns = {
@@ -178,6 +227,13 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                     )
                 )
 
+            if "profile_image_filename" not in employee_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employees "
+                        "ADD COLUMN profile_image_filename VARCHAR(255)"
+                    )
+                )
 
             if "leader_id" not in employee_columns:
                 connection.execute(
@@ -866,3 +922,46 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                     """
                 )
             )
+    # Recoverable archive/bin for employee disciplinary records.
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "employee_disciplinary_records" in table_names:
+        disciplinary_columns = {
+            column["name"]
+            for column in inspector.get_columns("employee_disciplinary_records")
+        }
+        datetime_sql = (
+            "TIMESTAMP WITH TIME ZONE"
+            if engine.dialect.name == "postgresql"
+            else "DATETIME"
+        )
+        with engine.begin() as connection:
+            if "archived_at" not in disciplinary_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employee_disciplinary_records "
+                        f"ADD COLUMN archived_at {datetime_sql}"
+                    )
+                )
+            if "archived_by_user_id" not in disciplinary_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE employee_disciplinary_records "
+                        "ADD COLUMN archived_by_user_id INTEGER"
+                    )
+                )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_employee_disciplinary_records_archived_at "
+                    "ON employee_disciplinary_records (archived_at)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_employee_disciplinary_records_archived_by_user_id "
+                    "ON employee_disciplinary_records (archived_by_user_id)"
+                )
+            )
+

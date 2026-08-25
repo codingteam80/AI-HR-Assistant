@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -23,12 +24,14 @@ from schemas.organization_schema import (
     CompanyThemeColorUpdate,
 )
 from services.organization_service import OrganizationService
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
 )
 from ui.components.responsive_image import prepare_responsive_image
 from ui.theme.color_palette import build_accent_palette
+from ui.pages.admin.hr_contacts_management import render_hr_contacts_management
 
 
 
@@ -129,20 +132,20 @@ def _render_theme_preview(selected_color: str) -> None:
             border-radius:14px;
             padding:16px;
             background:#FFFFFF;
-            margin:8px 0 14px 0;
+            margin:0;
         ">
             <div style="color:#10172A;font-weight:700;margin-bottom:10px;">
                 Theme Preview
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
-                <div style="min-width:170px;padding:11px 15px;border-radius:10px;
+                <div style="min-width:120px;padding:10px 12px;border-radius:10px;
                     background:{palette['primary']};color:{palette['on_primary']};
                     font-weight:700;text-align:center;">Primary Action</div>
-                <div style="min-width:170px;padding:11px 15px;border-radius:10px;
+                <div style="min-width:120px;padding:10px 12px;border-radius:10px;
                     background:{palette['primary_hover']};
                     color:{palette['on_primary_hover']};font-weight:700;
                     text-align:center;">Hover State</div>
-                <div style="min-width:170px;padding:11px 15px;border-radius:10px;
+                <div style="min-width:120px;padding:10px 12px;border-radius:10px;
                     background:{palette['primary_soft']};
                     color:{palette['primary_text']};
                     border:1px solid {palette['primary']};font-weight:700;
@@ -182,7 +185,7 @@ def _render_logo_color_suggestions(
 ) -> None:
     """Render accent suggestions extracted from the current/uploaded logo."""
 
-    suggestions = extract_logo_theme_colors(image_bytes, max_colors=4)
+    suggestions = extract_logo_theme_colors(image_bytes, max_colors=3)
     st.markdown("**Suggested From Company Logo**")
 
     if not suggestions:
@@ -207,7 +210,7 @@ def _render_logo_color_suggestions(
         )
 
     st.markdown(f"<style>{''.join(css_rules)}</style>", unsafe_allow_html=True)
-    columns = st.columns(4, gap="small")
+    columns = st.columns(len(suggestions), gap="small")
 
     for index, color in enumerate(suggestions):
         with columns[index]:
@@ -232,28 +235,33 @@ def _render_company_information_tab(
     """Render editable company identity fields."""
 
     st.subheader("Company Information")
-    new_company_code = st.text_input(
-        "Company Code",
-        value=company_code,
-        max_chars=50,
-        help=(
-            "Employees use this code when signing in. Letters are saved in "
-            "uppercase; numbers, hyphens, and underscores are allowed."
-        ),
-        key=_company_profile_field_key(
-            current_user.company_id,
-            "code",
-        ),
-    )
-    new_company_name = st.text_input(
-        "Company Name",
-        value=company_name,
-        max_chars=200,
-        key=_company_profile_field_key(
-            current_user.company_id,
-            "name",
-        ),
-    )
+    code_column, name_column = st.columns(2, gap="medium")
+
+    with code_column:
+        new_company_code = st.text_input(
+            "Company Code",
+            value=company_code,
+            max_chars=50,
+            help=(
+                "Employees use this code when signing in. Letters are saved in "
+                "uppercase; numbers, hyphens, and underscores are allowed."
+            ),
+            key=_company_profile_field_key(
+                current_user.company_id,
+                "code",
+            ),
+        )
+
+    with name_column:
+        new_company_name = st.text_input(
+            "Company Name",
+            value=company_name,
+            max_chars=200,
+            key=_company_profile_field_key(
+                current_user.company_id,
+                "name",
+            ),
+        )
 
     normalized_code = new_company_code.strip().upper()
     code_changed = normalized_code != company_code.strip().upper()
@@ -265,12 +273,17 @@ def _render_company_information_tab(
             "to sign in. Existing company records remain linked to the same "
             "internal Company ID."
         )
+        confirmation_key = _company_profile_field_key(
+            current_user.company_id,
+            "confirm_code_change",
+        )
+        invalidate_confirmation_on_change(
+            confirmation_key=confirmation_key,
+            dependencies={"company_code": normalized_code},
+        )
         confirm_code_change = st.checkbox(
             "I understand that employees must use the new Company Code to sign in.",
-            key=_company_profile_field_key(
-                current_user.company_id,
-                "confirm_code_change",
-            ),
+            key=confirmation_key,
         )
 
     submitted = st.button(
@@ -350,6 +363,7 @@ def _render_branding_sections(
                 "Company Logo File",
                 type=["png", "jpg", "jpeg", "webp"],
                 key=_logo_uploader_key(current_user.company_id),
+                label_visibility="collapsed",
                 help=(
                     "Maximum size: "
                     f"{settings.company_logo_upload_max_mb} MB. "
@@ -359,7 +373,7 @@ def _render_branding_sections(
             uploaded_logo_bytes = (
                 uploaded_logo.getvalue() if uploaded_logo is not None else b""
             )
-            save_logo_column, remove_logo_column = st.columns(2)
+            save_logo_column, remove_logo_column = st.columns(2, gap="small")
 
             with save_logo_column:
                 save_logo = st.button(
@@ -463,26 +477,35 @@ def _render_branding_sections(
         selected_color,
     )
 
-    st.markdown("**Custom Color**")
-    picker_key = _theme_picker_key(current_user.company_id)
-    picked_color = st.color_picker(
-        "Color Picker",
-        value=selected_color,
-        key=picker_key,
-        help="Choose any custom primary accent color.",
-    ).upper()
+    custom_color_column, preview_column = st.columns(
+        [1.15, 3.85],
+        gap="medium",
+        vertical_alignment="top",
+    )
 
-    if picked_color != selected_color:
-        _set_theme_draft(current_user.company_id, picked_color)
-        selected_color = picked_color
+    with custom_color_column:
+        st.markdown("**Custom Color**")
+        picker_key = _theme_picker_key(current_user.company_id)
+        picked_color = st.color_picker(
+            "Color Picker",
+            value=selected_color,
+            key=picker_key,
+            help="Choose any custom primary accent color.",
+        ).upper()
 
-    selected_color = str(
-        st.session_state[_theme_draft_key(current_user.company_id)]
-    ).upper()
-    st.caption(f"Selected accent: {selected_color}")
-    _render_theme_preview(selected_color)
+        if picked_color != selected_color:
+            _set_theme_draft(current_user.company_id, picked_color)
+            selected_color = picked_color
 
-    save_column, reset_column = st.columns(2)
+        selected_color = str(
+            st.session_state[_theme_draft_key(current_user.company_id)]
+        ).upper()
+        st.caption(f"Selected accent: {selected_color}")
+
+    with preview_column:
+        _render_theme_preview(selected_color)
+
+    save_column, reset_column = st.columns(2, gap="small")
 
     with save_column:
         save_theme = st.button(
@@ -547,8 +570,8 @@ def render_company_page(current_user: AuthenticatedUser) -> None:
 
     st.title("Company Profile")
     st.caption(
-        "Manage company information and visual branding used throughout "
-        "the Administration and Employee portals."
+        "Manage company information, visual branding, and the HR contact "
+        "directory used throughout the Administration and Employee portals."
     )
     render_operation_feedback(namespace="company")
 
@@ -566,30 +589,41 @@ def render_company_page(current_user: AuthenticatedUser) -> None:
         )
         company_status = "Active" if company.is_active else "Inactive"
 
-    metric_columns = st.columns(4)
+    metric_columns = st.columns(3)
 
     with metric_columns[0]:
-        st.metric("Company Code", company_code)
+        st.metric("Tenant ID", current_user.company_id)
 
     with metric_columns[1]:
         st.metric("Status", company_status)
 
     with metric_columns[2]:
-        st.metric("Tenant ID", current_user.company_id)
+        st.metric("Company Code", company_code)
 
-    with metric_columns[3]:
-        st.metric("Theme Color", company_theme_color)
+    pending_tab = st.session_state.pop("company_profile_pending_active_tab", None)
+    company_tabs = {"Company Information", "Branding", "HR Contacts"}
+    if pending_tab in company_tabs:
+        st.session_state["company_profile_active_tab"] = pending_tab
 
-    _render_company_information_tab(
-        current_user,
-        company_code=company_code,
-        company_name=company_name,
+    information_tab, branding_tab, hr_contacts_tab = persistent_tabs(
+        ["Company Information", "Branding", "HR Contacts"],
+        key="company_profile_active_tab",
     )
 
-    st.divider()
-    _render_branding_sections(
-        current_user,
-        company_logo_filename=company_logo_filename,
-        company_logo_bytes=company_logo_bytes,
-        company_theme_color=company_theme_color,
-    )
+    with information_tab:
+        _render_company_information_tab(
+            current_user,
+            company_code=company_code,
+            company_name=company_name,
+        )
+
+    with branding_tab:
+        _render_branding_sections(
+            current_user,
+            company_logo_filename=company_logo_filename,
+            company_logo_bytes=company_logo_bytes,
+            company_theme_color=company_theme_color,
+        )
+
+    with hr_contacts_tab:
+        render_hr_contacts_management(current_user)

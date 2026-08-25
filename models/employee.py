@@ -119,6 +119,12 @@ class Employee(TimestampMixin, Base):
         String(150)
     )
 
+    # Canonical private profile-image filename. The actual image is stored
+    # beneath the company/employee upload directory, never as a database BLOB.
+    profile_image_filename: Mapped[str | None] = mapped_column(
+        String(255)
+    )
+
     # User-facing values are limited to employed and resigned.
     employment_status: Mapped[str] = mapped_column(
         String(50),

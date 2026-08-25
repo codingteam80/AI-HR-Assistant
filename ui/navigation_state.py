@@ -14,6 +14,39 @@ PORTAL_QUERY_KEY = "portal"
 PAGE_QUERY_KEY = "page"
 VALID_PORTALS = {"admin", "employee"}
 
+# URL/session targets that are intentionally preserved for F5/deep links but
+# must not leak into a different module selected from the sidebar.
+_SIDEBAR_MODULE_QUERY_KEYS = {
+    "employee_view",
+    "policy_view",
+    "leave_view",
+    "announcement_view",
+    "form_view",
+    "dashboard_view",
+    "onboarding_view",
+    "announcement_id",
+    "reminder_id",
+    "leave_request_id",
+    "policy_id",
+    "company_form_id",
+    "form_submission_id",
+    "employee_id",
+}
+
+_SIDEBAR_PENDING_TAB_STATE_KEYS = {
+    "company_forms_next_tab",
+    "employee_company_forms_next_tab",
+    "announcements_next_tab",
+    "reminders_next_tab",
+    "employees_pending_active_tab",
+    "admin_onboarding_management_pending_active_tab",
+    "company_profile_pending_active_tab",
+    "employee_onboarding_pending_active_tab",
+    "_admin_leave_next_tabs",
+    "notification_related_entity_type",
+    "notification_related_entity_id",
+}
+
 
 def _clean_query_value(
     value: Any,
@@ -99,13 +132,73 @@ def set_navigation_state(
         st.query_params[PAGE_QUERY_KEY] = normalized_page
 
 
+
+def reset_module_view_for_sidebar_navigation() -> None:
+    """Reset horizontal/sub-tab targets after an intentional sidebar change.
+
+    This is deliberately *not* used for normal reruns or browser refreshes.
+    F5 keeps the exact active native tab through ``tab_*`` URL state, while a
+    different sidebar destination starts from that module's first/default tab.
+    """
+
+    import streamlit as st
+
+    from ui.components.persistent_tabs import clear_persistent_tab_navigation
+
+    clear_persistent_tab_navigation()
+
+    for query_key in _SIDEBAR_MODULE_QUERY_KEYS:
+        if query_key in st.query_params:
+            del st.query_params[query_key]
+
+    for state_key in _SIDEBAR_PENDING_TAB_STATE_KEYS:
+        st.session_state.pop(state_key, None)
+
+
+def set_sidebar_navigation_state(
+    *,
+    portal_mode: str,
+    current_page: str,
+) -> None:
+    """Navigate from the sidebar and reset the destination's inner tabs.
+
+    A click that actually changes portal/page is different from F5. The former
+    deliberately starts the selected module at its first/default horizontal
+    tab; the latter must preserve the exact current tab.
+    """
+
+    import streamlit as st
+
+    normalized_portal = (
+        portal_mode if portal_mode in VALID_PORTALS else "employee"
+    )
+    normalized_page = (
+        current_page.strip()[:100] if current_page.strip() else DEFAULT_PAGE
+    )
+
+    route_changed = (
+        st.session_state.get("portal_mode") != normalized_portal
+        or st.session_state.get("current_page") != normalized_page
+    )
+
+    if route_changed:
+        reset_module_view_for_sidebar_navigation()
+
+    set_navigation_state(
+        portal_mode=normalized_portal,
+        current_page=normalized_page,
+    )
+
 def clear_navigation_state() -> None:
     """Remove only navigation parameters while preserving theme state."""
 
     import streamlit as st
 
-    for key in (PORTAL_QUERY_KEY, PAGE_QUERY_KEY):
-        if key in st.query_params:
+    for key in list(st.query_params.keys()):
+        if (
+            key in {PORTAL_QUERY_KEY, PAGE_QUERY_KEY}
+            or str(key).startswith("tab_")
+        ):
             del st.query_params[key]
 
     st.session_state.portal_mode = "employee"

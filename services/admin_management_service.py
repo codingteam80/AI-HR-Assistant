@@ -19,14 +19,17 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from authentication.password_manager import PasswordManager
 from core.constants import CLEARANCE_ADMIN, CLEARANCE_USER
+from config.settings import get_settings
 from models.department import Department
 from models.employee import Employee
 from models.employee_history import EmployeeHistory
 from models.employee_training import EmployeeTraining
 from models.hr_policy import HRPolicy
 from models.hr_policy_document import HRPolicyDocument
+from models.policy_violation import PolicyViolation
 from models.password_reset_token import PasswordResetToken
 from models.user import User
+from modules.employees.profile_image_storage import EmployeeProfileImageStorage
 from repositories.department_repository import DepartmentRepository
 from repositories.employee_repository import EmployeeRepository
 from repositories.employee_history_repository import EmployeeHistoryRepository
@@ -951,7 +954,18 @@ class AdminManagementService:
             )
         ) or 0
 
-        return int(policy_count) + int(document_count)
+        violation_count = self.session.scalar(
+            select(func.count(PolicyViolation.id)).where(
+                PolicyViolation.company_id == company_id,
+                (
+                    (PolicyViolation.created_by_user_id == user_id)
+                    | (PolicyViolation.last_edited_by_user_id == user_id)
+                    | (PolicyViolation.archived_by_user_id == user_id)
+                ),
+            )
+        ) or 0
+
+        return int(policy_count) + int(document_count) + int(violation_count)
 
     def delete_employee_master_record(
         self,
@@ -995,74 +1009,63 @@ class AdminManagementService:
             > 0
         ):
             raise ValueError(
-                "This account is referenced by policy history and "
+                "This account is referenced by policy history or violation history and "
                 "cannot be permanently deleted. Change the employee "
                 "status to Resigned instead."
             )
 
-        self._record_employee_history(
-            employee=employee,
-            performed_by_user_id=current_user_id,
-            action_type="permanently_deleted",
-            summary="Employee profile and eligible linked login account permanently deleted.",
-            old_values=self._employee_snapshot(employee),
+        settings = get_settings()
+        profile_storage = EmployeeProfileImageStorage(
+            settings.employee_profile_image_dir,
+            max_mb=settings.employee_profile_image_max_mb,
         )
-        self.session.flush()
+        profile_mutation = None
+        if employee.profile_image_filename:
+            profile_mutation = profile_storage.stage_remove(
+                company_id=request.company_id,
+                employee_id=employee_id,
+                filename=employee.profile_image_filename,
+            )
 
-        direct_report_ids = list(
-            self.session.scalars(
-                select(Employee.id).where(
-                    Employee.company_id == request.company_id,
-                    Employee.manager_id == employee_id,
+        try:
+            self._record_employee_history(
+                employee=employee,
+                performed_by_user_id=current_user_id,
+                action_type="permanently_deleted",
+                summary="Employee profile and eligible linked login account permanently deleted.",
+                old_values=self._employee_snapshot(employee),
+            )
+            self.session.flush()
+
+            direct_report_ids = list(
+                self.session.scalars(
+                    select(Employee.id).where(
+                        Employee.company_id == request.company_id,
+                        Employee.manager_id == employee_id,
+                    )
+                ).all()
+            )
+
+            if direct_report_ids:
+                self.session.execute(
+                    update(Employee)
+                    .where(
+                        Employee.company_id == request.company_id,
+                        Employee.manager_id == employee_id,
+                    )
+                    .values(manager_id=None)
+                    .execution_options(
+                        synchronize_session=False
+                    )
                 )
-            ).all()
-        )
 
-        if direct_report_ids:
             self.session.execute(
-                update(Employee)
+                delete(EmployeeTraining)
                 .where(
-                    Employee.company_id == request.company_id,
-                    Employee.manager_id == employee_id,
-                )
-                .values(manager_id=None)
-                .execution_options(
-                    synchronize_session=False
-                )
-            )
-
-        self.session.execute(
-            delete(EmployeeTraining)
-            .where(
-                EmployeeTraining.company_id
-                == request.company_id,
-                EmployeeTraining.employee_id
-                == employee_id,
-            )
-            .execution_options(
-                synchronize_session=False
-            )
-        )
-
-        self.session.execute(
-            delete(Employee)
-            .where(
-                Employee.company_id == request.company_id,
-                Employee.id == employee_id,
-            )
-            .execution_options(
-                synchronize_session=False
-            )
-        )
-
-        if linked_user_id is not None:
-            self.session.execute(
-                delete(PasswordResetToken)
-                .where(
-                    PasswordResetToken.company_id
+                    EmployeeTraining.company_id
                     == request.company_id,
-                    PasswordResetToken.user_id
-                    == linked_user_id,
+                    EmployeeTraining.employee_id
+                    == employee_id,
                 )
                 .execution_options(
                     synchronize_session=False
@@ -1070,18 +1073,55 @@ class AdminManagementService:
             )
 
             self.session.execute(
-                delete(User)
+                delete(Employee)
                 .where(
-                    User.company_id == request.company_id,
-                    User.id == linked_user_id,
+                    Employee.company_id == request.company_id,
+                    Employee.id == employee_id,
                 )
                 .execution_options(
                     synchronize_session=False
                 )
             )
 
-        self.session.commit()
-        self.session.expire_all()
+            if linked_user_id is not None:
+                self.session.execute(
+                    delete(PasswordResetToken)
+                    .where(
+                        PasswordResetToken.company_id
+                        == request.company_id,
+                        PasswordResetToken.user_id
+                        == linked_user_id,
+                    )
+                    .execution_options(
+                        synchronize_session=False
+                    )
+                )
+
+                self.session.execute(
+                    delete(User)
+                    .where(
+                        User.company_id == request.company_id,
+                        User.id == linked_user_id,
+                    )
+                    .execution_options(
+                        synchronize_session=False
+                    )
+                )
+
+            self.session.commit()
+            self.session.expire_all()
+        except Exception:
+            self.session.rollback()
+            if profile_mutation is not None:
+                profile_mutation.rollback()
+            raise
+
+        if profile_mutation is not None:
+            profile_mutation.finalize()
+        profile_storage.delete_orphaned_employee_directory(
+            company_id=request.company_id,
+            employee_id=employee_id,
+        )
 
         return EmployeeDeletionResult(
             employee_id=employee_id,

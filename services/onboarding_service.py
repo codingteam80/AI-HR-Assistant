@@ -380,6 +380,54 @@ class OnboardingService:
         self.session.add(CompanyBenefit(company_id=company_id, **normalized))
         self.session.commit()
 
+    def create_benefits_many(
+        self,
+        *,
+        company_id: int,
+        values_list: list[dict[str, object]],
+    ) -> list[CompanyBenefit]:
+        """Atomically create a validated batch of active company benefits."""
+
+        if not values_list:
+            raise ValueError("There are no Benefit rows to import.")
+        if len(values_list) > 1000:
+            raise ValueError("A maximum of 1,000 benefits can be imported at once.")
+
+        existing = {
+            item.name.strip().casefold()
+            for item in self.repository.list_benefits(company_id, active_only=False)
+        }
+        normalized_rows: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for values in values_list:
+            normalized = self._validated_benefit_values(values)
+            name_key = str(normalized["name"]).strip().casefold()
+            if name_key in existing:
+                raise ValueError(
+                    f"Benefit '{normalized['name']}' already exists in Active or Archive."
+                )
+            if name_key in seen:
+                raise ValueError(
+                    f"Benefit '{normalized['name']}' is duplicated in this import batch."
+                )
+            seen.add(name_key)
+            normalized_rows.append(normalized)
+
+        created = [
+            CompanyBenefit(company_id=company_id, **values)
+            for values in normalized_rows
+        ]
+        try:
+            self.session.add_all(created)
+            self.session.flush()
+            self.session.commit()
+            for benefit in created:
+                self.session.refresh(benefit)
+            return created
+        except Exception:
+            self.session.rollback()
+            raise
+
     def update_benefit(
         self,
         *,

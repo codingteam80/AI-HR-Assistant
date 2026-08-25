@@ -10,6 +10,9 @@ from modules.policy_qa.policy_assistant import PolicyAssistant
 from config.settings import get_settings
 from services.policy_service import PolicyService
 from ui.components.live_search import live_search_input
+from ui.components.persistent_tabs import persistent_tabs
+from ui.pages.user.policy_violations import render_employee_policy_violations
+from ui.components.disciplinary_records import render_employee_disciplinary_records
 
 
 def _source_caption(source) -> str:
@@ -55,12 +58,11 @@ def _policy_content_html(value: str) -> str:
     )
 
 
-def render_employee_policies_page(
+def _render_employee_policy_library(
     current_user: AuthenticatedUser,
 ) -> None:
     """Browse and ask questions about approved policy files."""
 
-    st.title("Company Policies")
     st.caption(
         "Only active published files from your company are available. "
         "Versions moved to the Bin are excluded."
@@ -240,3 +242,25 @@ def render_employee_policies_page(
 
             for source in response.sources:
                 st.caption(_source_caption(source))
+
+
+def render_employee_policies_page(
+    current_user: AuthenticatedUser,
+) -> None:
+    """Render published policies and the read-only violation master list."""
+
+    st.title("Company Policies")
+    policy_tab, violation_tab, records_tab = persistent_tabs(
+        [
+            "Company Policies",
+            "Violations & Disciplinary Actions",
+            "My Disciplinary Records",
+        ],
+        key="employee_policies_active_tab",
+    )
+    with policy_tab:
+        _render_employee_policy_library(current_user)
+    with violation_tab:
+        render_employee_policy_violations(current_user)
+    with records_tab:
+        render_employee_disciplinary_records(current_user)

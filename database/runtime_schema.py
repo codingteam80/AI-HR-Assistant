@@ -18,6 +18,14 @@ _SCHEMA_READY = False
 _LOGIN_REQUIRED_COMPANY_COLUMNS = {
     "attendance_regular_hours",
     "attendance_lunch_minutes",
+    "ot_dinner_break_deduction_hours",
+    "shifting_credits_enabled",
+    "shifting_credit_block_hours",
+    "shifting_credit_required_blocks",
+    "shifting_credit_cutoff_day",
+    "shifting_credit_additional_vl_threshold_hours",
+    "shifting_credit_additional_vl_days",
+    "shifting_credit_excluded_positions_json",
     "work_monday",
     "work_tuesday",
     "work_wednesday",
@@ -41,12 +49,16 @@ _REQUIRED_RUNTIME_TABLES = {
     "employee_onboarding_progress",
     "company_benefits",
     "audit_events",
+    "hr_contacts",
+    "policy_violations",
+    "employee_disciplinary_records",
 }
 _REQUIRED_EMPLOYEE_COLUMNS = {
     "archived_at",
     "archived_by_user_id",
     "edit_version",
     "last_edited_by_user_id",
+    "profile_image_filename",
 }
 _REQUIRED_LEAVE_REQUEST_COLUMNS = {
     "duration_code",
@@ -64,6 +76,18 @@ _REQUIRED_ATTENDANCE_SESSION_COLUMNS = {
     "rounded_time_in",
     "rounded_time_out",
     "work_status",
+}
+
+_REQUIRED_DISCIPLINARY_RECORD_COLUMNS = {
+    "archived_at",
+    "archived_by_user_id",
+}
+
+_REQUIRED_OVERTIME_REQUEST_COLUMNS = {
+    "payable_hours",
+    "shifting_credit_hours",
+    "shifting_credit_group",
+    "additional_vl_days",
 }
 
 
@@ -110,11 +134,21 @@ def _has_runtime_schema(database_engine: Engine) -> bool:
         column["name"]
         for column in schema_inspector.get_columns("employees")
     }
+    disciplinary_columns = {
+        column["name"]
+        for column in schema_inspector.get_columns("employee_disciplinary_records")
+    }
+    overtime_columns = {
+        column["name"]
+        for column in schema_inspector.get_columns("overtime_requests")
+    }
     return (
         _REQUIRED_LEAVE_REQUEST_COLUMNS.issubset(leave_columns)
         and _REQUIRED_ATTENDANCE_RECORD_COLUMNS.issubset(attendance_columns)
         and _REQUIRED_ATTENDANCE_SESSION_COLUMNS.issubset(session_columns)
         and _REQUIRED_EMPLOYEE_COLUMNS.issubset(employee_columns)
+        and _REQUIRED_DISCIPLINARY_RECORD_COLUMNS.issubset(disciplinary_columns)
+        and _REQUIRED_OVERTIME_REQUEST_COLUMNS.issubset(overtime_columns)
     )
 
 

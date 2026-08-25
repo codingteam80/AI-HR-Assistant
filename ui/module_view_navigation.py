@@ -18,6 +18,7 @@ _VIEW_ROUTES: dict[
             "list": "Employee List",
             "add": "Add Employee",
             "edit": "Edit Employee",
+            "disciplinary": "Violations / Disciplinary Records",
             "onboarding": "Onboarding Management",
         },
     ),
@@ -28,6 +29,7 @@ _VIEW_ROUTES: dict[
             "library": "Policies",
             "upload": "Upload Policy File",
             "manage": "Manage Existing Policy",
+            "violations": "Violations & Disciplinary Actions",
         },
     ),
     ("admin", "Leave Management"): (
@@ -57,6 +59,15 @@ _VIEW_ROUTES: dict[
             "overview": "Overview",
             "upload": "Upload Form",
             "manage": "Manage Form",
+        },
+    ),
+    ("employee", "Company Policies"): (
+        "policy_view",
+        "employee_policies_active_tab",
+        {
+            "library": "Company Policies",
+            "violations": "Violations & Disciplinary Actions",
+            "disciplinary": "My Disciplinary Records",
         },
     ),
     ("employee", "Dashboard"): (

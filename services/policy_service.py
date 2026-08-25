@@ -15,13 +15,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import re
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models.hr_policy import HRPolicy
 from models.hr_policy_document import HRPolicyDocument
 from models.hr_policy_section import HRPolicySection
+from models.policy_violation import PolicyViolation
 from modules.documents.policy_file_parser import (
     ParsedPolicyDocument,
     PolicyFileParser,
@@ -986,6 +987,19 @@ class PolicyService:
         )
 
         try:
+            # Keep violation rules valid if their source policy version is
+            # permanently removed. The rule remains, but its optional policy
+            # link is cleared instead of causing a foreign-key failure.
+            linked_violations = self.session.scalars(
+                select(PolicyViolation).where(
+                    PolicyViolation.company_id == values.company_id,
+                    PolicyViolation.related_policy_id == policy.id,
+                )
+            ).all()
+            for violation in linked_violations:
+                violation.related_policy_id = None
+
+            self.session.flush()
             self.session.execute(
                 delete(HRPolicySection).where(
                     HRPolicySection.company_id

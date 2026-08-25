@@ -22,14 +22,21 @@ import os
 import re
 from typing import Iterable
 from urllib import request, error
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from authentication.current_user import AuthenticatedUser
 from config.chat_assistant_settings import get_chat_assistant_settings
+from config.settings import get_settings
 from modules.hr_assistant.hr_assistant import HRAssistantResponse
-from modules.smart_ai.prompts.hr_assistant_prompt import build_hr_assistant_prompt
+from modules.smart_ai.prompts.hr_assistant_prompt import (
+    NOT_FOUND_ANSWER,
+    OUT_OF_SCOPE_ANSWER,
+    UNDETERMINED_ANSWER,
+    build_hr_assistant_prompt,
+)
 from models.announcement import Announcement
 from models.attendance_record import AttendanceRecord
 from models.company import Company
@@ -43,6 +50,13 @@ from models.leave_request import LeaveRequest
 from models.overtime_request import OvertimeRequest
 from models.user import User
 from repositories.policy_section_repository import PolicySectionRepository
+from services.policy_violation_service import PolicyViolationService
+from services.company_form_knowledge_service import CompanyFormKnowledgeExtractor
+from services.runtime_connection_service import (
+    RuntimeServiceUnavailableError,
+    classify_runtime_connection_issue,
+    log_runtime_connection_issue,
+)
 
 
 def _disable_chroma_product_telemetry() -> None:
@@ -85,16 +99,16 @@ class RetrievedDocument:
 _PORTAL_GUIDES = {
     "shared": [
         ("Navigation and privacy", "The HR Assistant answers only from the authenticated company portal. It cannot use outside knowledge, expose another company, or reveal passwords, reset tokens, secret keys, SMTP credentials, or private authentication data."),
-        ("Company policies", "Published company policies are available in Company Policies. Answers should use only published and effective policy files. Administrators manage policy upload, versions, searchable sections, previews, Bin, restore, and permanent deletion from the Policies workspace."),
+        ("Company policies and violations", "Published company policies are available in Company Policies. Active company violation/offense rules and their disciplinary actions are available in Violations & Disciplinary Actions. Answers must use only published/effective policy files and active/effective violation rules from the authenticated company. Administrators manage policy upload/versions/Bin and the separate violation master list."),
         ("Announcements and reminders", "Announcements show published company notices. Independent event reminders are planning records for future events and activities. Reminder notifications are sent to administrators at one month, two weeks, and one week before an event."),
         ("Leave workflow", "Employees may file Whole Day, AM Only, or PM Only leave in Leave Management using a coded standard reason and an Others explanation only when 0 - OTHERS is selected. Overlapping active leave for the same owner is blocked. Leaders and Managers may file for direct reports, but approval always follows the leave owner hierarchy and filing is never automatic approval. Paid credits are reserved after final approval and used on approved dates."),
         ("Attendance and DTR", "Attendance supports multiple non-overlapping WFO and WFH work sessions per day. Mixed locations become Hybrid. Actual punches remain in audit history while payroll Time In rounds up and Time Out rounds down to 15-minute boundaries. Approved AM/PM leave supplies four leave hours on an eight-hour day and only the remaining work portion is checked for undertime; leave, gaps, and lunch never become overtime."),
-        ("Overtime requests", "The employee Attendance/DTR page contains one collapsible Overtime Request section combining DTR-prefilled filing and My Overtime Requests. Employee ID, name, and the original DTR reference are read-only. Date Rendered, OT Start/End, and Estimated Hours are prefilled but editable. The employee selects OT Type and enters Purpose, optional Travel Fare and required Route, and Dinner Break. Approved requests populate the full OT report row; a DTR-only row leaves unsupported fields blank."),
+        ("Overtime requests", "The employee Attendance/DTR page contains one collapsible Overtime Request section combining DTR-prefilled filing and My Overtime Requests. Employee ID, name, and the original DTR reference are read-only. Date Rendered, OT Start/End, and Estimated Hours are prefilled but editable. The employee selects OT Type and enters Purpose, optional Travel Fare and required Route, and Dinner Break. Company OT rules can deduct dinner-break hours from payable OT, pair qualifying smaller OT blocks within one cut-off as Shifting Credits, and grant additional Vacation Leave for a qualifying single long OT request. Shifting-credit eligibility uses the company exclusion list rather than guessing a senior-position hierarchy. Approved requests populate the full OT report row; a DTR-only row leaves unsupported fields blank."),
         ("Company forms and documents", "Company Form/Documents contains company templates. Administrators upload and manage templates and review employee submissions. Employees may view, download, fill, and submit forms when the selected template permits employee submission."),
         ("App-wide answer boundary", "The assistant may answer from authorized live HR records, published company policies, company announcements, configured leave rules, and actual workflows available in this HR application. If the information is not present in those company or application sources, it must say that the information was not found and must not use outside knowledge."),
     ],
     "employee": [
-        ("Employee portal scope", "The employee assistant may show the signed-in employee's own profile, leave credits, personal leave requests, published company policies, announcements, reminders visible to employees, and instructions for available employee portal pages. It must not disclose another employee's private record."),
+        ("Employee portal scope", "The employee assistant may show the signed-in employee's own profile, leave credits, personal leave requests, published company policies, active company violation and disciplinary-action rules, the signed-in employee's own issued disciplinary records when portal visibility is enabled, announcements, reminders visible to employees, and instructions for available employee portal pages. It must never disclose another employee's disciplinary history or private record."),
         ("Employee records", "Employees can ask for their employee number, department, manager, leader, job title, work email, employment status, hire date, and other fields stored in their own employee profile."),
         ("Employee documents", "Company Form/Documents contains available company forms and documents. Its My Documents tab contains only the signed-in employee's own completed form submissions, review status, administrator notes, previews, and downloads. The assistant must not invent a document that is not present."),
         ("Employee navigation", "Dashboard contains the employee's Time In/Time Out and Announcements workspaces. Attendance Hub contains the employee's monthly DTR, attendance editor, and overtime request workflow. Reports generates one employee-scoped Excel workbook containing DTR Logs, Overtime File, and Leave File. Leave Management contains leave overview, filing, My Requests, and authorized leader or manager views. Company Form/Documents contains View, Download, Fill / Submit, and My Documents. Onboarding contains Overview, Checklist, and the permanent Benefits workspace. Company Policies, HR Contacts, and FAQ retain their corresponding approved or default information."),
@@ -103,7 +117,7 @@ _PORTAL_GUIDES = {
         ("Administrator portal scope", "The administrator assistant may summarize authorized company-wide employees, departments, user accounts, leave requests, leave credits, policies, announcements, reminders, integrations, and company settings. Results must remain restricted to the authenticated company."),
         ("Employee management", "Administrators manage employee records, account linkage, departments, manager and leader assignments, job titles, employment status, hire date, demographics, training checklist, account information, onboarding progress, onboarding checklist setup, and company benefits in Employees."),
         ("Security restrictions", "Passwords, password hashes, reset tokens, cookie secrets, SMTP passwords, and equivalent credentials can never be displayed by the assistant. The assistant may explain where settings are managed without exposing secret values."),
-        ("Administrator navigation", "Admin Dashboard contains company metrics and Attendance/DTR/OT. Employees contains employee list, add, and edit workspaces. Policies contains library, upload, management, and Bin. Leave Management contains overview, employee leave accounts, leave requests, and rules. Announcements contains overview, create, manage, reminders, and archive. Company Form/Documents contains overview, upload, management, employee submissions, and Bin. Reports and Integrations contain the implemented reporting and integration workspaces."),
+        ("Administrator navigation", "Admin Dashboard contains company metrics and Attendance/DTR/OT. Employees contains employee list, add, edit, and Violations / Disciplinary Records workspaces for actual employee cases. Policies contains library, upload, management, Violations & Disciplinary Actions, and Bin; the violation workspace is the single source of truth for master offense definitions and penalty guidance. Leave Management contains overview, employee leave accounts, leave requests, and rules. Announcements contains overview, create, manage, reminders, and archive. Company Form/Documents contains overview, upload, management, employee submissions, and Bin. Reports includes disciplinary reporting alongside existing reports, and Integrations contains the implemented integration workspaces."),
     ],
 }
 
@@ -203,6 +217,7 @@ class PortalKnowledgeBuilder:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.settings = get_chat_assistant_settings()
+        self.company_form_extractor = CompanyFormKnowledgeExtractor()
 
     @staticmethod
     def _add_document(
@@ -267,6 +282,18 @@ class PortalKnowledgeBuilder:
                 )
                 if enabled
             ]
+            try:
+                excluded_positions = json.loads(
+                    company.shifting_credit_excluded_positions_json or "[]"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                excluded_positions = []
+            if not isinstance(excluded_positions, list):
+                excluded_positions = []
+            excluded_positions_text = ", ".join(
+                str(value) for value in excluded_positions if str(value).strip()
+            ) or "None"
+
             self._add_document(
                 documents,
                 document_id=f"company:{company_id}:live:company",
@@ -279,7 +306,17 @@ class PortalKnowledgeBuilder:
                     f"Company active: {'Yes' if company.is_active else 'No'}. "
                     f"Regular workdays: {', '.join(workdays) or 'None configured'}. "
                     f"Regular hours per workday: {company.attendance_regular_hours}. "
-                    f"Lunch break: {company.attendance_lunch_minutes} minutes."
+                    f"Lunch break: {company.attendance_lunch_minutes} minutes. "
+                    f"OT dinner-break deduction: {company.ot_dinner_break_deduction_hours} hours. "
+                    f"Shifting Credits enabled: {'Yes' if company.shifting_credits_enabled else 'No'}. "
+                    f"Shifting-credit block: {company.shifting_credit_block_hours} hours; "
+                    f"required blocks per cut-off: {company.shifting_credit_required_blocks}; "
+                    f"first cut-off end day: {company.shifting_credit_cutoff_day}. "
+                    f"Additional VL qualifying OT: "
+                    f"{company.shifting_credit_additional_vl_threshold_hours} hours; "
+                    f"additional VL: {company.shifting_credit_additional_vl_days} days. "
+                    f"Shifting-credit excluded positions: "
+                    f"{excluded_positions_text}."
                 ),
             )
 
@@ -543,6 +580,39 @@ class PortalKnowledgeBuilder:
                 metadata={"company_form_id": form.id, "title": form.title},
             )
 
+            # Active Company Form/Documents files contribute their actual
+            # readable content to company knowledge. This lets a natural
+            # question search the document body, not only title/filename
+            # metadata. Unsupported/old binary formats remain metadata-only.
+            if form.status == "active" and form.trashed_at is None:
+                extracted_form_text = self.company_form_extractor.extract(form)
+                if extracted_form_text:
+                    for chunk_index, chunk in enumerate(
+                        _split_text(
+                            extracted_form_text,
+                            int(self.settings.chunk_size),
+                            int(self.settings.chunk_overlap),
+                        ),
+                        start=1,
+                    ):
+                        self._add_document(
+                            documents,
+                            document_id=(
+                                f"company:{company_id}:company-form-content:"
+                                f"{form.id}:{chunk_index}"
+                            ),
+                            title=f"{form.title} — {form.original_filename}",
+                            source_type="company_form_content",
+                            company_id=company_id,
+                            role_scope="admin" if is_admin else "shared",
+                            text=chunk,
+                            metadata={
+                                "company_form_id": form.id,
+                                "title": form.title,
+                                "filename": form.original_filename,
+                            },
+                        )
+
         submission_query = select(CompanyFormSubmission).where(
             CompanyFormSubmission.company_id == company_id
         )
@@ -666,9 +736,56 @@ class PortalKnowledgeBuilder:
             role_scope=role_scope,
         )
 
+        violation_service = PolicyViolationService(self.session)
+        violation_date = datetime.now(
+            ZoneInfo(get_settings().display_timezone)
+        ).date()
+        for violation in violation_service.list_employee_visible(
+            company_id=company_id,
+            as_of_date=violation_date,
+        ):
+            related_policy = violation_service.related_policy_label(
+                company_id=company_id,
+                violation=violation,
+            )
+            self._add_document(
+                documents,
+                document_id=(
+                    f"company:{company_id}:policy-violation:{violation.id}"
+                ),
+                title=(
+                    f"{violation.violation_code} — {violation.offense_title}"
+                ),
+                source_type="policy_violation",
+                company_id=company_id,
+                role_scope="shared",
+                text=(
+                    f"Violation code: {violation.violation_code}. "
+                    f"Violation / offense: {violation.offense_title}. "
+                    f"Category: {violation.category}. Severity: {violation.severity}. "
+                    f"Description: {violation.description}. "
+                    f"1st offense action: {violation.first_offense_action}. "
+                    f"2nd offense action: {violation.second_offense_action}. "
+                    f"3rd offense action: {violation.third_offense_action}. "
+                    f"Final / maximum action: {violation.final_action}. "
+                    f"Related policy: {related_policy}. "
+                    f"Effective date: "
+                    f"{violation.effective_date.isoformat() if violation.effective_date else 'Immediate'}."
+                ),
+                metadata={
+                    "violation_id": violation.id,
+                    "violation_code": violation.violation_code,
+                    "severity": violation.severity,
+                    "category": violation.category,
+                    "related_policy_id": violation.related_policy_id,
+                },
+            )
+
         rows = PolicySectionRepository(self.session).list_searchable(
             company_id=company_id,
-            as_of_date=date.today(),
+            as_of_date=datetime.now(
+                ZoneInfo(get_settings().display_timezone)
+            ).date(),
         )
         chunk_size = int(self.settings.chunk_size)
         overlap = int(self.settings.chunk_overlap)
@@ -853,6 +970,21 @@ class OllamaClient:
     def __init__(self) -> None:
         self.settings = get_chat_assistant_settings()
 
+
+    def check_available(self) -> None:
+        """Fast local health check used before each submitted chat question."""
+
+        url = self.settings.ollama_base_url.rstrip("/") + "/api/tags"
+        req = request.Request(url, method="GET")
+        try:
+            with request.urlopen(
+                req,
+                timeout=float(self.settings.ollama_health_timeout_seconds),
+            ) as response:
+                response.read(1)
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeServiceUnavailableError("ollama", cause=exc) from exc
+
     def generate(self, prompt: str, *, quality: bool = False) -> str | None:
         url = self.settings.ollama_base_url.rstrip("/") + "/api/generate"
         payload = json.dumps({
@@ -880,17 +1012,19 @@ class OllamaClient:
                 data = json.loads(response.read().decode("utf-8"))
             value = _clean_model_answer(str(data.get("response", "")))
             return value or None
-        except (error.URLError, TimeoutError, ValueError, OSError):
-            return None
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeServiceUnavailableError("ollama", cause=exc) from exc
+        except ValueError as exc:
+            raise RuntimeServiceUnavailableError("ollama", cause=exc) from exc
 
 
 class SmartPortalAssistant:
     """Enhance deterministic portal answers without weakening access control."""
 
-    _NEVER_ENHANCE_INTENTS = {"sensitive_security", "empty"}
+    _NEVER_ENHANCE_INTENTS = {"sensitive_security", "empty", "leave_carryover", "live_report", "policy_violation", "disciplinary_records", "employee_hierarchy", "employee_aggregate"}
     _RAG_INTENTS = {
         "policy", "policy_question", "policy_fallback", "benefits_policy",
-        "leave_type_details", "onboarding", "faq", "not_found",
+        "leave_type_details", "leave_request_status", "onboarding", "faq", "not_found",
         "employee_summary", "account_summary", "leave_summary",
         "announcement_summary", "attendance", "company_forms",
         "company_profile", "integrations", "audit_logs", "reports",
@@ -904,11 +1038,283 @@ class SmartPortalAssistant:
         "employee_profile", "personal_employee", "policy_summary", "dashboard",
     }
 
+
+    _YES_NO_PATTERN = re.compile(
+        r"^\s*(?:"
+        r"can|could|may|might|should|would|will|do|does|did|"
+        r"is|are|was|were|has|have|had|am|"
+        r"pwede\s+ba|puwede\s+ba|maaari\s+ba"
+        r")\b",
+        re.I,
+    )
+    _NON_BINARY_REQUEST_PATTERN = re.compile(
+        r"^\s*(?:"
+        r"(?:who|what|when|where|why|how|which|show|list|tell|give|display|find|summarize|explain)\b"
+        r"|(?:can|could|would|will)\s+you\s+"
+        r"(?:show|list|tell|give|display|find|summarize|explain|help|open|check)"
+        r"|(?:can|could|may)\s+i\s+"
+        r"(?:see|view|show|list|check|know)"
+        r")",
+        re.I,
+    )
+    _FOLLOW_UP_PATTERNS = (
+        r"\bhow about\b",
+        r"\bwhat about\b",
+        r"\babout it\b",
+        r"\babout that\b",
+        r"\bapprove(?:s)? it\b",
+        r"\bwho (?:needs to )?approve(?:s)?\b",
+        r"\bthat request\b",
+        r"\bthis request\b",
+        r"\bthe same request\b",
+        r"\bwhat happens next\b",
+        r"\band (?:vl|sl|el)\b",
+        r"\bilan na lang\b",
+        r"\bilan nalang\b",
+        r"\bpaano naman\b",
+        r"\byun\b",
+        r"\bito\b",
+    )
+    _SCOPE_STOPWORDS = {
+        "a", "an", "and", "ang", "ano", "are", "ba", "can", "could", "do",
+        "does", "for", "from", "how", "i", "in", "is", "it", "ko", "may",
+        "my", "ng", "of", "on", "or", "si", "sino", "the", "to", "what",
+        "when", "where", "which", "who", "why", "with", "would", "you", "your",
+    }
+    _IN_SCOPE_TERMS = {
+        "hr", "employee", "employees", "company", "work", "office", "manager",
+        "leader", "leave", "vacation", "sick", "emergency", "lwop", "attendance",
+        "dtr", "overtime", "policy", "policies", "benefit", "benefits", "onboarding",
+        "announcement", "announcements", "form", "forms", "document", "documents",
+        "report", "reports", "department", "job", "salary", "payroll", "schedule",
+        "shift", "holiday", "holidays", "dress", "uniform", "attire", "parking",
+        "park", "reimbursement", "travel", "fare", "meal", "break", "remote",
+        "wfh", "wfo", "credit", "credits", "request", "requests", "approval",
+        "approve", "approver", "contact", "contacts", "faq", "training",
+    }
+    _STRONG_IN_SCOPE_TERMS = {
+        "hr", "employee", "employees", "company", "manager", "leader", "leave",
+        "vacation", "sick", "emergency", "lwop", "attendance", "dtr", "overtime",
+        "policy", "policies", "benefit", "benefits", "onboarding", "payroll",
+        "department", "wfh", "wfo", "approval", "approver", "training",
+    }
+    _OBVIOUS_EXTERNAL_TERMS = {
+        "batman", "superman", "marvel", "dc comics", "celebrity", "celebrities",
+        "movie", "movies", "actor", "actress", "singer", "music", "song", "songs",
+        "basketball", "football", "nba", "nfl", "sports", "score", "scores",
+        "election", "politics", "politician", "president", "senator", "mayor",
+        "python programming", "javascript", "programming", "source code", "coding",
+        "recipe", "recipes", "weather", "horoscope", "astrology",
+    }
+
+    @classmethod
+    def _is_yes_no_question(cls, question: str) -> bool:
+        clean = _clean_text(question)
+        if cls._NON_BINARY_REQUEST_PATTERN.search(clean):
+            return False
+        return bool(
+            cls._YES_NO_PATTERN.search(clean)
+            or re.search(r"\byes\s+or\s+no\b", clean, re.I)
+        )
+
+    @classmethod
+    def _is_follow_up_question(
+        cls,
+        question: str,
+        history: list[dict] | None,
+    ) -> bool:
+        if not history:
+            return False
+        clean = _clean_text(question).casefold()
+        if any(re.search(pattern, clean, re.I) for pattern in cls._FOLLOW_UP_PATTERNS):
+            return True
+        # Very short reference-only questions are also follow-ups, but clear
+        # standalone module/topic names are deliberately excluded.
+        tokens = _tokenize(clean)
+        standalone_topics = {
+            "policy", "policies", "documents", "attendance", "overtime",
+            "onboarding", "benefits", "announcements", "faq", "reports",
+        }
+        return (
+            0 < len(tokens) <= 4
+            and not standalone_topics.intersection(tokens)
+            and bool(re.search(r"\b(it|that|those|this|these|them|same)\b", clean))
+        )
+
+    @staticmethod
+    def _last_user_question(history: list[dict] | None) -> str | None:
+        for message in reversed(history or []):
+            if message.get("role") != "user":
+                continue
+            value = _clean_text(str(message.get("content", "")))
+            if value:
+                return value
+        return None
+
+    @classmethod
+    def _contextual_search_query(
+        cls,
+        question: str,
+        history: list[dict] | None,
+    ) -> str:
+        if not cls._is_follow_up_question(question, history):
+            return question
+        previous = cls._last_user_question(history)
+        return f"{previous} {question}".strip() if previous else question
+
+    @classmethod
+    def _scope_terms(cls, value: str) -> set[str]:
+        terms: set[str] = set()
+        for token in _tokenize(value):
+            if token in cls._SCOPE_STOPWORDS or len(token) <= 2:
+                continue
+            stem = token
+            for suffix in ("ingly", "edly", "ing", "ed", "es", "s"):
+                if stem.endswith(suffix) and len(stem) - len(suffix) >= 4:
+                    stem = stem[:-len(suffix)]
+                    break
+            terms.add(stem)
+        return terms
+
+    @classmethod
+    def _retrieval_has_lexical_support(
+        cls,
+        query: str,
+        retrieved: list[RetrievedDocument],
+    ) -> bool:
+        query_terms = cls._scope_terms(query)
+        if not query_terms:
+            return False
+        for item in retrieved:
+            document_terms = cls._scope_terms(
+                f"{item.document.title} {item.document.text}"
+            )
+            if query_terms.intersection(document_terms):
+                return True
+        return False
+
+    @staticmethod
+    def _contains_scope_term(value: str, term: str) -> bool:
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])",
+                value,
+                re.I,
+            )
+        )
+
+    @classmethod
+    def _is_out_of_scope_question(
+        cls,
+        *,
+        question: str,
+        history: list[dict] | None,
+        deterministic_intent: str,
+        retrieved: list[RetrievedDocument],
+    ) -> bool:
+        # Recognized HR/application routes are already inside the product scope.
+        if deterministic_intent not in {"policy_fallback", "not_found"}:
+            return False
+        if cls._is_follow_up_question(question, history):
+            return False
+        if cls._is_yes_no_question(question):
+            # A yes/no workplace rule may be phrased without an explicit HR
+            # keyword; allow retrieval/prompt grounding to decide it safely.
+            return False
+
+        normalized = _clean_text(question).casefold()
+        has_strong_scope = any(
+            cls._contains_scope_term(normalized, term)
+            for term in cls._STRONG_IN_SCOPE_TERMS
+        )
+        has_external = any(
+            cls._contains_scope_term(normalized, term)
+            for term in cls._OBVIOUS_EXTERNAL_TERMS
+        )
+        if has_external and not has_strong_scope:
+            return True
+        if any(
+            cls._contains_scope_term(normalized, term)
+            for term in cls._IN_SCOPE_TERMS
+        ):
+            return False
+        if cls._retrieval_has_lexical_support(question, retrieved):
+            return False
+
+        # Unknown wording with no authorized HR/company support is kept away
+        # from the general-purpose knowledge of the local model.
+        return True
+
+    @staticmethod
+    def _normalize_standard_answer(answer: str) -> str:
+        """Remove an accidental binary prefix from non-binary answers.
+
+        Local models occasionally start an ordinary Who/What/Show/List answer
+        with ``YES.`` or ``NO.`` even when the question is not binary. Keep the
+        useful grounded remainder but never present that misleading prefix.
+        """
+
+        clean = _clean_model_answer(answer)
+        match = re.match(
+            r"^\s*(?:\*\*)?(?:yes|no)\s*[.!,:;-]\s*(?:\*\*)?\s*(.+)$",
+            clean,
+            re.I | re.S,
+        )
+        if match:
+            clean = match.group(1).strip()
+        return _organize_answer(clean)
+
+    @staticmethod
+    def _normalize_yes_no_answer(answer: str) -> str:
+        clean = _clean_model_answer(answer)
+        if not clean:
+            return UNDETERMINED_ANSWER
+        if clean.casefold().startswith(UNDETERMINED_ANSWER.casefold()):
+            return UNDETERMINED_ANSWER
+        if clean.casefold().startswith(NOT_FOUND_ANSWER.casefold()):
+            return UNDETERMINED_ANSWER
+        match = re.match(
+            r"^\s*(?:\*\*)?(yes|no)\s*[.!,:;-]?\s*(?:\*\*)?\s*(.*)$",
+            clean,
+            re.I | re.S,
+        )
+        if not match:
+            # Do not infer a binary conclusion from prose. If the model did not
+            # provide a grounded YES/NO, fail closed instead of guessing.
+            return UNDETERMINED_ANSWER
+        prefix = f"**{match.group(1).upper()}.**"
+        remainder = match.group(2).strip()
+        return f"{prefix} {remainder}".strip()
+
     def __init__(self, session: Session) -> None:
         self.session = session
         self.settings = get_chat_assistant_settings()
         self.retriever = HybridRetriever()
         self.ollama = OllamaClient()
+
+
+    def preflight_connection_issue(
+        self,
+        *,
+        role_scope: str,
+    ):
+        """Return a safe Ollama warning without blocking deterministic HR answers."""
+
+        if not self.settings.enabled:
+            return None
+        try:
+            self.ollama.check_available()
+            return None
+        except RuntimeServiceUnavailableError as exc:
+            issue = classify_runtime_connection_issue(exc, service_hint="ollama")
+            if issue is None:
+                raise
+            log_runtime_connection_issue(
+                exc,
+                issue,
+                context=f"chat_preflight:{role_scope}",
+            )
+            return issue
 
     def _history_text(self, history: list[dict] | None) -> str:
         lines = []
@@ -933,7 +1339,16 @@ class SmartPortalAssistant:
         if deterministic_response.intent in self._NEVER_ENHANCE_INTENTS:
             return deterministic_response
 
-        if deterministic_response.intent in self._DIRECT_LIVE_INTENTS:
+        is_yes_no = self._is_yes_no_question(question)
+        is_follow_up = self._is_follow_up_question(question, history)
+
+        # Exact live answers stay deterministic unless the user explicitly
+        # asked a binary question or an incomplete follow-up needs resolution.
+        if (
+            deterministic_response.intent in self._DIRECT_LIVE_INTENTS
+            and not is_yes_no
+            and not is_follow_up
+        ):
             return HRAssistantResponse(
                 answer=_organize_answer(deterministic_response.answer),
                 intent=deterministic_response.intent,
@@ -953,6 +1368,8 @@ class SmartPortalAssistant:
         needs_ai = (
             deterministic_response.intent in self._RAG_INTENTS
             or asks_for_explanation
+            or is_yes_no
+            or is_follow_up
             or len(question_tokens) >= int(self.settings.min_question_tokens)
         )
         if not needs_ai:
@@ -967,7 +1384,22 @@ class SmartPortalAssistant:
             current_user=current_user,
             role_scope=role_scope,
         )
-        retrieved = self.retriever.search(question, documents)
+        retrieval_query = self._contextual_search_query(question, history)
+        retrieved = self.retriever.search(retrieval_query, documents)
+
+        if self._is_out_of_scope_question(
+            question=question,
+            history=history,
+            deterministic_intent=deterministic_response.intent,
+            retrieved=retrieved,
+        ):
+            return HRAssistantResponse(
+                answer=OUT_OF_SCOPE_ANSWER,
+                intent="out_of_scope",
+                actions=[],
+                sources=[],
+            )
+
         context = "\n\n".join(
             f"[{index}] {item.document.title}\n{item.document.text}"
             for index, item in enumerate(retrieved, start=1)
@@ -984,21 +1416,62 @@ class SmartPortalAssistant:
             question=question,
             router_answer=deterministic_response.answer,
             context=context,
+            question_mode="yes_no" if is_yes_no else "standard",
+            follow_up=is_follow_up,
+            current_datetime_text=datetime.now(
+                ZoneInfo(get_settings().display_timezone)
+            ).strftime("%Y/%m/%d %I:%M %p %Z"),
         )
         use_quality_model = asks_for_explanation and (
             len(question_tokens) >= int(self.settings.quality_min_question_tokens)
             or len(retrieved) >= int(self.settings.quality_min_retrieved_documents)
         )
-        generated = self.ollama.generate(prompt, quality=use_quality_model)
-        if not generated:
+        try:
+            generated = self.ollama.generate(prompt, quality=use_quality_model)
+        except RuntimeServiceUnavailableError as exc:
+            issue = classify_runtime_connection_issue(exc, service_hint="ollama")
+            if issue is None:
+                raise
+            log_runtime_connection_issue(
+                exc,
+                issue,
+                context=f"chat_enhancement:{role_scope}",
+            )
+            fallback_answer = (
+                UNDETERMINED_ANSWER
+                if is_yes_no
+                else _organize_answer(deterministic_response.answer)
+            )
             return HRAssistantResponse(
-                answer=_organize_answer(deterministic_response.answer),
+                answer=fallback_answer,
                 intent=deterministic_response.intent,
                 actions=deterministic_response.actions,
                 sources=deterministic_response.sources,
+                report=deterministic_response.report,
+                runtime_warning=issue.message,
+                runtime_warning_title=issue.title,
+                runtime_warning_code=issue.code,
             )
+        if not generated:
+            fallback_answer = (
+                UNDETERMINED_ANSWER
+                if is_yes_no
+                else _organize_answer(deterministic_response.answer)
+            )
+            return HRAssistantResponse(
+                answer=fallback_answer,
+                intent=deterministic_response.intent,
+                actions=deterministic_response.actions,
+                sources=deterministic_response.sources,
+                report=deterministic_response.report,
+            )
+        final_answer = (
+            self._normalize_yes_no_answer(generated)
+            if is_yes_no
+            else self._normalize_standard_answer(generated)
+        )
         return HRAssistantResponse(
-            answer=_organize_answer(generated),
+            answer=final_answer,
             intent=deterministic_response.intent,
             actions=deterministic_response.actions,
             sources=deterministic_response.sources,

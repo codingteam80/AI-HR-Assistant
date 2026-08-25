@@ -178,6 +178,15 @@ def _render_overtime_request(
                     employee_id=current_user.employee_id,
                     date_rendered=rendered_date,
                 )
+                overtime_rules = overtime_service.rule_snapshot(
+                    current_user.company_id
+                )
+                shifting_eligible, employee_position = (
+                    overtime_service.shifting_eligibility(
+                        company_id=current_user.company_id,
+                        employee_id=current_user.employee_id,
+                    )
+                )
 
             st.markdown("**DTR Reference — read-only**")
             reference_columns = st.columns(4)
@@ -323,6 +332,33 @@ def _render_overtime_request(
                 ("No", "Yes"),
                 key=f"employee_ot_dinner_{rendered_date}",
             )
+            payable_preview = OvertimeService.payable_hours_before_shifting(
+                Decimal(str(estimated_hours)),
+                dinner_break_flag=dinner_break == "Yes",
+                dinner_break_deduction_hours=(
+                    overtime_rules.dinner_break_deduction_hours
+                ),
+            )
+            st.caption(
+                f"Payable OT before Shifting Credit pairing: "
+                f"{payable_preview:.2f} hour(s). "
+                + (
+                    f"Dinner Break deducts "
+                    f"{overtime_rules.dinner_break_deduction_hours:.2f} hour(s). "
+                    if dinner_break == "Yes"
+                    else ""
+                )
+                + (
+                    "This position is eligible for Shifting Credits."
+                    if shifting_eligible and overtime_rules.shifting_credits_enabled
+                    else (
+                        f"Position {employee_position or '—'} is excluded from "
+                        "Shifting Credits."
+                        if overtime_rules.shifting_credits_enabled
+                        else "Shifting Credits are currently disabled."
+                    )
+                )
+            )
             st.text_input(
                 "Status",
                 value="Pending Approval",
@@ -396,7 +432,10 @@ def _render_overtime_request(
                         f"{_local_overtime_time(item.ot_time_start, local_timezone)}–"
                         f"{_local_overtime_time(item.ot_time_end, local_timezone)}"
                     ),
-                    "Hours": f"{Decimal(item.estimated_hours):.2f}",
+                    "Gross Hours": f"{Decimal(item.estimated_hours):.2f}",
+                    "Payable OT": f"{Decimal(item.payable_hours):.2f}",
+                    "Shifting Credit": f"{Decimal(item.shifting_credit_hours):.2f}",
+                    "Additional VL": f"{Decimal(item.additional_vl_days):.2f}",
                     "OT Type": item.ot_type,
                     "Status": item.status.replace("_", " ").title(),
                     "DTR Review": "Mismatch" if item.has_dtr_mismatch else "Matched",
@@ -433,6 +472,11 @@ def _render_overtime_request(
                 f"{_local_overtime_time(selected_request.ot_time_start, local_timezone)}–"
                 f"{_local_overtime_time(selected_request.ot_time_end, local_timezone)} · "
                 f"{Decimal(selected_request.estimated_hours):.2f} hour(s)"
+            )
+            st.caption(
+                f"Payable OT: {Decimal(selected_request.payable_hours):.2f} hour(s) · "
+                f"Shifting Credit: {Decimal(selected_request.shifting_credit_hours):.2f} hour(s) · "
+                f"Additional VL: {Decimal(selected_request.additional_vl_days):.2f} day(s)"
             )
             st.caption(
                 f"Travel Fare: {selected_request.travel_fare or '—'} · "

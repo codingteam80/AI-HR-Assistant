@@ -12,6 +12,7 @@ from config.settings import get_settings
 from database.session import SessionFactory
 from models.department import Department
 from modules.reports.combined_hr_report import build_combined_hr_excel
+from modules.reports.disciplinary_report import build_disciplinary_records_excel
 from modules.reports.leave_conversion_report import (
     build_leave_conversion_excel,
     build_leave_conversion_rows,
@@ -22,9 +23,12 @@ from repositories.leave_repository import (
     LeaveRequestRepository,
 )
 from services.leave_service import LeaveService
+from services.admin_management_service import AdminManagementService
+from services.disciplinary_record_service import DisciplinaryRecordService, CASE_STATUSES
 from services.attendance_service import AttendanceService
 from services.overtime_service import OvertimeService
 from ui.components.live_search import live_search_input
+from ui.components.persistent_tabs import persistent_tabs
 
 
 def _selected_employee_ids(
@@ -300,14 +304,131 @@ def _render_leave_conversion_report(
     )
 
 
+
+def _render_disciplinary_report(current_user: AuthenticatedUser) -> None:
+    """Review/export confidential company disciplinary cases."""
+
+    st.markdown("## Violation / Disciplinary Records Report")
+    st.caption(
+        "Admin-only company report. Suggested actions are derived live from the "
+        "Policies → Violations & Disciplinary Actions master list."
+    )
+    today = date.today()
+    period = st.date_input(
+        "Incident Period",
+        value=(today.replace(day=1), today),
+        key="disciplinary_report_period",
+    )
+    if not isinstance(period, (tuple, list)) or len(period) != 2:
+        st.info("Select both the report start date and end date.")
+        return
+    start_date, end_date = period
+    if end_date < start_date:
+        st.error("The report end date cannot be earlier than the start date.")
+        return
+
+    with SessionFactory() as session:
+        admin_service = AdminManagementService(session)
+        employees = admin_service.list_employees(current_user.company_id)
+        users = admin_service.list_users(current_user.company_id)
+        user_labels = {
+            user.id: (user.employee.full_name if user.employee is not None else user.username)
+            for user in users
+        }
+        service = DisciplinaryRecordService(session)
+        records = service.list_admin_records(
+            company_id=current_user.company_id,
+            requester_user_id=current_user.user_id,
+        )
+
+        employee_options = {
+            "All Employees": None,
+            **{f"{item.employee_number} · {item.full_name}": item.id for item in employees},
+        }
+        filters = st.columns(2)
+        with filters[0]:
+            employee_label = st.selectbox(
+                "Employee",
+                list(employee_options),
+                key="disciplinary_report_employee",
+            )
+        with filters[1]:
+            status_filter = st.selectbox(
+                "Case Status",
+                ["All", *CASE_STATUSES],
+                key="disciplinary_report_status",
+            )
+
+        employee_id = employee_options[employee_label]
+        filtered = [
+            item for item in records
+            if start_date <= item.incident_date <= end_date
+            and (employee_id is None or item.employee_id == employee_id)
+            and (status_filter == "All" or item.case_status == status_filter)
+        ]
+        rows = []
+        for item in filtered:
+            rows.append({
+                "Case ID": item.public_id,
+                "Employee": f"{item.employee_number} — {item.employee_name}",
+                "Violation": f"{item.violation_code} — {item.violation_title}",
+                "Incident Date": item.incident_date.isoformat(),
+                "Incident / Case Description": item.incident_description,
+                "Evidence / Remarks": item.evidence_remarks or "",
+                "Project / Team / Department": item.context_snapshot or "",
+                "Previous Offense Count": item.previous_offense_count,
+                "Current Offense": item.offense_level,
+                "Suggested Disciplinary Action": service.suggested_action_for_record(item),
+                "Actual Action Taken": item.actual_action_taken or "",
+                "Issued By": user_labels.get(item.issued_by_user_id, ""),
+                "Reviewed / Approved By": user_labels.get(item.reviewed_approved_by_user_id, ""),
+                "Date Issued": item.date_issued.isoformat() if item.date_issued else "",
+                "Employee Acknowledgment": item.employee_acknowledgment,
+                "Case Status": item.case_status,
+                "Notes": item.notes or "",
+            })
+
+    metrics = st.columns(3)
+    metrics[0].metric("Cases", len(rows))
+    metrics[1].metric("Issued", sum(1 for item in filtered if item.case_status == "Issued"))
+    metrics[2].metric("Closed", sum(1 for item in filtered if item.case_status == "Closed"))
+
+    if rows:
+        from ui.components.data_table import render_admin_table
+        render_admin_table(
+            rows,
+            key="disciplinary_records_report_table",
+            min_width=3400,
+            compact=True,
+            max_height=470,
+        )
+    else:
+        st.info("No disciplinary cases match the selected report filters.")
+
+    workbook = build_disciplinary_records_excel(rows)
+    st.download_button(
+        "Download Disciplinary Records Excel",
+        data=workbook,
+        file_name=(
+            f"disciplinary_records_{start_date.isoformat()}_to_{end_date.isoformat()}.xlsx"
+        ),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        width="stretch",
+        disabled=not rows,
+    )
+
 def render_admin_reports_page(current_user: AuthenticatedUser) -> None:
     """Render stateful report workspaces without duplicating sidebar pages."""
 
     st.title("Reports")
-    combined_tab, conversion_tab = st.tabs(
-        ("Combined HR Report", "Leave Conversion to Cash"),
+    combined_tab, conversion_tab, disciplinary_tab = persistent_tabs(
+        (
+            "Combined HR Report",
+            "Leave Conversion to Cash",
+            "Disciplinary Records",
+        ),
         key="admin_reports_active_tab",
-        on_change="rerun",
     )
     if combined_tab.open:
         with combined_tab:
@@ -315,3 +436,6 @@ def render_admin_reports_page(current_user: AuthenticatedUser) -> None:
     elif conversion_tab.open:
         with conversion_tab:
             _render_leave_conversion_report(current_user)
+    elif disciplinary_tab.open:
+        with disciplinary_tab:
+            _render_disciplinary_report(current_user)

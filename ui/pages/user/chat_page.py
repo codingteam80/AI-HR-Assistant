@@ -4,9 +4,18 @@ import streamlit as st
 
 from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
-from modules.hr_assistant.hr_assistant import HRAssistant
+from modules.hr_assistant.hr_assistant import HRAssistant, HRAssistantResponse
 from modules.smart_ai.portal_ai import SmartPortalAssistant
+from services.runtime_connection_service import (
+    classify_runtime_connection_issue,
+    log_runtime_connection_issue,
+)
 from ui.components.quick_actions import render_quick_actions
+from ui.components.chat_assistant_report import (
+    current_assistant_timestamp,
+    render_assistant_timestamp,
+    render_chat_report,
+)
 from ui.module_view_navigation import (
     EXACT_VIEW_QUERY_KEYS,
     prime_exact_module_view,
@@ -215,9 +224,20 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
                 with st.chat_message(role):
                     # Stable wrapper for Light Mode contrast and Markdown lists.
                     with st.container(key=message_key):
+                        if role == "assistant" and message.get("runtime_warning"):
+                            warning_title = str(message.get("runtime_warning_title") or "Service warning")
+                            st.warning(
+                                f"**{warning_title}**\n\n{message['runtime_warning']}"
+                            )
                         st.markdown(
                             str(message.get("content", ""))
                         )
+
+                        if role == "assistant":
+                            render_chat_report(
+                                message.get("report"),
+                                key_prefix=f"{message_key}_report",
+                            )
 
                         if message.get("sources"):
                             st.markdown(
@@ -231,6 +251,9 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
                             message_index=message_index,
                             actions=message.get("actions", []),
                         )
+
+                        if role == "assistant":
+                            render_assistant_timestamp(message.get("timestamp"))
 
         question = st.chat_input(
             "Ask an HR question, e.g. 'Ilan na lang VL ko?'",
@@ -261,24 +284,61 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
                     with st.spinner(
                         "Searching your authorized HR records and company information…"
                     ):
-                        with SessionFactory() as session:
-                            response = HRAssistant(session).answer(
-                                current_user=current_user,
-                                question=question,
-                                history=previous_history,
+                        try:
+                            with SessionFactory() as session:
+                                response = HRAssistant(session).answer(
+                                    current_user=current_user,
+                                    question=question,
+                                    history=previous_history,
+                                )
+                                smart_assistant = SmartPortalAssistant(session)
+                                preflight_issue = smart_assistant.preflight_connection_issue(
+                                    role_scope="employee",
+                                )
+                                if preflight_issue is None:
+                                    response = smart_assistant.enhance(
+                                        current_user=current_user,
+                                        role_scope="employee",
+                                        question=question,
+                                        history=previous_history,
+                                        deterministic_response=response,
+                                    )
+                                else:
+                                    response.runtime_warning = preflight_issue.message
+                                    response.runtime_warning_title = preflight_issue.title
+                                    response.runtime_warning_code = preflight_issue.code
+                        except Exception as exc:
+                            issue = classify_runtime_connection_issue(exc)
+                            if issue is None:
+                                raise
+                            log_runtime_connection_issue(
+                                exc, issue, context="employee_chat_request"
                             )
-                            response = SmartPortalAssistant(session).enhance(
-                                current_user=current_user,
-                                role_scope="employee",
-                                question=question,
-                                history=previous_history,
-                                deterministic_response=response,
+                            response = HRAssistantResponse(
+                                answer=(
+                                    "I could not complete that HR request while the "
+                                    "required connection is unavailable."
+                                ),
+                                intent="runtime_connection_error",
+                                runtime_warning=issue.message,
+                                runtime_warning_title=issue.title,
+                                runtime_warning_code=issue.code,
                             )
+
+            if response.runtime_warning:
+                st.toast(
+                    f"{response.runtime_warning_title or 'Service warning'}: "
+                    f"{response.runtime_warning}",
+                    icon="⚠️",
+                )
 
             messages.append(
                 {
                     "role": "assistant",
                     "content": response.answer,
+                    "runtime_warning": response.runtime_warning,
+                    "runtime_warning_title": response.runtime_warning_title,
+                    "runtime_warning_code": response.runtime_warning_code,
                     "sources": _source_lines(response.sources),
                     "actions": [
                         {
@@ -290,6 +350,8 @@ def render_chat_page(current_user: AuthenticatedUser) -> None:
                         for action in response.actions
                     ],
                     "intent": response.intent,
+                    "report": response.report,
+                    "timestamp": current_assistant_timestamp(),
                 }
             )
             st.rerun()

@@ -11,6 +11,10 @@ import re
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
+from ui.components.employee_profile_photo import render_profile_photo_manager
+from ui.components.disciplinary_records import render_admin_disciplinary_records
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -736,10 +740,15 @@ def _render_bulk_employee_upload(current_user: AuthenticatedUser) -> None:
     with st.expander("Upload Employees via Excel", expanded=False):
         st.caption(
             "Download the exact template, enter employee information, then "
-            "validate the file. User ID is generated after saving; Clearance, "
-            "User Name, and Temporary Password remain editable in the preview."
+            "validate the file. Hover Excel column headers to see field guidance "
+            "and complete valid selections; closed choices also have dropdowns. "
+            "User ID is generated after saving; Clearance, User Name, and "
+            "Temporary Password remain editable in the preview."
         )
-        template_data = EmployeeBulkImportService.build_template()
+        with SessionFactory() as session:
+            template_data = EmployeeBulkImportService(session).build_company_template(
+                company_id=current_user.company_id
+            )
         st.download_button(
             "Download Employee Excel Template",
             data=template_data,
@@ -1153,8 +1162,8 @@ def _render_delete_employee(
         expanded=False,
     ):
         st.warning(
-            "Permanent deletion removes the employee profile, training "
-            "records, and linked login account. This action cannot be "
+            "Permanent deletion removes the employee profile, profile photo, "
+            "training records, and linked login account. This action cannot be "
             "undone. Department records are preserved."
         )
 
@@ -1170,13 +1179,16 @@ def _render_delete_employee(
             f"{employee_number} — {full_name}"
         )
 
+        delete_confirmation_key = f"employee_delete_acknowledged_{employee_id}"
+        invalidate_confirmation_on_change(
+            confirmation_key=delete_confirmation_key,
+            dependencies={"employee_id": employee_id},
+            tracker_key="__employee_permanent_delete_target_confirmation",
+        )
         acknowledged = st.checkbox(
             "I understand that this permanently deletes the selected "
             "employee record and linked login account.",
-            key=(
-                "employee_delete_acknowledged_"
-                f"{employee_id}"
-            ),
+            key=delete_confirmation_key,
         )
 
         delete_submitted = st.button(
@@ -1294,6 +1306,16 @@ def _render_edit_employee(
             "manager_name": selected.manager.full_name if selected.manager else None,
             "leader_name": selected.leader.full_name if selected.leader else None,
         }
+
+    with st.expander("Profile Photo", expanded=False):
+        render_profile_photo_manager(
+            current_user=current_user,
+            employee_id=selected_id,
+            employee_display_name=selected.full_name,
+            employee_number=selected.employee_number,
+            key_prefix=f"admin_employee_{selected_id}",
+            admin_mode=True,
+        )
 
     manager_people = _manager_options(
         employees, exclude_employee_id=selected_id
@@ -1900,9 +1922,15 @@ def _render_employee_archive(
             key="employee_archive_restore_selection",
         )
         selected_id = options[selected_label]
+        restore_confirmation_key = f"employee_archive_restore_confirm_{selected_id}"
+        invalidate_confirmation_on_change(
+            confirmation_key=restore_confirmation_key,
+            dependencies={"archived_employee_id": selected_id},
+            tracker_key="__employee_restore_target_confirmation",
+        )
         confirmed = st.checkbox(
             "Restore this employee as Employed and reactivate the linked login account.",
-            key=f"employee_archive_restore_confirm_{selected_id}",
+            key=restore_confirmation_key,
         )
         restore_clicked = st.button(
             "Restore Employee Record",
@@ -1963,6 +1991,7 @@ def render_employees_page(
         "Employee List",
         "Add Employee",
         "Edit Employee",
+        "Violations / Disciplinary Records",
         "Onboarding Management",
         "History",
         f"Archive ({len(archived_employees)})",
@@ -1973,20 +2002,21 @@ def render_employees_page(
         list_tab,
         add_tab,
         edit_tab,
+        disciplinary_tab,
         onboarding_tab,
         history_tab,
         archive_tab,
-    ) = st.tabs(
+    ) = persistent_tabs(
         [
             "Employee List",
             "Add Employee",
             "Edit Employee",
+            "Violations / Disciplinary Records",
             "Onboarding Management",
             "History",
             f"Archive ({len(archived_employees)})",
         ],
         key="employees_active_tab",
-        on_change="rerun",
     )
 
     with list_tab:
@@ -2003,6 +2033,9 @@ def render_employees_page(
             current_user,
             employees,
         )
+
+    with disciplinary_tab:
+        render_admin_disciplinary_records(current_user)
 
     with onboarding_tab:
         render_onboarding_management(current_user)

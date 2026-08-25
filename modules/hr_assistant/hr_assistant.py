@@ -20,8 +20,12 @@ from authentication.current_user import AuthenticatedUser
 from models.leave_type import LeaveType
 from modules.policy_qa.policy_assistant import PolicyAssistant
 from repositories.employee_repository import EmployeeRepository
+from services.employee_hierarchy_service import EmployeeHierarchyService
 from services.leave_service import LeaveService
+from services.chat_report_service import ChatReportService
+from services.disciplinary_record_service import DisciplinaryRecordService
 from services.policy_service import PolicySource
+from services.policy_violation_service import PolicyViolationService
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +46,10 @@ class HRAssistantResponse:
     intent: str
     actions: list[HRAssistantAction] = field(default_factory=list)
     sources: list[PolicySource] = field(default_factory=list)
+    report: dict[str, object] | None = None
+    runtime_warning: str | None = None
+    runtime_warning_title: str | None = None
+    runtime_warning_code: str | None = None
 
 
 class HRAssistant:
@@ -81,7 +89,13 @@ class HRAssistant:
     }
 
     _FOLLOW_UP_MARKERS = {
+        "about it",
         "about that",
+        "and el",
+        "and sl",
+        "and vl",
+        "approve it",
+        "approves it",
         "how about",
         "how many left",
         "ilan nalang",
@@ -89,8 +103,13 @@ class HRAssistant:
         "ito",
         "naman",
         "paano naman",
-        "that",
+        "that request",
+        "the same request",
+        "this request",
         "what about",
+        "what happens next",
+        "who approves",
+        "who needs to approve",
         "yun",
     }
 
@@ -124,6 +143,8 @@ class HRAssistant:
         "history",
         "pending",
         "rejected",
+        "latest leave request",
+        "leave request status",
         "request history",
         "request status",
         "requests ko",
@@ -140,13 +161,25 @@ class HRAssistant:
         "procedure",
         "rule",
         "rules",
+        "violation",
+        "violations",
+        "offense",
+        "offenses",
+        "penalty",
+        "penalties",
+        "disciplinary",
+        "sanction",
+        "sanctions",
     }
 
     def __init__(self, session: Session) -> None:
         self.session = session
         self.leave_service = LeaveService(session)
         self.employee_repository = EmployeeRepository(session)
+        self.employee_hierarchy_service = EmployeeHierarchyService(session)
         self.policy_assistant = PolicyAssistant(session)
+        self.violation_service = PolicyViolationService(session)
+        self.disciplinary_service = DisciplinaryRecordService(session)
 
     @classmethod
     def normalize_query(cls, value: str) -> str:
@@ -249,6 +282,107 @@ class HRAssistant:
         )
 
     @classmethod
+    def looks_like_employee_hierarchy_query(cls, value: str) -> bool:
+        """Recognize varied English/Tagalog member and supervisor questions.
+
+        The actual role is never inferred here.  This method only routes the
+        question to the hierarchy handler; Manager/Leader status is determined
+        later from live ``manager_id`` / ``leader_id`` assignments.
+        """
+
+        query = cls.normalize_query(value)
+        if not query:
+            return False
+
+        direct_phrases = {
+            "my member",
+            "my members",
+            "member ko",
+            "members ko",
+            "member ni",
+            "members ni",
+            "member niya",
+            "members niya",
+            "member nya",
+            "members nya",
+            "members of",
+            "member of",
+            "team member",
+            "team members",
+            "direct report",
+            "direct reports",
+            "reports to me",
+            "who reports to",
+            "who reports",
+            "has a member",
+            "has member",
+            "has members",
+            "have a member",
+            "have member",
+            "have members",
+            "may member",
+            "may members",
+            "may mga member",
+            "sino member",
+            "sino ang member",
+            "sino members",
+            "sino ang members",
+            "who is under",
+            "who are under",
+            "who works under",
+            "under me",
+            "under him",
+            "under her",
+            "under them",
+            "hawak kong member",
+            "hawak niyang member",
+            "hawak nyang member",
+            "leader or manager",
+            "leader o manager",
+            "manager or leader",
+            "manager o leader",
+            "my manager",
+            "my leader",
+            "manager ko",
+            "leader ko",
+            "manager niya",
+            "leader niya",
+            "manager nya",
+            "leader nya",
+            "manager ni",
+            "leader ni",
+            "manager of",
+            "leader of",
+            "reports to whom",
+            "who manages",
+            "who leads",
+            "hierarchy role",
+            "supervisory role",
+            "am i a leader",
+            "am i a manager",
+            "leader ba",
+            "manager ba",
+        }
+        if any(phrase in query for phrase in direct_phrases):
+            return True
+
+        patterns = (
+            r"\bmembers?\s+(?:of|ni|ng|kay)\b",
+            r"\bmay\s+(?:mga\s+)?members?\b",
+            r"\b(?:who|sino)\s+(?:is|are|ang|mga)?\s*(?:under|members?)\b",
+            r"\b(?:team|members?|direct reports?|subordinates?)\s+(?:handled|managed|led)\s+by\b",
+            r"\b(?:handle|handles|handling|hawak)\b.*\b(?:team|members?|people|employees?)\b",
+            r"\b(?:manage|manages|managing|lead|leads|leading)\b.*\b(?:team|members?|people|employees?)\b",
+            r"\b(?:is|si)\b.*\b(?:a\s+)?(?:leader|manager)\b",
+            r"\b(?:leader|manager)\b.*\b(?:ba|role|members?|team)\b",
+            r"\b(?:who|sino)\b.*\b(?:manager|leader)\b",
+            r"\b(?:manager|leader)\s+(?:of|ni|ng|kay)\b",
+            r"\b(?:who|sino)\b.*\b(?:manages|leads|manager\s+of|leader\s+of)\b",
+            r"\b(?:reports?\s+to|nag\s*rereport\s+kay|nagre-report\s+kay)\b",
+        )
+        return any(re.search(pattern, query) for pattern in patterns)
+
+    @classmethod
     def _has_leave_context(
         cls,
         value: str,
@@ -288,6 +422,21 @@ class HRAssistant:
             },
         ):
             return "help"
+
+        if (
+            leave_context
+            and cls._contains_any(
+                query,
+                {
+                    "carry over",
+                    "carryover",
+                    "carried over",
+                    "roll over",
+                    "rollover",
+                },
+            )
+        ):
+            return "leave_carryover"
 
         if (
             leave_context
@@ -335,6 +484,9 @@ class HRAssistant:
         ):
             return "leave_type_details"
 
+        if cls.looks_like_employee_hierarchy_query(query):
+            return "employee_hierarchy"
+
         if cls._contains_any(
             query,
             {
@@ -342,6 +494,9 @@ class HRAssistant:
                 "manager ko",
                 "my department",
                 "department ko",
+                "my profile",
+                "my employee info",
+                "my employee information",
                 "employee number",
                 "job title",
                 "hire date",
@@ -463,7 +618,7 @@ class HRAssistant:
             return False
 
         return any(
-            marker in current
+            re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", current)
             for marker in cls._FOLLOW_UP_MARKERS
         )
 
@@ -479,18 +634,28 @@ class HRAssistant:
             question
         )
 
-        # A complete recognizable topic always starts a new topic.
+        standalone_intent = cls._classify_normalized_query(current)
+        explicit_follow_up = cls._is_explicit_follow_up(current)
+
+        # A complete recognizable topic normally starts fresh. Safe exceptions
+        # are intentionally incomplete follow-ups such as "How about SL?" or
+        # "What about the second offense?". Policy follow-ups inherit context
+        # only when the previous assistant topic was also policy/violation.
+        policy_follow_up = (
+            standalone_intent == "policy"
+            and explicit_follow_up
+        )
         if (
-            cls._classify_normalized_query(
-                current
+            standalone_intent != "policy_fallback"
+            and not (
+                standalone_intent == "leave_overview"
+                and explicit_follow_up
             )
-            != "policy_fallback"
+            and not policy_follow_up
         ):
             return current
 
-        if not cls._is_explicit_follow_up(
-            current
-        ):
+        if not explicit_follow_up:
             return current
 
         previous_questions = (
@@ -508,6 +673,13 @@ class HRAssistant:
             not previous_questions
             or previous_intent is None
         ):
+            return current
+
+        if policy_follow_up and previous_intent not in {
+            "policy",
+            "policy_fallback",
+            "policy_violation",
+        }:
             return current
 
         previous = cls.normalize_query(
@@ -534,7 +706,13 @@ class HRAssistant:
             )
         )
 
-        if standalone_intent != "policy_fallback":
+        if (
+            standalone_intent != "policy_fallback"
+            and not (
+                standalone_intent == "leave_overview"
+                and cls._is_explicit_follow_up(current)
+            )
+        ):
             return standalone_intent
 
         contextual = cls._contextual_query(
@@ -604,6 +782,29 @@ class HRAssistant:
             employee_id=current_user.employee_id,
         )
 
+    @staticmethod
+    def _leave_carryover_answer() -> HRAssistantResponse:
+        """Return the implemented annual SL/VL carry-over rule exactly."""
+
+        return HRAssistantResponse(
+            answer=(
+                "**YES.** Unused annual Sick Leave and Vacation Leave balances "
+                "can carry into the next leave-year ledger. Applicable year-end "
+                "Vacation Leave utilization/forfeiture and retained cash-conversion "
+                "rules are applied before the remaining balance becomes the next "
+                "year's beginning credit; other leave types are not part of this "
+                "annual SL/VL carry-over rule."
+            ),
+            intent="leave_carryover",
+            actions=[
+                HRAssistantAction(
+                    label="View Leave Credits",
+                    page="Leave Management",
+                    query_params={"leave_view": "credits"},
+                )
+            ],
+        )
+
     def _leave_overview_answer(
         self,
     ) -> HRAssistantResponse:
@@ -670,9 +871,12 @@ class HRAssistant:
             current_user.company_id,
             current_user.employee_id,
         )
-        selected_type = self._requested_leave_type(
-            contextual_query,
-            [balance.leave_type for balance in balances],
+        leave_types = [balance.leave_type for balance in balances]
+        # Prefer an explicit leave type in the current follow-up (e.g. SL in
+        # "How about SL?") before falling back to the combined history query.
+        selected_type = (
+            self._requested_leave_type(question, leave_types)
+            or self._requested_leave_type(contextual_query, leave_types)
         )
         vacation_combined = False
         if selected_type is not None:
@@ -906,12 +1110,25 @@ class HRAssistant:
                 else "You have not submitted a leave request yet."
             )
         else:
-            lines = [
-                "Narito ang latest leave requests mo:"
-                if tagalog
-                else "Here are your latest leave requests:"
-            ]
-            for request in requests[:5]:
+            normalized_question = self.normalize_query(question)
+            asks_latest = any(
+                term in normalized_question
+                for term in ("latest", "most recent", "pinakahuli")
+            )
+            selected_requests = requests[:1] if asks_latest else requests[:5]
+            if asks_latest:
+                lines = [
+                    "Ito ang latest leave request mo:"
+                    if tagalog
+                    else "Your latest leave request:"
+                ]
+            else:
+                lines = [
+                    "Narito ang latest leave requests mo:"
+                    if tagalog
+                    else "Here are your latest leave requests:"
+                ]
+            for request in selected_requests:
                 lines.append(
                     f"- **{request.public_id} — {request.leave_type.name}:** "
                     f"{request.start_date.isoformat()} to {request.end_date.isoformat()} | "
@@ -997,6 +1214,78 @@ class HRAssistant:
             ],
         )
 
+
+    def _employee_hierarchy_answer(
+        self,
+        *,
+        current_user: AuthenticatedUser,
+        question: str,
+    ) -> HRAssistantResponse:
+        """Describe only the signed-in employee's actual assignment hierarchy."""
+
+        employee = self._employee_record(current_user)
+        if employee is None:
+            return HRAssistantResponse(
+                answer="Your login account is not linked to an employee master record.",
+                intent="employee_hierarchy",
+            )
+
+        normalized = self.normalize_query(question)
+        own_number = self.normalize_query(employee.employee_number)
+        own_name = self.normalize_query(employee.full_name)
+        personal_markers = (
+            " my ", " me ", " i ", " ako ", " ko ", " akin ",
+        )
+        padded = f" {normalized} "
+        self_scoped = (
+            any(marker in padded for marker in personal_markers)
+            or (own_number and own_number in normalized)
+            or (own_name and own_name in normalized)
+        )
+        if not self_scoped:
+            return HRAssistantResponse(
+                answer=(
+                    "You can view only your own Manager/Leader relationships and "
+                    "members available to your signed-in employee assignment."
+                ),
+                intent="employee_hierarchy",
+            )
+
+        snapshot = self.employee_hierarchy_service.snapshot(
+            company_id=current_user.company_id,
+            employee_id=employee.id,
+        )
+        if snapshot is None:
+            return HRAssistantResponse(
+                answer="Your employee hierarchy record is no longer available.",
+                intent="employee_hierarchy",
+            )
+
+        lines = [
+            "Your current employee hierarchy is based on actual Manager/Leader selections in Employee Master:",
+            f"- **Hierarchy Role:** {snapshot.role_label}",
+            f"- **Your Manager:** {snapshot.manager.full_name if snapshot.manager else 'Not assigned'}",
+            f"- **Your Leader:** {snapshot.leader.full_name if snapshot.leader else 'Not assigned'}",
+            f"- **Manager Direct Reports:** {len(snapshot.manager_reports)}",
+            f"- **Leader Team Members:** {len(snapshot.leader_members)}",
+        ]
+        if snapshot.manager_reports:
+            lines.append("- **Assigned as Manager for:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}" for item in snapshot.manager_reports
+            ))
+        if snapshot.leader_members:
+            lines.append("- **Assigned as Leader for:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}" for item in snapshot.leader_members
+            ))
+        lines.append(
+            "- **Basis:** reverse Manager/Leader assignments, not job title. You may report to someone above you while also managing or leading employees below you."
+        )
+
+        return HRAssistantResponse(
+            answer="\n".join(lines),
+            intent="employee_hierarchy",
+        )
+
     def _employee_profile_answer(
         self,
         *,
@@ -1011,6 +1300,16 @@ class HRAssistant:
                 intent="employee_profile",
             )
 
+        snapshot = self.employee_hierarchy_service.snapshot(
+            company_id=current_user.company_id,
+            employee_id=employee.id,
+        )
+        if snapshot is None:
+            return HRAssistantResponse(
+                answer="Your employee record is no longer available.",
+                intent="employee_profile",
+            )
+
         lines = [
             "Your employee information:",
             f"- **Employee Number:** {employee.employee_number}",
@@ -1022,8 +1321,15 @@ class HRAssistant:
             ),
             (
                 f"- **Manager:** "
-                f"{employee.manager.full_name if employee.manager else 'Not assigned'}"
+                f"{snapshot.manager.full_name if snapshot.manager else 'Not assigned'}"
             ),
+            (
+                f"- **Leader:** "
+                f"{snapshot.leader.full_name if snapshot.leader else 'Not assigned'}"
+            ),
+            f"- **Hierarchy Role:** {snapshot.role_label}",
+            f"- **Manager Direct Reports:** {len(snapshot.manager_reports)}",
+            f"- **Leader Team Members:** {len(snapshot.leader_members)}",
             f"- **Work Email:** {employee.work_email or current_user.email}",
             f"- **Employment Status:** {employee.employment_status.title()}",
             (
@@ -1044,6 +1350,23 @@ class HRAssistant:
         intent: str = "policy",
     ) -> HRAssistantResponse | None:
         """Return an approved-policy answer when a relevant section exists."""
+
+        violation_answer = self.violation_service.answer_question(
+            company_id=current_user.company_id,
+            question=question,
+        )
+        if violation_answer is not None:
+            return HRAssistantResponse(
+                answer=violation_answer,
+                intent="policy_violation",
+                actions=[
+                    HRAssistantAction(
+                        label="Open Violations & Disciplinary Actions",
+                        page="Company Policies",
+                        query_params={"policy_view": "violations"},
+                    )
+                ],
+            )
 
         result = self.policy_assistant.answer(
             company_id=current_user.company_id,
@@ -1098,8 +1421,11 @@ class HRAssistant:
                 "and configured leave types\n"
                 "- Filing leave and where to open the request form\n"
                 "- Recent leave-request status\n"
-                "- Your employee number, department, manager, job title, and work email\n"
+                "- Your employee number, department, manager, leader, job title, and work email\n"
+                "- Your actual Manager/Leader member assignments and direct reports\n"
                 "- Approved company HR policies with sources\n"
+                "- Active company violations and disciplinary-action rules\n"
+                "- Your own issued disciplinary records, when Employee Portal visibility is enabled\n"
                 "- Attendance / DTR and Company Form/Documents workflows\n"
                 "- Navigation to Company Form/Documents, Onboarding Benefits, "
                 "HR Contacts, FAQ, and company announcements\n\n"
@@ -1121,6 +1447,19 @@ class HRAssistant:
         cleaned_question = (question or "").strip()
         if not cleaned_question:
             return HRAssistantResponse(answer="Please enter an HR question.", intent="empty")
+
+        report_result = ChatReportService(self.session).try_answer(
+            current_user=current_user,
+            role_scope="employee",
+            question=cleaned_question,
+            history=history,
+        )
+        if report_result is not None:
+            return HRAssistantResponse(
+                answer=report_result.answer,
+                intent="live_report",
+                report=report_result.report,
+            )
 
         intent = self.classify_intent(
             cleaned_question,
@@ -1145,8 +1484,31 @@ class HRAssistant:
 
         if intent == "help":
             return self._help_response()
+
+        disciplinary_answer = self.disciplinary_service.answer_employee_question(
+            company_id=current_user.company_id,
+            employee_id=current_user.employee_id,
+            requester_user_id=current_user.user_id,
+            question=cleaned_question,
+        )
+        if disciplinary_answer is not None:
+            return HRAssistantResponse(
+                answer=disciplinary_answer,
+                intent="disciplinary_records",
+                actions=[
+                    HRAssistantAction(
+                        label="Open My Disciplinary Records",
+                        page="Company Policies",
+                        query_params={"policy_view": "disciplinary"},
+                    )
+                ],
+            )
+
         if intent == "leave_overview":
             return self._leave_overview_answer()
+
+        if intent == "leave_carryover":
+            return self._leave_carryover_answer()
 
         if intent == "leave_balance":
             return self._leave_balance_answer(
@@ -1163,12 +1525,17 @@ class HRAssistant:
         if intent == "leave_request_status":
             return self._leave_request_status_answer(
                 current_user=current_user,
-                question=cleaned_question,
+                question=contextual_query,
             )
         if intent == "leave_type_details":
             return self._leave_type_details_answer(
                 current_user=current_user,
                 contextual_query=contextual_query,
+            )
+        if intent == "employee_hierarchy":
+            return self._employee_hierarchy_answer(
+                current_user=current_user,
+                question=cleaned_question,
             )
         if intent == "employee_profile":
             return self._employee_profile_answer(current_user=current_user)
@@ -1197,9 +1564,14 @@ class HRAssistant:
                     ],
                 )
 
+            policy_question = (
+                self._contextual_query(cleaned_question, history)
+                if self._is_explicit_follow_up(self.normalize_query(cleaned_question))
+                else cleaned_question
+            )
             policy = self._policy_response(
                 current_user=current_user,
-                question=cleaned_question,
+                question=policy_question,
             )
             if policy is not None:
                 return policy
@@ -1325,9 +1697,14 @@ class HRAssistant:
                 page="FAQ",
             )
 
+        fallback_question = (
+            self._contextual_query(cleaned_question, history)
+            if self._is_explicit_follow_up(self.normalize_query(cleaned_question))
+            else cleaned_question
+        )
         policy = self._policy_response(
             current_user=current_user,
-            question=cleaned_question,
+            question=fallback_question,
             intent="policy_fallback",
         )
         if policy is not None:

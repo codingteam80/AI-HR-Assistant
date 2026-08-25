@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
@@ -269,10 +270,9 @@ def render_employee_onboarding_page(current_user: AuthenticatedUser) -> None:
     if pending_tab in {"Overview", "Checklist", "Benefits"}:
         st.session_state["employee_onboarding_active_tab"] = pending_tab
 
-    overview_tab, checklist_tab, benefits_tab = st.tabs(
+    overview_tab, checklist_tab, benefits_tab = persistent_tabs(
         ["Overview", "Checklist", "Benefits"],
         key="employee_onboarding_active_tab",
-        on_change="rerun",
     )
     with overview_tab:
         _render_overview(employee, checklist)

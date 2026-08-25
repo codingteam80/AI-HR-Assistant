@@ -9,7 +9,7 @@ import streamlit as st
 from authentication.current_user import AuthenticatedUser
 from authentication.session_manager import AuthSessionManager
 from ui.components.company_logo import render_company_sidebar_logo
-from ui.navigation_state import set_navigation_state
+from ui.navigation_state import set_sidebar_navigation_state
 
 
 ADMIN_NAVIGATION = (
@@ -48,7 +48,7 @@ def render_admin_sidebar(
     # Department names are managed directly from Employee Add/Edit.
     # Redirect older refresh-safe Department bookmarks to Employees.
     if st.session_state.current_page == "Departments":
-        set_navigation_state(
+        set_sidebar_navigation_state(
             portal_mode="admin",
             current_page="Employees",
         )
@@ -57,14 +57,14 @@ def render_admin_sidebar(
     # Preserve old central-history bookmarks after the unified Audit Trail
     # replaced both Audit Logs and the standalone Integrations sidebar page.
     if st.session_state.current_page == "Audit Logs":
-        set_navigation_state(
+        set_sidebar_navigation_state(
             portal_mode="admin",
             current_page="Audit Trail",
         )
         st.rerun()
 
     if st.session_state.current_page == "Integrations":
-        set_navigation_state(
+        set_sidebar_navigation_state(
             portal_mode="admin",
             current_page="Audit Trail",
         )
@@ -86,7 +86,7 @@ def render_admin_sidebar(
             type=button_type,
             key=f"admin_nav_{page_name}",
         ):
-            set_navigation_state(
+            set_sidebar_navigation_state(
                 portal_mode="admin",
                 current_page=page_name,
             )
@@ -105,7 +105,7 @@ def render_admin_sidebar(
         width="stretch",
         key="employee_portal_button",
     ):
-        set_navigation_state(
+        set_sidebar_navigation_state(
             portal_mode="employee",
             current_page="Dashboard",
         )

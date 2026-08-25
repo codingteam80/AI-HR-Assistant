@@ -18,6 +18,7 @@ from ui.pages.user.dashboard_page import (
 )
 from ui.pages.user.attendance_hub_page import render_employee_attendance_hub_page
 from ui.pages.user.faq_page import render_employee_faq_page
+from ui.pages.user.hr_contacts_page import render_employee_hr_contacts_page
 from ui.pages.user.placeholder_page import render_placeholder_page
 from ui.pages.user.policies_page import render_employee_policies_page
 from ui.pages.user.reports_page import render_employee_reports_page
@@ -99,6 +100,8 @@ def render_user_layout(
         render_employee_policies_page(current_user)
     elif current_page == "FAQ":
         render_employee_faq_page(current_user)
+    elif current_page == "HR Contacts":
+        render_employee_hr_contacts_page(current_user)
     elif current_page in {"Onboarding", "Benefits"}:
         if current_page == "Benefits":
             # Preserve older bookmarks after Benefits moved into Onboarding.

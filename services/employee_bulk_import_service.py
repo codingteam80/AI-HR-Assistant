@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -24,6 +25,11 @@ from models.employee_training import EmployeeTraining
 from models.role import Role
 from models.user import User
 from schemas.admin_management_schema import EmployeeAccountCreate
+from services.excel_template_guidance import (
+    add_header_guidance,
+    add_inline_list_validation,
+    employee_reference_label,
+)
 
 
 EMPLOYEE_IMPORT_COLUMNS = (
@@ -73,14 +79,25 @@ SAMPLE_EMPLOYEE_ROW = (
     "lander.garcia@example.com",
     "09171234567",
     "Information Technology",
-    "100001",
-    "Maria Santos",
+    "100001 - Santos, Maria",
+    "100002 - Reyes, Pedro Jr.",
     "Software Developer",
     "Employed",
     "2022-01-15",
     "4 (automatic)",
     "[x] Orientation; [ ] Data Privacy",
 )
+
+EMPLOYEE_GENDER_OPTIONS = ("Male", "Female")
+EMPLOYEE_CIVIL_STATUS_OPTIONS = (
+    "N/A",
+    "Single",
+    "Married",
+    "Widowed",
+    "Separated",
+    "Divorced",
+)
+EMPLOYEE_EMPLOYMENT_STATUS_OPTIONS = ("Employed", "Resigned")
 
 
 def calculate_years_of_service(hire_date: date | None, *, as_of: date | None = None) -> int | None:
@@ -197,7 +214,11 @@ def _resolve_assignment_reference(
         return None, None
 
     # Employee Number is always authoritative and is matched before names.
-    number_key = raw.casefold()
+    # Company-aware templates display references as
+    # "Employee Number - Last Name, First Name Suffix"; keep raw employee
+    # numbers and older name-based entries backward compatible.
+    number_candidate = raw.split(" - ", 1)[0].strip() if " - " in raw else raw
+    number_key = number_candidate.casefold()
     number_matches = {
         str(candidate["employee_number"]): candidate
         for candidate in candidates
@@ -299,8 +320,13 @@ class EmployeeBulkImportService:
         self.password_manager = PasswordManager()
 
     @staticmethod
-    def build_template() -> bytes:
-        """Return a styled template with exact headers and format guidance."""
+    def build_template(
+        *,
+        department_names: tuple[str, ...] = (),
+        employee_references: tuple[tuple[str, str, str, str], ...] = (),
+        include_reference_sheets: bool = False,
+    ) -> bytes:
+        """Return a styled template with complete current selection guidance."""
 
         workbook = Workbook()
         sheet = workbook.active
@@ -326,28 +352,154 @@ class EmployeeBulkImportService:
         widths = {
             "A": 18, "B": 20, "C": 22, "D": 20, "E": 12,
             "F": 14, "G": 16, "H": 16, "I": 30, "J": 24,
-            "K": 24, "L": 25, "M": 25, "N": 24, "O": 20,
+            "K": 24, "L": 46, "M": 46, "N": 24, "O": 20,
             "P": 16, "Q": 18, "R": 36,
         }
         for column, width in widths.items():
             sheet.column_dimensions[column].width = width
         sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = f"A1:R2000"
+        sheet.auto_filter.ref = "A1:R2000"
 
-        status_validation = DataValidation(
-            type="list",
-            formula1='"Employed,Resigned"',
-            allow_blank=True,
+        add_header_guidance(
+            sheet, "A1",
+            requirement="Required and unique inside the company. Free-text employee number; no fixed selection.",
         )
-        clearance_validation = DataValidation(
-            type="list",
-            formula1='"Male,Female"',
-            allow_blank=True,
+        add_header_guidance(sheet, "B1", requirement="Required. Employee last name; free text.")
+        add_header_guidance(sheet, "C1", requirement="Required. Employee first name; free text.")
+        add_header_guidance(sheet, "D1", requirement="Optional middle name; free text.")
+        add_header_guidance(sheet, "E1", requirement="Optional suffix such as Jr., Sr., II, or III; free text.")
+        add_header_guidance(
+            sheet, "F1",
+            requirement="Optional. Use one of the same Gender choices available in Employee Master.",
+            choices=EMPLOYEE_GENDER_OPTIONS,
         )
-        sheet.add_data_validation(status_validation)
-        sheet.add_data_validation(clearance_validation)
-        status_validation.add("O2:O2000")
-        clearance_validation.add("F2:F2000")
+        add_header_guidance(
+            sheet, "G1",
+            requirement="Optional. Use one of the same Civil Status choices available in Employee Master.",
+            choices=EMPLOYEE_CIVIL_STATUS_OPTIONS,
+        )
+        add_header_guidance(sheet, "H1", requirement="Optional date of birth. Use YYYY-MM-DD or an Excel date cell.")
+        add_header_guidance(sheet, "I1", requirement="Required unique work/login email address.")
+        add_header_guidance(sheet, "J1", requirement="Optional telephone or mobile number; free text.")
+        add_header_guidance(
+            sheet, "K1",
+            requirement="Enter an existing department name or a new department name.",
+            choices=department_names,
+            choices_heading="Current company department names available at download time:",
+            extra=(
+                (
+                    "The same current list is in the 'Department References' worksheet. "
+                    "This field intentionally remains open because Employee Master permits creating a new department."
+                    if department_names
+                    else "No current company departments are available yet. You may enter a new department name."
+                )
+                if include_reference_sheets
+                else (
+                    "The company-aware template downloaded from the app includes the current Department References worksheet. "
+                    "This field remains open because Employee Master permits creating a new department."
+                )
+            ),
+        )
+        assignment_choices = tuple(
+            f"{number} - {name}"
+            for number, name, _job_title, _department in employee_references
+        )
+        assignment_extra = (
+            (
+                "The complete current employed-employee reference list is in the 'Employee References' worksheet. "
+                "You may also reference another employed row in the same upload by Employee Number."
+            )
+            if include_reference_sheets
+            else (
+                "The company-aware template downloaded from the app includes an Employee References worksheet. "
+                "You may also reference another employed row in the same upload by Employee Number."
+            )
+        )
+        add_header_guidance(
+            sheet, "L1",
+            requirement="Optional Manager reference. For current employees, choose or enter: Employee Number - Last Name, First Name Suffix. Another employed row in the same upload may still be referenced by Employee Number.",
+            choices=assignment_choices,
+            choices_heading="Current employed employee selections available at download time:",
+            extra=(assignment_extra if assignment_choices else assignment_extra + " No current employed employee references are available yet."),
+        )
+        add_header_guidance(
+            sheet, "M1",
+            requirement="Optional Leader reference. For current employees, choose or enter: Employee Number - Last Name, First Name Suffix. Another employed row in the same upload may still be referenced by Employee Number.",
+            choices=assignment_choices,
+            choices_heading="Current employed employee selections available at download time:",
+            extra=(assignment_extra if assignment_choices else assignment_extra + " No current employed employee references are available yet."),
+        )
+        add_header_guidance(sheet, "N1", requirement="Optional job title or position; free text.")
+        add_header_guidance(
+            sheet, "O1",
+            requirement="Optional. Blank defaults to Employed.",
+            choices=EMPLOYEE_EMPLOYMENT_STATUS_OPTIONS,
+        )
+        add_header_guidance(sheet, "P1", requirement="Required hired date. Use YYYY-MM-DD or an Excel date cell.")
+        add_header_guidance(sheet, "Q1", requirement="Automatic from Hired Date during preview/import. Leave this column blank.")
+        add_header_guidance(
+            sheet, "R1",
+            requirement="Optional checklist. Separate items with semicolons; prefix completed items with [x].",
+            extra="Example: [x] Orientation; [ ] Data Privacy",
+        )
+
+        add_inline_list_validation(sheet, "F2:F2000", EMPLOYEE_GENDER_OPTIONS, allow_blank=True)
+        add_inline_list_validation(sheet, "G2:G2000", EMPLOYEE_CIVIL_STATUS_OPTIONS, allow_blank=True)
+        add_inline_list_validation(
+            sheet, "O2:O2000", EMPLOYEE_EMPLOYMENT_STATUS_OPTIONS, allow_blank=True
+        )
+
+        if include_reference_sheets:
+            department_sheet = workbook.create_sheet("Department References")
+            department_sheet.append(["Current Department Name"])
+            for cell in department_sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            if department_names:
+                for name in department_names:
+                    department_sheet.append([name])
+            else:
+                department_sheet.append(["No current departments. You may enter a new department name."])
+            department_sheet.column_dimensions["A"].width = 52
+            department_sheet.freeze_panes = "A2"
+
+            employee_sheet = workbook.create_sheet("Employee References")
+            employee_sheet.append(["Employee Number", "Employee Reference", "Employee Name", "Job Title / Position", "Department"])
+            for cell in employee_sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            if employee_references:
+                for number, name, job_title, department in employee_references:
+                    employee_sheet.append([number, f"{number} - {name}", name, job_title, department])
+                workbook.defined_names.add(
+                    DefinedName(
+                        "EmployeeAssignmentReferences",
+                        attr_text=f"'Employee References'!$B$2:$B${len(employee_references) + 1}",
+                    )
+                )
+                # Suggest the live reference list but allow a raw Employee Number
+                # for another employed employee created in the same workbook.
+                assignment_validation = DataValidation(
+                    type="list", formula1="=EmployeeAssignmentReferences", allow_blank=True
+                )
+                assignment_validation.showErrorMessage = False
+                assignment_validation.promptTitle = "Current employee references"
+                assignment_validation.prompt = (
+                    "Choose Employee Number - Last Name, First Name Suffix, or enter a same-upload Employee Number."
+                )
+                assignment_validation.showInputMessage = True
+                sheet.add_data_validation(assignment_validation)
+                assignment_validation.add("L2:L2000")
+                assignment_validation.add("M2:M2000")
+            else:
+                employee_sheet.append(["", "", "No current employed employees available.", "", ""])
+            employee_sheet.column_dimensions["A"].width = 24
+            employee_sheet.column_dimensions["B"].width = 52
+            employee_sheet.column_dimensions["C"].width = 38
+            employee_sheet.column_dimensions["D"].width = 34
+            employee_sheet.column_dimensions["E"].width = 30
+            employee_sheet.freeze_panes = "A2"
+
         instructions = workbook.create_sheet("Instructions")
         instructions_rows = [
             ("Column", "Requirement"),
@@ -356,10 +508,12 @@ class EmployeeBulkImportService:
             ("Email", "Required; unique and used as the login email."),
             ("Hired Date", "Required; YYYY-MM-DD."),
             ("Years of Service", "Automatic from Hired Date during preview/import; leave this column blank."),
+            ("Gender / Civil Status / Employment Status", "Use the dropdowns or hover the related column headers to see the complete current selections."),
+            ("Department", "Current department names are listed in Department References. New department names are also allowed, matching Employee Master behavior."),
             ("Gray Sample Row", "Row 2 is a reference example only. Its unchanged SAMPLE ONLY employee number is automatically ignored during upload. Delete it or replace it with actual employee information."),
             (
                 "Manager/Leader Employee Number",
-                "Optional; accepts Employee Number, exact full name, First Name + Last Name, or a unique first/last name. The employee may already exist or be another employed row in this file. If a name matches multiple employees, use Employee Number or a more complete unique name.",
+                "Optional. Current employees are shown as Employee Number - Last Name, First Name Suffix in Employee References and the dropdown. Another employed row in the same file may be referenced by Employee Number. Legacy exact/unique employee-name references remain accepted for compatibility.",
             ),
             ("Employment Status", "Employed or Resigned; blank defaults to Employed."),
             ("Training Checklist", "Optional; separate items with semicolons. Use [x] for completed."),
@@ -377,6 +531,47 @@ class EmployeeBulkImportService:
         output = BytesIO()
         workbook.save(output)
         return output.getvalue()
+
+    def build_company_template(self, *, company_id: int) -> bytes:
+        """Return the employee template with current company reference sheets."""
+
+        departments = list(
+            self.session.scalars(
+                select(Department)
+                .where(
+                    Department.company_id == company_id,
+                    Department.is_active.is_(True),
+                )
+                .order_by(Department.name.asc())
+            )
+        )
+        employees = list(
+            self.session.scalars(
+                select(Employee)
+                .where(
+                    Employee.company_id == company_id,
+                    Employee.employment_status == "employed",
+                )
+                .order_by(Employee.last_name.asc(), Employee.first_name.asc())
+            )
+        )
+        department_lookup = {department.id: department.name for department in departments}
+        references = tuple(
+            (
+                employee.employee_number,
+                employee_reference_label(
+                    employee.employee_number, employee.last_name, employee.first_name, employee.suffix
+                ).split(" - ", 1)[1],
+                employee.job_title or "",
+                department_lookup.get(employee.department_id, ""),
+            )
+            for employee in employees
+        )
+        return self.build_template(
+            department_names=tuple(department.name for department in departments),
+            employee_references=references,
+            include_reference_sheets=True,
+        )
 
     def _unique_username(self, base: str, reserved: set[str]) -> str:
         normalized = base.casefold()

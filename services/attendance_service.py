@@ -24,6 +24,7 @@ from repositories.attendance_repository import AttendanceRepository
 from repositories.company_workday_repository import CompanyWorkdayRepository
 from schemas.attendance_schema import (
     CompanyAttendanceCalendarInput,
+    CompanyOvertimeRulesInput,
     AttendanceCorrectionInput,
     AttendancePunchInput,
     AttendanceSessionInput,
@@ -116,6 +117,47 @@ class AttendanceService:
         """Return company attendance settings for an authorized UI scope."""
 
         return self._company(company_id)
+
+    @staticmethod
+    def overtime_excluded_positions(company: Company) -> list[str]:
+        """Return the normalized company-configured shifting exclusions."""
+
+        raw = company.shifting_credit_excluded_positions_json or "[]"
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            values = []
+        if not isinstance(values, list):
+            values = []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            value = " ".join(str(item or "").strip().split())
+            token = value.casefold()
+            if value and token not in seen:
+                seen.add(token)
+                cleaned.append(value)
+        return cleaned
+
+    def save_overtime_rules(self, values: CompanyOvertimeRulesInput) -> Company:
+        """Persist company OT/shifting rules without changing the DTR calendar."""
+
+        company = self._company(values.company_id)
+        company.ot_dinner_break_deduction_hours = values.dinner_break_deduction_hours
+        company.shifting_credits_enabled = values.shifting_credits_enabled
+        company.shifting_credit_block_hours = values.shifting_credit_block_hours
+        company.shifting_credit_required_blocks = values.shifting_credit_required_blocks
+        company.shifting_credit_cutoff_day = values.shifting_credit_cutoff_day
+        company.shifting_credit_additional_vl_threshold_hours = (
+            values.additional_vl_threshold_hours
+        )
+        company.shifting_credit_additional_vl_days = values.additional_vl_days
+        company.shifting_credit_excluded_positions_json = json.dumps(
+            values.excluded_positions, ensure_ascii=False
+        )
+        self.session.commit()
+        self.session.refresh(company)
+        return company
 
     def _employee(self, company_id: int, employee_id: int) -> Employee:
         employee = self.session.scalar(

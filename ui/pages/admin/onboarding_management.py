@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 from datetime import date
+import hashlib
+import logging
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
 
 from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
 from services.onboarding_service import OnboardingService
+from services.benefit_bulk_import_service import (
+    BENEFIT_PREVIEW_COLUMNS,
+    BenefitBulkImportService,
+)
 from ui.components.data_table import render_admin_table
 from ui.components.live_search import live_search_input
 from ui.components.operation_feedback import (
@@ -37,6 +45,11 @@ AUTO_RULE_LABELS = {
     "First Time In recorded": "first_time_in",
     "All assigned training completed": "training_complete",
 }
+
+
+logger = logging.getLogger(__name__)
+_BENEFIT_BULK_PREVIEW_KEY = "benefit_bulk_preview_rows"
+_BENEFIT_BULK_DIGEST_KEY = "benefit_bulk_preview_digest"
 
 
 def _stay_on_onboarding(subtab: str) -> None:
@@ -368,9 +381,15 @@ def _render_checklist_setup(current_user: AuthenticatedUser, items) -> None:
                 "Its employee progress history stays in the database and returns "
                 "when the item is restored."
             )
+            archive_confirmation_key = f"onboarding_archive_item_confirm_{archive_item_id}"
+            invalidate_confirmation_on_change(
+                confirmation_key=archive_confirmation_key,
+                dependencies={"checklist_item_id": archive_item_id},
+                tracker_key="__onboarding_checklist_archive_target_confirmation",
+            )
             archive_confirmed = st.checkbox(
                 "I confirm that this checklist item should be moved to Archive.",
-                key=f"onboarding_archive_item_confirm_{archive_item_id}",
+                key=archive_confirmation_key,
             )
             if st.button(
                 "Move Checklist Item to Archive",
@@ -530,6 +549,119 @@ def _benefit_form_values(prefix: str, benefit=None) -> dict[str, object]:
     }
 
 
+def _render_bulk_benefit_upload(current_user: AuthenticatedUser) -> None:
+    """Render Benefit Excel template download, preview, and atomic import."""
+
+    with st.expander("Bulk Add Benefits via Excel", expanded=False):
+        st.caption(
+            "Download the template, enter one benefit per row, then validate and "
+            "preview before importing. Hover Excel headers for field guidance. "
+            "Related Workspace includes the complete current project selections "
+            "and an Excel dropdown/reference sheet."
+        )
+        template_data = BenefitBulkImportService.build_template()
+        st.download_button(
+            "Download Benefit Excel Template",
+            data=template_data,
+            file_name="Benefit_Import_Template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="benefit_bulk_template_download",
+        )
+        uploaded = st.file_uploader(
+            "Upload Completed Benefit Template",
+            type=["xlsx"],
+            accept_multiple_files=False,
+            key="benefit_bulk_upload_file",
+            help="Use the downloadable .xlsx Benefit template. Maximum file size: 10 MB.",
+        )
+        uploaded_bytes = uploaded.getvalue() if uploaded is not None else None
+        digest = hashlib.sha256(uploaded_bytes).hexdigest() if uploaded_bytes else None
+        stored_digest = st.session_state.get(_BENEFIT_BULK_DIGEST_KEY)
+        if st.session_state.get(_BENEFIT_BULK_PREVIEW_KEY) is not None and (
+            digest is None or digest != stored_digest
+        ):
+            st.session_state.pop(_BENEFIT_BULK_PREVIEW_KEY, None)
+            st.session_state.pop(_BENEFIT_BULK_DIGEST_KEY, None)
+
+        if st.button(
+            "Validate and Preview Benefits",
+            width="stretch",
+            disabled=uploaded is None,
+            key="benefit_bulk_validate",
+        ) and uploaded is not None:
+            try:
+                if uploaded.size > 10 * 1024 * 1024:
+                    raise ValueError("The Benefit Excel file must not exceed 10 MB.")
+                with st.spinner("Validating company benefits…"):
+                    with SessionFactory() as session:
+                        preview = BenefitBulkImportService(session).prepare_preview(
+                            uploaded_bytes or b"",
+                            filename=uploaded.name,
+                            company_id=current_user.company_id,
+                        )
+                st.session_state[_BENEFIT_BULK_PREVIEW_KEY] = preview
+                st.session_state[_BENEFIT_BULK_DIGEST_KEY] = digest
+            except ValueError as error:
+                st.session_state.pop(_BENEFIT_BULK_PREVIEW_KEY, None)
+                st.session_state.pop(_BENEFIT_BULK_DIGEST_KEY, None)
+                render_action_warning(error)
+
+        preview_rows = st.session_state.get(_BENEFIT_BULK_PREVIEW_KEY)
+        if isinstance(preview_rows, list) and preview_rows:
+            st.markdown("#### Benefit Import Preview")
+            st.caption(
+                "Invalid rows must be corrected in Excel and validated again. "
+                "Import is atomic, so a failed batch saves nothing."
+            )
+            st.data_editor(
+                [
+                    {column: row.get(column, "") for column in BENEFIT_PREVIEW_COLUMNS}
+                    for row in preview_rows
+                ],
+                width="stretch",
+                hide_index=True,
+                disabled=list(BENEFIT_PREVIEW_COLUMNS),
+                key="benefit_bulk_preview_editor",
+            )
+            invalid_count = sum(
+                str(row.get("Validation", "")) != "Ready" for row in preview_rows
+            )
+            if invalid_count:
+                st.error(
+                    f"{invalid_count} row(s) contain validation errors. "
+                    "Correct the workbook and validate it again."
+                )
+            if st.button(
+                "Import Benefits",
+                type="primary",
+                width="stretch",
+                disabled=invalid_count > 0,
+                key="benefit_bulk_import_submit",
+            ):
+                try:
+                    with st.spinner("Importing company benefits…"):
+                        with SessionFactory() as session:
+                            created = BenefitBulkImportService(session).import_preview_rows(
+                                preview_rows, company_id=current_user.company_id
+                            )
+                    st.session_state.pop(_BENEFIT_BULK_PREVIEW_KEY, None)
+                    st.session_state.pop(_BENEFIT_BULK_DIGEST_KEY, None)
+                    _stay_on_onboarding("Benefits Management")
+                    set_operation_feedback(
+                        f"Successfully imported {len(created)} benefit(s).",
+                        namespace="onboarding",
+                    )
+                    st.rerun()
+                except ValueError as error:
+                    render_action_warning(error)
+                except Exception:
+                    logger.exception("Unexpected Benefit bulk import failure")
+                    st.error(
+                        "The Benefit batch could not be imported. "
+                        "No benefit from this batch was saved."
+                    )
+
+
 def _render_benefits_management(current_user: AuthenticatedUser, benefits) -> None:
     st.subheader("Benefits Management")
     st.caption(
@@ -559,6 +691,9 @@ def _render_benefits_management(current_user: AuthenticatedUser, benefits) -> No
         )
     else:
         st.info("No active company benefits. Add a benefit or restore one from Archive.")
+
+    _render_bulk_benefit_upload(current_user)
+
     with st.expander("Add Benefit", expanded=False):
         values = _benefit_form_values("onboarding_create_benefit")
         if st.button(
@@ -634,9 +769,15 @@ def _render_benefits_management(current_user: AuthenticatedUser, benefits) -> No
                 "This safe-delete action removes the benefit from the Employee "
                 "Portal and moves it to Archive. The company benefit record is retained."
             )
+            archive_confirmation_key = f"onboarding_archive_benefit_confirm_{archive_benefit_id}"
+            invalidate_confirmation_on_change(
+                confirmation_key=archive_confirmation_key,
+                dependencies={"benefit_id": archive_benefit_id},
+                tracker_key="__onboarding_benefit_archive_target_confirmation",
+            )
             archive_confirmed = st.checkbox(
                 "I confirm that this benefit should be moved to Archive.",
-                key=f"onboarding_archive_benefit_confirm_{archive_benefit_id}",
+                key=archive_confirmation_key,
             )
             if st.button(
                 "Move Benefit to Archive",
@@ -739,10 +880,9 @@ def render_onboarding_management(current_user: AuthenticatedUser) -> None:
     }:
         st.session_state["admin_onboarding_management_active_tab"] = pending_subtab
 
-    progress_tab, checklist_tab, benefits_tab = st.tabs(
+    progress_tab, checklist_tab, benefits_tab = persistent_tabs(
         ["Employee Progress", "Checklist Setup", "Benefits Management"],
         key="admin_onboarding_management_active_tab",
-        on_change="rerun",
     )
     with progress_tab:
         _render_employee_progress(current_user, progress_rows)

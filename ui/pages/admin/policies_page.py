@@ -7,6 +7,7 @@ import html
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 from pydantic import ValidationError
 
 from authentication.current_user import AuthenticatedUser
@@ -19,7 +20,9 @@ from schemas.policy_schema import (
     PolicyUploadRequest,
 )
 from services.policy_service import PolicyAdminView, PolicyService
+from ui.pages.admin.policy_violations import render_admin_policy_violations
 from ui.components.data_table import render_admin_table
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.live_search import live_search_input
 from ui.components.operation_feedback import (
     render_operation_feedback,
@@ -675,10 +678,17 @@ def _render_move_to_bin(current_user: AuthenticatedUser, view: PolicyAdminView) 
         f"Selected target: {public_id} · {view.policy.title} "
         f"v{view.policy.version}"
     )
+    move_confirmation_key = f"confirm_move_policy_bin_{view.policy.id}"
+    invalidate_confirmation_on_change(
+        confirmation_key=move_confirmation_key,
+        dependencies={"policy_id": view.policy.id},
+        tracker_key="__policy_move_to_bin_target_confirmation",
+    )
     with st.form(f"move_policy_bin_{view.policy.id}"):
         acknowledged = st.checkbox(
             "I confirm that the selected policy version above should "
-            "be moved to the Bin."
+            "be moved to the Bin.",
+            key=move_confirmation_key,
         )
         submitted = st.form_submit_button(
             "Move Policy Version to Bin",
@@ -1250,22 +1260,29 @@ def _render_permanent_delete(
         "sections. Other versions remain."
     )
 
-    with st.form(
-        f"permanent_delete_policy_{policy.id}"
-    ):
-        confirmation = st.text_input(
-            "Type the exact Policy ID to confirm",
-            placeholder=public_id,
-            max_chars=30,
-        )
-        acknowledged = st.checkbox(
-            "I understand that this policy version and its file "
-            "will be permanently deleted.",
-        )
-        submitted = st.form_submit_button(
-            "Delete Policy Version Permanently",
-            width="stretch",
-        )
+    confirmation_input_key = f"permanent_delete_policy_id_input_{policy.id}"
+    confirmation_checkbox_key = f"permanent_delete_policy_ack_{policy.id}"
+    confirmation = st.text_input(
+        "Type the exact Policy ID to confirm",
+        placeholder=public_id,
+        max_chars=30,
+        key=confirmation_input_key,
+    )
+    invalidate_confirmation_on_change(
+        confirmation_key=confirmation_checkbox_key,
+        dependencies={"typed_policy_id": confirmation.strip()},
+    )
+    acknowledged = st.checkbox(
+        "I understand that this policy version and its file "
+        "will be permanently deleted.",
+        key=confirmation_checkbox_key,
+    )
+    submitted = st.button(
+        "Delete Policy Version Permanently",
+        width="stretch",
+        disabled=not acknowledged,
+        key=f"permanent_delete_policy_submit_{policy.id}",
+    )
 
     if not submitted:
         return
@@ -1452,7 +1469,7 @@ def _render_manage(current_user: AuthenticatedUser, policies) -> None:
     except ValueError as error:
         render_action_warning(error); return
 
-    tabs = st.tabs([
+    tabs = persistent_tabs([
         "Overview",
         "Edit Details",
         "Upload New Version",
@@ -1461,7 +1478,7 @@ def _render_manage(current_user: AuthenticatedUser, policies) -> None:
         "Original File",
         "Version History",
         "Move to Bin",
-    ])
+    ], key="admin_policy_manage_detail_tab")
     with tabs[0]:
         _render_overview(view)
     with tabs[1]:
@@ -1517,14 +1534,14 @@ def _render_bin(current_user: AuthenticatedUser, policies, document_map) -> None
             company_id=current_user.company_id,
             policy_id=selected_id,
         )
-    tabs = st.tabs([
+    tabs = persistent_tabs([
         "Overview",
         "Extracted Content",
         "Original File",
         "Version History",
         "Restore",
         "Delete Permanently",
-    ])
+    ], key="admin_policy_bin_detail_tab")
     with tabs[0]:
         _render_overview(view)
     with tabs[1]:
@@ -1580,8 +1597,9 @@ def render_admin_policies_page(current_user: AuthenticatedUser) -> None:
 
     st.title("Policies")
     st.caption(
-        "Upload and preview policy files, track every version, and retain "
-        "removed versions safely in the Bin."
+        "Upload and preview policy files, maintain company violations and "
+        "disciplinary actions, track every version, and retain removed policy "
+        "versions safely in the Bin."
     )
     render_operation_feedback(namespace="policy")
 
@@ -1603,6 +1621,7 @@ def render_admin_policies_page(current_user: AuthenticatedUser) -> None:
         "Policies",
         "Upload Policy File",
         "Manage Existing Policy",
+        "Violations & Disciplinary Actions",
         f"Bin ({len(bin_policies)})",
     ]
     current_policy_tab = st.session_state.get("policies_active_tab")
@@ -1613,10 +1632,9 @@ def render_admin_policies_page(current_user: AuthenticatedUser) -> None:
     ):
         st.session_state["policies_active_tab"] = policy_tab_labels[-1]
 
-    policies_tab, upload_tab, manage_tab, bin_tab = st.tabs(
+    policies_tab, upload_tab, manage_tab, violations_tab, bin_tab = persistent_tabs(
         policy_tab_labels,
         key="policies_active_tab",
-        on_change="rerun",
     )
 
     with policies_tab:
@@ -1637,6 +1655,9 @@ def render_admin_policies_page(current_user: AuthenticatedUser) -> None:
             current_user,
             active,
         )
+
+    with violations_tab:
+        render_admin_policy_violations(current_user)
 
     with bin_tab:
         _render_bin(

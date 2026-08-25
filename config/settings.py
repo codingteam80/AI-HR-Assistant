@@ -29,7 +29,7 @@ class Settings(ChatAssistantSettingsCompatibilityMixin, BaseSettings):
 
     # Application identity and runtime behavior.
     app_name: str = "AI HR Assistant"
-    app_version: str = "0.8.8.169"
+    app_version: str = "0.8.8.200"
     # Previous table-readability checkpoint: app_version: str = "0.8.8.164.3"
     # Previous per-tab-auth checkpoint: app_version: str = "0.8.8.164.4"
     # Immediate base checkpoint: app_version: str = "0.8.8.164"
@@ -100,6 +100,14 @@ class Settings(ChatAssistantSettingsCompatibilityMixin, BaseSettings):
     # Company-scoped sidebar logos. Uploaded files are normalized to PNG.
     company_logo_upload_dir: str = "data/uploads/company_logos"
     company_logo_upload_max_mb: int = 5
+
+    # Employee profile photos. Files are canonicalized to private 512x512 PNGs.
+    employee_profile_image_dir: str = "data/uploads/employee_profiles"
+    employee_profile_image_max_mb: int = 5
+
+    # Privacy switch for Employee Portal self-service disciplinary visibility.
+    # Administrators always retain the protected management workspace.
+    employee_disciplinary_records_visible: bool = True
 
     display_timezone: str = "Asia/Manila"
 

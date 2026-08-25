@@ -23,23 +23,38 @@ from repositories.employee_repository import EmployeeRepository
 from repositories.user_repository import UserRepository
 from services.announcement_service import AnnouncementService
 from services.leave_service import LeaveService
+from services.chat_report_service import ChatReportService
+from services.disciplinary_record_service import DisciplinaryRecordService
+from services.employee_hierarchy_service import EmployeeHierarchyService
+from services.employee_company_query_service import EmployeeCompanyQueryService
 from services.policy_service import PolicyService
+from services.policy_violation_service import PolicyViolationService
 
 
 class AdminHRAssistant:
     """Answer administrator HR questions using tenant-scoped live data."""
 
     _FOLLOW_UP_MARKERS = {
+        "about it",
+        "and that",
         "and those",
+        "approve it",
+        "approves it",
         "how about",
         "how many",
         "ilan",
         "paano naman",
         "show details",
         "sino",
+        "that request",
+        "the same request",
+        "this request",
         "those",
         "what about",
+        "what happens next",
         "which ones",
+        "who approves",
+        "who needs to approve",
         "yun",
     }
 
@@ -65,10 +80,14 @@ class AdminHRAssistant:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.employee_repository = EmployeeRepository(session)
+        self.employee_hierarchy_service = EmployeeHierarchyService(session)
+        self.employee_company_query_service = EmployeeCompanyQueryService(session)
         self.user_repository = UserRepository(session)
         self.leave_service = LeaveService(session)
         self.policy_service = PolicyService(session)
         self.policy_assistant = PolicyAssistant(session)
+        self.violation_service = PolicyViolationService(session)
+        self.disciplinary_service = DisciplinaryRecordService(session)
         self.announcement_service = AnnouncementService(session)
         self.employee_assistant = HRAssistant(session)
 
@@ -118,7 +137,7 @@ class AdminHRAssistant:
     @classmethod
     def _is_explicit_follow_up(cls, query: str) -> bool:
         return bool(query) and any(
-            marker in query
+            re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", query)
             for marker in cls._FOLLOW_UP_MARKERS
         )
 
@@ -169,6 +188,12 @@ class AdminHRAssistant:
         if cls._is_personal_employee_question(query):
             return "personal_employee"
 
+        # Leave-status wording must win before the generic employee-summary
+        # matcher. Otherwise questions such as "How many employees are on
+        # leave today?" are incorrectly routed to headcount.
+        if "on leave today" in query:
+            return "leave_summary"
+
         if cls._contains_any(
             query,
             {
@@ -218,14 +243,26 @@ class AdminHRAssistant:
         ):
             return "employee_howto"
 
+        if HRAssistant.looks_like_employee_hierarchy_query(query):
+            return "employee_hierarchy"
+
         if cls._contains_any(
             query,
             {
                 "find employee",
                 "lookup employee",
                 "employee details",
+                "employee detail",
+                "employee info",
+                "employee information",
+                "employee profile",
                 "who is employee",
                 "show employee",
+                "info ni",
+                "impormasyon ni",
+                "detalye ni",
+                "profile ni",
+                "sino si",
             },
         ):
             return "employee_lookup"
@@ -289,6 +326,34 @@ class AdminHRAssistant:
             },
         ):
             return "leave_summary"
+
+        if cls._contains_any(
+            query,
+            {
+                "violation",
+                "violations",
+                "offense",
+                "offenses",
+                "penalty",
+                "penalties",
+                "disciplinary",
+                "sanction",
+                "sanctions",
+            },
+        ):
+            if cls._contains_any(
+                query,
+                {
+                    "add violation",
+                    "create violation",
+                    "edit violation",
+                    "manage violation",
+                    "archive violation",
+                    "restore violation",
+                },
+            ):
+                return "policy_howto"
+            return "policy_question"
 
         if cls._contains_any(
             query,
@@ -470,7 +535,7 @@ class AdminHRAssistant:
     ) -> HRAssistantResponse:
         """Rank live employee leave credits for a comparative admin question."""
 
-        year = date.today().year
+        year = self.leave_service._today().year
         balances = self.leave_service.list_company_balances(
             current_user.company_id,
             year,
@@ -569,26 +634,144 @@ class AdminHRAssistant:
         return self.user_repository.list_with_details(company_id)
 
     def _match_employees(self, company_id: int, query: str):
-        """Match employee number or full name inside an admin question."""
+        """Match company employees by number, full name, or unique short name.
+
+        Employee Number and complete-name matches always win.  If the question
+        uses only a first or last name (for example, ``May member ba si Juan?``),
+        return the matching employee only when that short name is unambiguous
+        inside the current company.
+        """
 
         normalized = self.normalize_query(query)
-        matches = []
+        employees = self._employees(company_id)
+        strong_matches = []
 
-        for employee in self._employees(company_id):
+        for employee in employees:
             employee_number = self.normalize_query(employee.employee_number)
             full_name = self.normalize_query(employee.full_name)
+            first_name = self.normalize_query(employee.first_name)
+            last_name = self.normalize_query(employee.last_name)
+            simple_names = {
+                value
+                for value in (
+                    full_name,
+                    f"{first_name} {last_name}".strip(),
+                    f"{last_name} {first_name}".strip(),
+                )
+                if len(value.split()) >= 2
+            }
 
-            if employee_number and employee_number in normalized:
-                matches.append(employee)
+            if employee_number and re.search(
+                rf"(?<![a-z0-9]){re.escape(employee_number)}(?![a-z0-9])",
+                normalized,
+            ):
+                strong_matches.append(employee)
                 continue
 
-            if (
-                len(full_name.split()) >= 2
-                and full_name in normalized
+            if any(
+                re.search(
+                    rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])",
+                    normalized,
+                )
+                for name in simple_names
             ):
-                matches.append(employee)
+                strong_matches.append(employee)
 
-        return matches
+        if strong_matches:
+            return list({employee.id: employee for employee in strong_matches}.values())
+
+        short_matches = []
+        for employee in employees:
+            for name in (employee.first_name, employee.last_name):
+                short_name = self.normalize_query(name)
+                if len(short_name) < 3:
+                    continue
+                if re.search(
+                    rf"(?<![a-z0-9]){re.escape(short_name)}(?![a-z0-9])",
+                    normalized,
+                ):
+                    short_matches.append(employee)
+                    break
+
+        return list({employee.id: employee for employee in short_matches}.values())
+
+
+    def _employee_hierarchy(
+        self,
+        current_user: AuthenticatedUser,
+        question: str,
+        history: list[dict] | None = None,
+    ) -> HRAssistantResponse:
+        """Return company-scoped Manager/Leader member relationships for one employee."""
+
+        matches = self._match_employees(current_user.company_id, question)
+        if not matches and history:
+            previous = self._history_last_user_question(history)
+            if previous:
+                matches = self._match_employees(current_user.company_id, previous)
+
+        if not matches:
+            return HRAssistantResponse(
+                answer=(
+                    "Include the employee number or complete employee name so I can "
+                    "check the actual Manager/Leader assignments. Example: "
+                    "**Who are the members of ADMIN-001?**"
+                ),
+                intent="employee_hierarchy",
+                actions=[self._admin_action("Open Employees", "Employees")],
+            )
+        if len(matches) > 1:
+            return HRAssistantResponse(
+                answer=(
+                    "Multiple employees matched. Use the Employee Number to check "
+                    "the correct Manager/Leader relationship."
+                ),
+                intent="employee_hierarchy",
+                actions=[self._admin_action("Open Employees", "Employees")],
+            )
+
+        employee = matches[0]
+        snapshot = self.employee_hierarchy_service.snapshot(
+            company_id=current_user.company_id,
+            employee_id=employee.id,
+        )
+        if snapshot is None:
+            return HRAssistantResponse(
+                answer="The employee hierarchy record is no longer available.",
+                intent="employee_hierarchy",
+                actions=[self._admin_action("Open Employees", "Employees")],
+            )
+
+        # There is no separate Manager/Leader role field.  The role below is
+        # derived only from reverse Employee Master assignments: an employee is
+        # a Manager when employed records select them in Manager, and a Leader
+        # when employed records select them in Leader.  The same person can
+        # still report upward to their own Manager/Leader at the same time.
+        lines = [
+            f"Hierarchy for **{employee.employee_number} — {employee.full_name}**:",
+            f"- **Hierarchy Role:** {snapshot.role_label}",
+            f"- **Reports to Manager:** {snapshot.manager.full_name if snapshot.manager else 'Not assigned'}",
+            f"- **Reports to Leader:** {snapshot.leader.full_name if snapshot.leader else 'Not assigned'}",
+            f"- **Manager Direct Reports:** {len(snapshot.manager_reports)}",
+            f"- **Leader Team Members:** {len(snapshot.leader_members)}",
+        ]
+        if snapshot.manager_reports:
+            lines.append("- **As Manager, members/direct reports:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}" for item in snapshot.manager_reports
+            ))
+        if snapshot.leader_members:
+            lines.append("- **As Leader, team members:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}" for item in snapshot.leader_members
+            ))
+        lines.append(
+            "- **Basis:** live Manager/Leader selections in Employee Master; job-title wording is not used to assign this role."
+        )
+
+        return HRAssistantResponse(
+            answer="\n".join(lines),
+            intent="employee_hierarchy",
+            actions=[self._admin_action("Open Employees", "Employees")],
+        )
 
     def _employee_summary(self, current_user: AuthenticatedUser) -> HRAssistantResponse:
         employees = self._employees(current_user.company_id)
@@ -662,7 +845,18 @@ class AdminHRAssistant:
             )
 
         employee = matches[0]
-        manager = employee.manager.full_name if employee.manager else "Not assigned"
+        snapshot = self.employee_hierarchy_service.snapshot(
+            company_id=current_user.company_id,
+            employee_id=employee.id,
+        )
+        if snapshot is None:
+            return HRAssistantResponse(
+                answer="The employee record is no longer available.",
+                intent="employee_lookup",
+                actions=[self._admin_action("Open Employees", "Employees")],
+            )
+        manager = snapshot.manager.full_name if snapshot.manager else "Not assigned"
+        leader = snapshot.leader.full_name if snapshot.leader else "Not assigned"
         department = employee.department.name if employee.department else "Not assigned"
         account_status = (
             "Active"
@@ -681,10 +875,28 @@ class AdminHRAssistant:
             f"- **Department:** {department}\n"
             f"- **Job Title:** {employee.job_title or 'Not specified'}\n"
             f"- **Manager:** {manager}\n"
+            f"- **Leader:** {leader}\n"
+            f"- **Hierarchy Role:** {snapshot.role_label}\n"
+            f"- **Manager Direct Reports:** {len(snapshot.manager_reports)}\n"
+            f"- **Leader Team Members:** {len(snapshot.leader_members)}\n"
             f"- **Work Email:** {employee.work_email or 'Not specified'}\n"
             f"- **Employment Status:** {employee.employment_status.title()}\n"
             f"- **Account Status:** {account_status}\n"
             f"- **Clearance:** {clearance}"
+        )
+        if snapshot.manager_reports:
+            answer += "\n- **As Manager for:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}"
+                for item in snapshot.manager_reports
+            )
+        if snapshot.leader_members:
+            answer += "\n- **As Leader for:** " + ", ".join(
+                f"{item.employee_number} — {item.full_name}"
+                for item in snapshot.leader_members
+            )
+        answer += (
+            "\n- **Hierarchy Basis:** live Manager/Leader selections in Employee Master; "
+            "job title does not assign the supervisory role."
         )
 
         return HRAssistantResponse(
@@ -719,16 +931,179 @@ class AdminHRAssistant:
             actions=[self._admin_action("Open Employees", "Employees")],
         )
 
+    @staticmethod
+    def _active_leave_today_status(status: str) -> bool:
+        return status in {
+            "scheduled",
+            "approved",
+            "in_progress",
+            "completed",
+            "partially_cancelled",
+        }
+
+    def _leave_today_answer(
+        self,
+        current_user: AuthenticatedUser,
+        *,
+        list_employees: bool,
+    ) -> HRAssistantResponse:
+        """Return an exact company-scoped count/list for employees on leave today."""
+
+        self.leave_service.reconcile_approved_leave(
+            company_id=current_user.company_id
+        )
+        today = self.leave_service._today()
+        requests = self.leave_service.list_company_requests(
+            current_user.company_id,
+        )
+        active = [
+            request
+            for request in requests
+            if (
+                self._active_leave_today_status(request.status)
+                and request.start_date <= today <= request.end_date
+            )
+        ]
+        by_employee = {}
+        for request in active:
+            by_employee.setdefault(request.employee_id, request)
+
+        action = self._admin_action(
+            "Open Leave Overview",
+            "Leave Management",
+            query_params={"leave_view": "overview"},
+        )
+        if not list_employees:
+            return HRAssistantResponse(
+                answer=(
+                    f"**{len(by_employee)}** employee(s) are on leave today "
+                    f"({today.isoformat()})."
+                ),
+                intent="leave_status",
+                actions=[action],
+            )
+
+        if not by_employee:
+            answer = f"No employees are on leave today ({today.isoformat()})."
+        else:
+            lines = [f"Employees on leave today ({today.isoformat()}):"]
+            for request in by_employee.values():
+                employee = request.employee
+                employee_label = (
+                    f"{employee.employee_number} — {employee.full_name}"
+                    if employee is not None
+                    else f"Employee ID {request.employee_id}"
+                )
+                lines.append(
+                    f"- **{employee_label}:** {request.leave_type.name} | "
+                    f"{request.start_date.isoformat()} to {request.end_date.isoformat()} | "
+                    f"{request.status.replace('_', ' ').title()}"
+                )
+            answer = "\n".join(lines)
+
+        return HRAssistantResponse(
+            answer=answer,
+            intent="leave_status",
+            actions=[action],
+        )
+
+    def _latest_pending_leave_answer(
+        self,
+        current_user: AuthenticatedUser,
+    ) -> HRAssistantResponse:
+        """Return exactly one newest pending company leave request."""
+
+        self.leave_service.reconcile_approved_leave(
+            company_id=current_user.company_id
+        )
+        requests = self.leave_service.list_company_requests(
+            current_user.company_id,
+        )
+        request = next(
+            (
+                item
+                for item in requests
+                if item.status in {
+                    "pending_leader_approval",
+                    "pending_manager_approval",
+                }
+            ),
+            None,
+        )
+        action = self._admin_action(
+            "Open Leave Overview",
+            "Leave Management",
+            query_params={"leave_view": "overview"},
+        )
+        if request is None:
+            return HRAssistantResponse(
+                answer="There is no pending leave request.",
+                intent="leave_status",
+                actions=[action],
+            )
+
+        employee = request.employee
+        employee_name = employee.full_name if employee is not None else f"Employee ID {request.employee_id}"
+        approver = request.current_approver
+        approver_text = (
+            approver.full_name
+            if approver is not None
+            else request.status.replace("pending_", "").replace("_", " ").title()
+        )
+        return HRAssistantResponse(
+            answer=(
+                f"The latest pending leave request is **{request.public_id} — "
+                f"{employee_name}**: {request.leave_type.name}, "
+                f"{request.start_date.isoformat()} to {request.end_date.isoformat()} | "
+                f"{self._format_days(request.requested_days)} day(s) | "
+                f"awaiting **{approver_text}** approval."
+            ),
+            intent="leave_status",
+            actions=[action],
+        )
+
     def _leave_summary(
         self,
         current_user: AuthenticatedUser,
         question: str,
     ) -> HRAssistantResponse:
+        normalized = self.normalize_query(question)
+
+        if any(
+            term in normalized
+            for term in ("carry over", "carryover", "carried over", "roll over", "rollover")
+        ):
+            response = self.employee_assistant._leave_carryover_answer()
+            response.actions = [
+                self._admin_action(
+                    "Open Leave Overview",
+                    "Leave Management",
+                    query_params={"leave_view": "overview"},
+                )
+            ]
+            return response
+
+        if "on leave today" in normalized:
+            asks_list = any(
+                term in normalized
+                for term in ("list", "show", "which", "who")
+            )
+            return self._leave_today_answer(
+                current_user,
+                list_employees=asks_list,
+            )
+
+        if (
+            "latest" in normalized
+            and "pending" in normalized
+            and "leave request" in normalized
+        ):
+            return self._latest_pending_leave_answer(current_user)
+
         matches = self._match_employees(
             current_user.company_id,
             question,
         )
-        normalized = self.normalize_query(question)
 
         comparative_credit_question = (
             self._contains_any(normalized, {"credit", "credits"})
@@ -761,7 +1136,7 @@ class AdminHRAssistant:
             balances = self.leave_service.list_employee_balances(
                 current_user.company_id,
                 employee.id,
-                date.today().year,
+                self.leave_service._today().year,
             )
             lines = [
                 f"Leave credits for **{employee.employee_number} — {employee.full_name}**:"
@@ -793,16 +1168,16 @@ class AdminHRAssistant:
         )
         overview = self.leave_service.overview(
             current_user.company_id,
-            date.today().year,
+            self.leave_service._today().year,
         )
         requests = self.leave_service.list_company_requests(
             current_user.company_id,
-            date.today().year,
+            self.leave_service._today().year,
         )
         statuses = Counter(request.status for request in requests)
 
         answer = (
-            f"Leave overview for **{date.today().year}**:\n"
+            f"Leave overview for **{self.leave_service._today().year}**:\n"
             f"- **Total requests:** {overview.get('total_requests', 0)}\n"
             f"- **Requests this month:** {overview.get('requests_this_month', 0)}\n"
             f"- **Employees on leave today:** {overview.get('employees_on_leave_today', 0)}\n"
@@ -831,6 +1206,11 @@ class AdminHRAssistant:
         active = self.policy_service.list_for_admin(current_user.company_id)
         published = self.policy_service.list_published(current_user.company_id)
         in_bin = self.policy_service.list_bin(current_user.company_id)
+        violations = self.violation_service.list_current(current_user.company_id)
+        visible_violations = self.violation_service.list_employee_visible(
+            company_id=current_user.company_id
+        )
+        archived_violations = self.violation_service.list_archived(current_user.company_id)
         categories = Counter(policy.category for policy in active)
         category_text = ", ".join(
             f"{name}: {count}"
@@ -842,7 +1222,10 @@ class AdminHRAssistant:
             f"- **Active policy versions:** {len(active)}\n"
             f"- **Published and currently effective:** {len(published)}\n"
             f"- **In Bin:** {len(in_bin)}\n"
-            f"- **Top categories:** {category_text}"
+            f"- **Current violation rules:** {len(violations)}\n"
+            f"- **Active/effective employee-visible violations:** {len(visible_violations)}\n"
+            f"- **Archived violation rules:** {len(archived_violations)}\n"
+            f"- **Top policy categories:** {category_text}"
         )
 
         return HRAssistantResponse(
@@ -856,6 +1239,23 @@ class AdminHRAssistant:
         current_user: AuthenticatedUser,
         question: str,
     ) -> HRAssistantResponse:
+        violation_answer = self.violation_service.answer_question(
+            company_id=current_user.company_id,
+            question=question,
+        )
+        if violation_answer is not None:
+            return HRAssistantResponse(
+                answer=violation_answer,
+                intent="policy_violation",
+                actions=[
+                    self._admin_action(
+                        "Open Violations & Disciplinary Actions",
+                        "Policies",
+                        query_params={"policy_view": "violations"},
+                    )
+                ],
+            )
+
         result = self.policy_assistant.answer(
             company_id=current_user.company_id,
             question=question,
@@ -911,6 +1311,8 @@ class AdminHRAssistant:
                 "- Employee lookup by employee number or full name\n"
                 "- Company leave requests, on-leave totals, and credit summaries\n"
                 "- Published policy summaries and approved-policy questions\n"
+                "- Active violation/offense and disciplinary-action rules\n"
+                "- Authorized employee disciplinary case records and counts\n"
                 "- Announcement status summaries\n"
                 "- Attendance / DTR / OT and Company Form/Documents workflows\n"
                 "- Navigation and basic workflows for Employees, Policies, "
@@ -942,6 +1344,9 @@ class AdminHRAssistant:
         normalized = self.normalize_query(cleaned)
         intent = self.classify_intent(cleaned, history=history)
 
+        # Security/privacy routing always wins before aggregate/report engines.
+        # This prevents a broad employee/report matcher from ever weakening a
+        # protected-secret refusal.
         if intent == "sensitive_security":
             return HRAssistantResponse(
                 answer=(
@@ -956,8 +1361,97 @@ class AdminHRAssistant:
                 ],
             )
 
+        report_result = ChatReportService(self.session).try_answer(
+            current_user=current_user,
+            role_scope="admin",
+            question=cleaned,
+            history=history,
+        )
+        if report_result is not None:
+            return HRAssistantResponse(
+                answer=report_result.answer,
+                intent="live_report",
+                report=report_result.report,
+            )
+
+        # Natural employee-information wording often omits the literal word
+        # "employee" (for example, "Tell me about Maria").  When an admin
+        # question contains an information marker and resolves to a company
+        # employee unambiguously, route it to the live employee lookup so the
+        # actual Manager/Leader/member relationship is included.
+        if intent in {"not_found", "employee_summary"} and self._contains_any(
+            normalized,
+            {
+                "info",
+                "information",
+                "details",
+                "profile",
+                "who is",
+                "tell me about",
+                "info ni",
+                "impormasyon ni",
+                "detalye ni",
+                "profile ni",
+                "sino si",
+            },
+        ):
+            if self._match_employees(current_user.company_id, cleaned):
+                intent = "employee_lookup"
+
         if intent == "help":
             return self._help_response()
+
+        # Company-wide employee aggregate/list/chart engine. It deliberately
+        # declines single-person hierarchy questions and non-employee domains.
+        # This is what answers natural variants such as "Who are the leaders?"
+        # and follow-ups such as "names of them" or "how many are there?".
+        specific_hierarchy_matches = (
+            self._match_employees(current_user.company_id, cleaned)
+            if intent == "employee_hierarchy"
+            else []
+        )
+        aggregate_result = (
+            None
+            if specific_hierarchy_matches
+            else self.employee_company_query_service.try_answer(
+                current_user=current_user,
+                question=cleaned,
+                history=history,
+            )
+        )
+        if aggregate_result is not None:
+            return HRAssistantResponse(
+                answer=aggregate_result.answer,
+                intent=aggregate_result.intent,
+                report=aggregate_result.report,
+                actions=[self._admin_action("Open Employees", "Employees")],
+            )
+
+        disciplinary_question = cleaned
+        if self._contains_any(
+            normalized,
+            {"this employee", "that employee", "same employee", "this person", "that person"},
+        ):
+            previous_question = self._history_last_user_question(history)
+            if previous_question:
+                disciplinary_question = f"{previous_question} {cleaned}"
+        disciplinary_answer = self.disciplinary_service.answer_admin_question(
+            company_id=current_user.company_id,
+            requester_user_id=current_user.user_id,
+            question=disciplinary_question,
+        )
+        if disciplinary_answer is not None:
+            return HRAssistantResponse(
+                answer=disciplinary_answer,
+                intent="disciplinary_records",
+                actions=[
+                    self._admin_action(
+                        "Open Disciplinary Records",
+                        "Employees",
+                        query_params={"employee_view": "disciplinary"},
+                    )
+                ],
+            )
 
         if intent == "personal_employee":
             return self.employee_assistant.answer(
@@ -968,6 +1462,13 @@ class AdminHRAssistant:
 
         if intent == "employee_summary":
             return self._employee_summary(current_user)
+
+        if intent == "employee_hierarchy":
+            return self._employee_hierarchy(
+                current_user,
+                cleaned,
+                history=history,
+            )
 
         if intent == "employee_lookup":
             return self._employee_lookup(current_user, cleaned)
@@ -982,7 +1483,12 @@ class AdminHRAssistant:
             return self._policy_summary(current_user)
 
         if intent == "policy_question":
-            return self._policy_question(current_user, cleaned)
+            policy_question = cleaned
+            if self._is_explicit_follow_up(normalized):
+                previous_question = self._history_last_user_question(history)
+                if previous_question:
+                    policy_question = f"{previous_question} {cleaned}"
+            return self._policy_question(current_user, policy_question)
 
         if intent == "announcement_summary":
             return self._announcement_summary(current_user)
@@ -1004,9 +1510,10 @@ class AdminHRAssistant:
                 "Leave Management",
             ),
             "policy_howto": (
-                "Open **Policies** to upload PDF, DOCX, TXT, or Markdown files. "
-                "Review the extracted content, publish the version, manage "
-                "metadata, or move a policy to the Bin.",
+                "Open **Policies** to upload/manage policy files or maintain the "
+                "**Violations & Disciplinary Actions** master list. For actual employee "
+                "cases, open **Employees → Violations / Disciplinary Records**. Case "
+                "penalty guidance stays linked to the master violation list.",
                 "Open Policies",
                 "Policies",
             ),
@@ -1070,6 +1577,20 @@ class AdminHRAssistant:
                 "announcement_howto": {"announcement_view": "create"},
                 "company_forms": {"form_view": "overview"},
             }.get(intent)
+            if intent == "policy_howto" and self._contains_any(
+                normalized,
+                {"violation", "violations", "offense", "offenses", "disciplinary"},
+            ):
+                if self._contains_any(
+                    normalized,
+                    {"employee case", "disciplinary case", "assign violation", "issue violation", "case record"},
+                ):
+                    page = "Employees"
+                    exact_params = {"employee_view": "disciplinary"}
+                    label = "Open Disciplinary Records"
+                else:
+                    exact_params = {"policy_view": "violations"}
+                    label = "Open Violations & Disciplinary Actions"
             return HRAssistantResponse(
                 answer=answer,
                 intent=intent,
@@ -1078,6 +1599,24 @@ class AdminHRAssistant:
                         label,
                         page,
                         query_params=exact_params,
+                    )
+                ],
+            )
+
+        # Final company-rule fallback for a natural HR question.
+        violation_answer = self.violation_service.answer_question(
+            company_id=current_user.company_id,
+            question=cleaned,
+        )
+        if violation_answer is not None:
+            return HRAssistantResponse(
+                answer=violation_answer,
+                intent="policy_violation",
+                actions=[
+                    self._admin_action(
+                        "Open Violations & Disciplinary Actions",
+                        "Policies",
+                        query_params={"policy_view": "violations"},
                     )
                 ],
             )

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Integer, Numeric, String
+from sqlalchemy import Boolean, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.constants import DEFAULT_COMPANY_THEME_COLOR
@@ -71,6 +71,49 @@ class Company(TimestampMixin, Base):
         Integer,
         default=60,
         server_default="60",
+        nullable=False,
+    )
+
+    # Company-configurable OT and shifting-credit policy.  These defaults
+    # preserve the HR rules currently used by the company while keeping the
+    # exclusions editable instead of hard-coding a senior-position ladder.
+    ot_dinner_break_deduction_hours: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        default=Decimal("0.75"),
+        server_default="0.75",
+        nullable=False,
+    )
+    shifting_credits_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1", nullable=False
+    )
+    shifting_credit_block_hours: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        default=Decimal("4.00"),
+        server_default="4.00",
+        nullable=False,
+    )
+    shifting_credit_required_blocks: Mapped[int] = mapped_column(
+        Integer, default=2, server_default="2", nullable=False
+    )
+    shifting_credit_cutoff_day: Mapped[int] = mapped_column(
+        Integer, default=15, server_default="15", nullable=False
+    )
+    shifting_credit_additional_vl_threshold_hours: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        default=Decimal("8.00"),
+        server_default="8.00",
+        nullable=False,
+    )
+    shifting_credit_additional_vl_days: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        default=Decimal("0.50"),
+        server_default="0.50",
+        nullable=False,
+    )
+    shifting_credit_excluded_positions_json: Mapped[str] = mapped_column(
+        Text,
+        default='["Trainee", "Design Engineer I", "Design Engineer II"]',
+        server_default='["Trainee", "Design Engineer I", "Design Engineer II"]',
         nullable=False,
     )
     work_monday: Mapped[bool] = mapped_column(

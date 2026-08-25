@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -14,6 +15,7 @@ from services.company_form_service import (
     CompanyFormService,
 )
 from ui.components.data_table import render_selectable_admin_table
+from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.company_form_download import (
     prepare_editable_company_form_download,
 )
@@ -590,9 +592,15 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
             _remember_tab("Bin")
             st.rerun()
 
+        delete_confirmation_key = f"confirm_company_form_delete_{selected_id}"
+        invalidate_confirmation_on_change(
+            confirmation_key=delete_confirmation_key,
+            dependencies={"form_id": selected_id},
+            tracker_key="__company_form_permanent_delete_target_confirmation",
+        )
         confirm_delete = action_columns[1].checkbox(
             "Confirm permanent deletion",
-            key=f"confirm_company_form_delete_{selected_id}",
+            key=delete_confirmation_key,
         )
         if st.button(
             "Permanently Delete Form",
@@ -641,10 +649,9 @@ def render_company_forms_documents_page(
         # preserves the requested tab without Streamlit's duplicate
         # default/session-state warning.
         st.session_state["company_forms_active_tab"] = requested_tab
-    tabs = st.tabs(
+    tabs = persistent_tabs(
         TAB_LABELS,
         key="company_forms_active_tab",
-        on_change="rerun",
     )
 
     with tabs[0]:

@@ -7,7 +7,7 @@ from authentication.current_user import AuthenticatedUser
 from authentication.session_manager import AuthSessionManager
 from ui.components.company_logo import render_company_sidebar_logo
 from core.constants import USER_NAVIGATION
-from ui.navigation_state import set_navigation_state
+from ui.navigation_state import set_sidebar_navigation_state
 
 
 def render_sidebar(
@@ -39,7 +39,7 @@ def render_sidebar(
             type=button_type,
             key=f"nav_{page_name}",
         ):
-            set_navigation_state(
+            set_sidebar_navigation_state(
                 portal_mode="employee",
                 current_page=page_name,
             )
@@ -54,7 +54,7 @@ def render_sidebar(
             width="stretch",
             key="admin_portal_button",
         ):
-            set_navigation_state(
+            set_sidebar_navigation_state(
                 portal_mode="admin",
                 current_page="Admin Dashboard",
             )

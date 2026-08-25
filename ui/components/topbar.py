@@ -10,6 +10,10 @@ from config.settings import get_settings
 from database.session import SessionFactory
 from services.notification_service import NotificationService
 from ui.navigation_state import set_navigation_state
+from ui.components.employee_profile_photo import (
+    load_profile_photo_bytes,
+    profile_avatar_html,
+)
 
 
 _NOTIFICATION_CATEGORY_RULES: tuple[
@@ -41,6 +45,11 @@ _NOTIFICATION_CATEGORY_RULES: tuple[
         ("company_form", "form_submitted", "form_status"),
         "📝",
         "Company Form",
+    ),
+    (
+        ("disciplinary",),
+        "⚖️",
+        "Disciplinary",
     ),
     (
         ("policy", "document"),
@@ -164,10 +173,12 @@ _NOTIFICATION_CONTEXT_QUERY_KEYS = (
     "leave_request_id",
     "leave_view",
     "policy_id",
+    "policy_view",
     "company_form_id",
     "form_submission_id",
     "form_view",
     "employee_id",
+    "employee_view",
 )
 
 
@@ -193,6 +204,8 @@ def _notification_destination(
             return "admin", "Leave Management"
         if "company_form" in entity or "form_submission" in entity:
             return "admin", "Company Form/Documents"
+        if "disciplinary" in entity:
+            return "admin", "Employees"
         if any(
             value in entity
             for value in ("policy", "document")
@@ -222,6 +235,8 @@ def _notification_destination(
         return "employee", "Leave Management"
     if "company_form" in entity or "form_submission" in entity:
         return "employee", "Company Form/Documents"
+    if "disciplinary" in entity:
+        return "employee", "Company Policies"
     if any(
         value in entity
         for value in ("policy", "document")
@@ -295,6 +310,8 @@ def _notification_entity_query_key(item) -> str | None:
         return "form_submission_id"
     if "company_form" in entity:
         return "company_form_id"
+    if "disciplinary" in entity:
+        return None
     if "policy" in entity or "document" in entity:
         return "policy_id"
     if any(
@@ -389,6 +406,11 @@ def _open_notification(
         ] = item.related_entity_id
 
     entity = str(item.related_entity_type or item.event_type or "").strip().casefold()
+    if "disciplinary" in entity:
+        if target_portal == "admin":
+            st.query_params["employee_view"] = "disciplinary"
+        else:
+            st.query_params["policy_view"] = "disciplinary"
     if target_portal == "employee" and "announcement" in entity:
         st.session_state["employee_dashboard_active_tab"] = "Announcements"
     if "company_form" in entity or "form_submission" in entity:
@@ -632,31 +654,56 @@ def render_topbar(
         if current_user.clearance == 1
         else "User"
     )
-
-    content, bell = st.columns(
-        [9.1, 0.9],
-        vertical_alignment="center",
+    profile_photo = load_profile_photo_bytes(
+        current_user=current_user,
+        employee_id=current_user.employee_id,
+    )
+    avatar_html = profile_avatar_html(
+        image_bytes=profile_photo,
+        display_name=display_name,
+        fallback=current_user.employee_number or current_user.username,
+        css_class="hr-topbar-avatar",
     )
 
-    with content:
-        st.markdown(
-            f"""
-            <div class="hr-topbar">
-                <div>
-                    <div class="hr-brand">
-                        {escape(company_name)}
-                    </div>
-                    <div class="hr-muted">
-                        {escape(section_name)}
-                    </div>
-                </div>
-                <div class="hr-muted">
-                    {escape(display_name)} · {access_label}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    # Keep the actual portal header visible while long pages scroll.
+    # The keyed Streamlit container gives the theme a stable project-owned
+    # selector without relying on brittle generated DOM class names.
+    with st.container(key="hr_global_topbar_shell"):
+        content, bell = st.columns(
+            [9.1, 0.9],
+            vertical_alignment="center",
         )
 
-    with bell:
-        _render_notification_bell(current_user)
+        with content:
+            st.markdown(
+                f"""
+                <div class="hr-topbar">
+                    <div class="hr-topbar-company">
+                        <div class="hr-brand">
+                            {escape(company_name)}
+                        </div>
+                        <div class="hr-muted hr-topbar-section">
+                            {escape(section_name)}
+                        </div>
+                    </div>
+                    <div class="hr-topbar-identity">
+                        {avatar_html}
+                        <span class="hr-muted hr-topbar-account">
+                            {escape(display_name)} · {access_label}
+                        </span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with bell:
+            _render_notification_bell(current_user)
+
+    # v8.8.190: keep a compact normal-flow spacer outside the viewport-fixed shell.
+    # The theme restores the original v8.8.186 banner geometry while only the
+    # positioning host is fixed, so page content never sits underneath it.
+    st.markdown(
+        '<div class="hr-topbar-flow-spacer" aria-hidden="true"></div>',
+        unsafe_allow_html=True,
+    )

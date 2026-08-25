@@ -7,6 +7,7 @@ from pydantic import ValidationError
 import json
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -1730,10 +1731,9 @@ def render_employee_leave_management_page(
     if approver_mode:
         labels.extend(["Pending Approvals", "Reviewed Requests"])
 
-    tabs = st.tabs(
+    tabs = persistent_tabs(
         labels,
         key="employee_leave_management_active_tab",
-        on_change="rerun",
     )
     tab_by_label = dict(zip(labels, tabs))
 

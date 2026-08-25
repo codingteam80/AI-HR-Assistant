@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.persistent_tabs import persistent_tabs
 
 from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
@@ -452,10 +453,9 @@ def render_employee_company_forms_documents_page(
         # Supplying both ``default`` and a stored value emits a Streamlit
         # warning and is intentionally avoided.
         st.session_state["employee_company_forms_active_tab"] = requested_tab
-    tabs = st.tabs(
+    tabs = persistent_tabs(
         EMPLOYEE_FORM_TABS,
         key="employee_company_forms_active_tab",
-        on_change="rerun",
     )
     with tabs[0]:
         _render_view(current_user, forms)

@@ -12,12 +12,17 @@ from integrations.email.email_sender import EmailDeliveryError
 from integrations.sms.sms_sender import SmsDeliveryError
 from services.email_integration_service import EmailIntegrationService
 from services.external_notification_service import ExternalNotificationService
+from services.runtime_connection_service import (
+    classify_runtime_connection_issue,
+    log_runtime_connection_issue,
+)
 from services.notification_configuration_service import (
     NotificationConfigurationError,
     NotificationConfigurationService,
 )
 from ui.components.data_table import render_admin_table
 from ui.components.validation_feedback import render_action_warning
+from ui.components.runtime_connection_notice import render_runtime_connection_notice
 
 
 def _display_value(value, *, missing: str = "Not configured") -> str:
@@ -263,12 +268,26 @@ def _email_configuration_section(
             )
             st.caption(f"Sent at {result.sent_at.isoformat()}.")
         except EmailDeliveryError as error:
-            render_action_warning(error)
-        except Exception:
-            st.error(
-                "The test email could not be sent. Review the detected/custom "
-                "mail settings, account credential, and network access."
-            )
+            issue = classify_runtime_connection_issue(error, service_hint="email")
+            if issue is None:
+                render_action_warning(error)
+            else:
+                log_runtime_connection_issue(
+                    error, issue, context="admin_test_email"
+                )
+                render_runtime_connection_notice(issue, popup=True)
+        except Exception as error:
+            issue = classify_runtime_connection_issue(error, service_hint="email")
+            if issue is None:
+                st.error(
+                    "The test email could not be sent. Review the detected/custom "
+                    "mail settings and account credential."
+                )
+            else:
+                log_runtime_connection_issue(
+                    error, issue, context="admin_test_email"
+                )
+                render_runtime_connection_notice(issue, popup=True)
 
 
 def _sms_configuration_section() -> None:
@@ -447,12 +466,26 @@ def _sms_configuration_section() -> None:
                 f"Provider reference: {reference}"
             )
         except SmsDeliveryError as error:
-            render_action_warning(error)
-        except Exception:
-            st.error(
-                "The test SMS could not be sent. Review the company SMS "
-                "gateway settings, sender, destination, and network access."
-            )
+            issue = classify_runtime_connection_issue(error, service_hint="sms")
+            if issue is None:
+                render_action_warning(error)
+            else:
+                log_runtime_connection_issue(
+                    error, issue, context="admin_test_sms"
+                )
+                render_runtime_connection_notice(issue, popup=True)
+        except Exception as error:
+            issue = classify_runtime_connection_issue(error, service_hint="sms")
+            if issue is None:
+                st.error(
+                    "The test SMS could not be sent. Review the company SMS "
+                    "gateway settings, sender, and destination."
+                )
+            else:
+                log_runtime_connection_issue(
+                    error, issue, context="admin_test_sms"
+                )
+                render_runtime_connection_notice(issue, popup=True)
 
 
 def render_integrations_page(current_user: AuthenticatedUser) -> None:

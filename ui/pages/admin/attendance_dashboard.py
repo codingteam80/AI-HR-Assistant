@@ -7,6 +7,10 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 from ui.components.validation_feedback import render_action_warning
+from ui.components.confirmation_guard import (
+    clear_confirmation_tracking,
+    invalidate_confirmation_on_change,
+)
 from pydantic import ValidationError
 from sqlalchemy import select
 
@@ -14,6 +18,7 @@ from authentication.current_user import AuthenticatedUser
 from config.settings import get_settings
 from database.session import SessionFactory
 from models.department import Department
+from models.employee import Employee
 from modules.reports.attendance_report import (
     build_attendance_excel,
     build_attendance_pdf,
@@ -22,6 +27,7 @@ from schemas.attendance_schema import (
     AttendanceCorrectionInput,
     AttendanceSessionInput,
     CompanyAttendanceCalendarInput,
+    CompanyOvertimeRulesInput,
 )
 from schemas.overtime_schema import OvertimeReviewInput
 from services.attendance_service import AttendanceService
@@ -60,8 +66,11 @@ def _render_overtime_approvals(current_user: AuthenticatedUser) -> None:
                     "Request ID": item.public_id,
                     "Employee": item.employee.full_name,
                     "Date": item.date_rendered.isoformat(),
-                    "Submitted Hours": f"{Decimal(item.estimated_hours):.2f}",
+                    "Gross Hours": f"{Decimal(item.estimated_hours):.2f}",
+                    "Payable OT": f"{Decimal(item.payable_hours):.2f}",
                     "DTR Hours": f"{Decimal(item.dtr_estimated_hours):.2f}",
+                    "Shift Credit": f"{Decimal(item.shifting_credit_hours):.2f}",
+                    "Add'l VL": f"{Decimal(item.additional_vl_days):.2f}",
                     "OT Type": item.ot_type,
                     "DTR Review": "Mismatch" if item.has_dtr_mismatch else "Matched",
                 }
@@ -90,7 +99,12 @@ def _render_overtime_approvals(current_user: AuthenticatedUser) -> None:
             )
             details[1].markdown(
                 f"**Employee request**  \n"
-                f"Submitted OT: {selected.estimated_hours} hour(s)"
+                f"Gross OT: {Decimal(selected.estimated_hours):.2f} hour(s)  \n"
+                f"Payable OT: {Decimal(selected.payable_hours):.2f} hour(s)"
+            )
+            st.caption(
+                f"Shifting Credit: {Decimal(selected.shifting_credit_hours):.2f} hour(s) · "
+                f"Additional VL: {Decimal(selected.additional_vl_days):.2f} day(s)"
             )
             st.write(f"**Purpose:** {selected.ot_purpose}")
             st.caption(
@@ -168,6 +182,35 @@ def _render_attendance_settings(
         company = service.get_company(current_user.company_id)
         regular_hours = float(company.attendance_regular_hours)
         lunch_minutes = int(company.attendance_lunch_minutes)
+        dinner_deduction = float(company.ot_dinner_break_deduction_hours)
+        shifting_enabled = bool(company.shifting_credits_enabled)
+        shifting_block_hours = float(company.shifting_credit_block_hours)
+        shifting_required_blocks = int(company.shifting_credit_required_blocks)
+        shifting_cutoff_day = int(company.shifting_credit_cutoff_day)
+        additional_vl_threshold = float(
+            company.shifting_credit_additional_vl_threshold_hours
+        )
+        additional_vl_days = float(company.shifting_credit_additional_vl_days)
+        excluded_positions = service.overtime_excluded_positions(company)
+        current_positions = [
+            value
+            for value in session.scalars(
+                select(Employee.job_title)
+                .where(
+                    Employee.company_id == current_user.company_id,
+                    Employee.employment_status == "employed",
+                    Employee.archived_at.is_(None),
+                    Employee.job_title.is_not(None),
+                )
+                .distinct()
+                .order_by(Employee.job_title)
+            ).all()
+            if value and value.strip()
+        ]
+        position_options = sorted(
+            set(current_positions) | set(excluded_positions),
+            key=str.casefold,
+        )
         workdays = service.monthly_workday_map(
             company_id=current_user.company_id,
             year=year,
@@ -270,6 +313,172 @@ def _render_attendance_settings(
                 render_action_warning(error)
             except Exception:
                 st.error("The attendance schedule could not be updated.")
+
+        st.divider()
+        st.markdown("**OT & Shifting Credits Rules**")
+        st.caption(
+            "Dinner-break deduction applies to payable OT. Shifting-credit "
+            "eligibility uses an exclusion list: every other position is "
+            "eligible automatically."
+        )
+        shifting_enabled_value = st.checkbox(
+            "Enable Shifting Credits",
+            value=shifting_enabled,
+            key=f"shifting_credits_enabled_{current_user.company_id}",
+        )
+        first_rule_row = st.columns(3)
+        with first_rule_row[0]:
+            dinner_deduction_value = st.number_input(
+                "Dinner Break Deduction (hours)",
+                min_value=0.0,
+                max_value=8.0,
+                value=dinner_deduction,
+                step=0.25,
+                key=f"ot_dinner_deduction_{current_user.company_id}",
+                help=(
+                    "When Dinner Break is Yes on an OT request, this amount "
+                    "is deducted from payable OT hours."
+                ),
+            )
+        with first_rule_row[1]:
+            shifting_block_value = st.number_input(
+                "Qualifying Shifting-Credit Block (hours)",
+                min_value=0.25,
+                max_value=24.0,
+                value=shifting_block_hours,
+                step=0.25,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_block_hours_{current_user.company_id}",
+            )
+        with first_rule_row[2]:
+            required_blocks_value = st.number_input(
+                "Required Blocks within Cut-off",
+                min_value=2,
+                max_value=10,
+                value=shifting_required_blocks,
+                step=1,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_required_blocks_{current_user.company_id}",
+            )
+
+        second_rule_row = st.columns(3)
+        with second_rule_row[0]:
+            cutoff_day_value = st.number_input(
+                "First Cut-off End Day",
+                min_value=1,
+                max_value=28,
+                value=shifting_cutoff_day,
+                step=1,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_cutoff_day_{current_user.company_id}",
+                help=(
+                    "Example: 15 means one cut-off is day 1–15 and the next "
+                    "is day 16 through month-end."
+                ),
+            )
+        with second_rule_row[1]:
+            vl_threshold_value = st.number_input(
+                "Additional VL Qualifying OT Hours",
+                min_value=0.25,
+                max_value=24.0,
+                value=additional_vl_threshold,
+                step=0.25,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_vl_threshold_{current_user.company_id}",
+                help=(
+                    "A single eligible OT request at or above this gross "
+                    "rendered duration earns the configured additional VL."
+                ),
+            )
+        with second_rule_row[2]:
+            additional_vl_value = st.number_input(
+                "Additional VL (days)",
+                min_value=0.0,
+                max_value=5.0,
+                value=additional_vl_days,
+                step=0.25,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_additional_vl_{current_user.company_id}",
+            )
+
+        excluded_positions_value = st.multiselect(
+            "Shifting Credit Excluded Positions",
+            position_options,
+            default=[value for value in excluded_positions if value in position_options],
+            disabled=not shifting_enabled_value,
+            key=f"shifting_excluded_positions_{current_user.company_id}",
+            help=(
+                "All positions not selected here are eligible. Defaults cover "
+                "Trainee, Design Engineer I (DE1), and Design Engineer II (DE2). "
+                "Current Employee Master positions are available for selection."
+            ),
+        )
+        st.caption(
+            "Default rule: two 4-hour blocks in the same cut-off are marked "
+            "as Shifting Credits. One unmatched 4-hour block remains payable "
+            "OT. A qualifying 8-hour OT remains payable OT and earns 0.5 VL. "
+            "Qualification uses gross rendered hours; dinner-break deduction "
+            "affects payable OT only."
+        )
+
+        ot_rules_key_prefix = f"company_ot_shifting_rules_{current_user.company_id}"
+        confirmation_key = f"{ot_rules_key_prefix}_reviewed"
+        invalidate_confirmation_on_change(
+            confirmation_key=confirmation_key,
+            dependencies={
+                "shifting_credits_enabled": shifting_enabled_value,
+                "dinner_break_deduction_hours": dinner_deduction_value,
+                "shifting_credit_block_hours": shifting_block_value,
+                "shifting_credit_required_blocks": int(required_blocks_value),
+                "shifting_credit_cutoff_day": int(cutoff_day_value),
+                "additional_vl_threshold_hours": vl_threshold_value,
+                "additional_vl_days": additional_vl_value,
+                "excluded_positions": tuple(
+                    sorted(excluded_positions_value, key=str.casefold)
+                ),
+            },
+        )
+        confirm_ot_rules = st.checkbox(
+            "I reviewed and validated the OT & Shifting Credits rules.",
+            key=confirmation_key,
+            help=(
+                "Any change to the OT or Shifting Credits settings after this "
+                "box is checked automatically clears the confirmation."
+            ),
+        )
+
+        save_ot_rules = st.button(
+            "Save OT & Shifting Rules",
+            type="primary",
+            width="stretch",
+            disabled=not confirm_ot_rules,
+            key=f"save_ot_shifting_rules_{current_user.company_id}",
+        )
+        if save_ot_rules:
+            try:
+                values = CompanyOvertimeRulesInput(
+                    company_id=current_user.company_id,
+                    dinner_break_deduction_hours=dinner_deduction_value,
+                    shifting_credits_enabled=shifting_enabled_value,
+                    shifting_credit_block_hours=shifting_block_value,
+                    shifting_credit_required_blocks=int(required_blocks_value),
+                    shifting_credit_cutoff_day=int(cutoff_day_value),
+                    additional_vl_threshold_hours=vl_threshold_value,
+                    additional_vl_days=additional_vl_value,
+                    excluded_positions=excluded_positions_value,
+                )
+                with SessionFactory() as session:
+                    AttendanceService(session).save_overtime_rules(values)
+                set_operation_feedback(
+                    "OT and Shifting Credits rules were updated.",
+                    namespace="admin_attendance",
+                )
+                clear_confirmation_tracking(confirmation_key)
+                st.rerun()
+            except (ValidationError, ValueError) as error:
+                render_action_warning(error)
+            except Exception:
+                st.error("The OT and Shifting Credits rules could not be updated.")
 
 
 def _render_correction(

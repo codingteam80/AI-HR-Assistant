@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import calendar
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,12 +14,14 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from models.attendance_record import AttendanceRecord
+from models.company import Company
 from models.employee import Employee
 from models.overtime_request import OvertimeRequest
 from models.user import User
 from repositories.attendance_repository import AttendanceRepository
 from repositories.overtime_repository import OvertimeRequestRepository
 from schemas.overtime_schema import OvertimeRequestInput, OvertimeReviewInput
+from services.leave_service import LeaveService
 from services.notification_service import NotificationService
 
 
@@ -34,6 +38,20 @@ class OvertimeDTRReference:
     estimated_hours: Decimal
 
 
+@dataclass(slots=True, frozen=True)
+class OvertimeRuleSnapshot:
+    """Detached company OT/shifting settings safe for UI calculations."""
+
+    dinner_break_deduction_hours: Decimal
+    shifting_credits_enabled: bool
+    shifting_credit_block_hours: Decimal
+    shifting_credit_required_blocks: int
+    shifting_credit_cutoff_day: int
+    additional_vl_threshold_hours: Decimal
+    additional_vl_days: Decimal
+    excluded_positions: tuple[str, ...]
+
+
 class OvertimeService:
     """Enforce ownership, DTR grounding, routing, and OT decisions."""
 
@@ -44,6 +62,201 @@ class OvertimeService:
         self.repository = OvertimeRequestRepository(session)
         self.attendance_repository = AttendanceRepository(session)
         self.timezone = ZoneInfo(get_settings().display_timezone)
+
+    def _company(self, company_id: int) -> Company:
+        company = self.session.get(Company, company_id)
+        if company is None:
+            raise ValueError("The company record was not found.")
+        return company
+
+    @staticmethod
+    def _normalized_position(value: str | None) -> str:
+        return " ".join((value or "").strip().casefold().split())
+
+    @classmethod
+    def _position_tokens(cls, value: str | None) -> set[str]:
+        """Return exact and DE1/DE2 alias tokens for exclusion matching."""
+
+        token = cls._normalized_position(value)
+        tokens = {token} if token else set()
+        aliases = {
+            "de1": "design engineer i",
+            "design engineer 1": "design engineer i",
+            "design engineer i": "de1",
+            "de2": "design engineer ii",
+            "design engineer 2": "design engineer ii",
+            "design engineer ii": "de2",
+        }
+        alias = aliases.get(token)
+        if alias:
+            tokens.add(alias)
+        return tokens
+
+    @staticmethod
+    def _excluded_positions(company: Company) -> tuple[str, ...]:
+        raw = company.shifting_credit_excluded_positions_json or "[]"
+        try:
+            values = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            values = []
+        if not isinstance(values, list):
+            values = []
+        cleaned = []
+        seen = set()
+        for raw_value in values:
+            value = " ".join(str(raw_value or "").strip().split())
+            token = value.casefold()
+            if value and token not in seen:
+                seen.add(token)
+                cleaned.append(value)
+        return tuple(cleaned)
+
+    def rule_snapshot(self, company_id: int) -> OvertimeRuleSnapshot:
+        company = self._company(company_id)
+        return OvertimeRuleSnapshot(
+            dinner_break_deduction_hours=Decimal(
+                company.ot_dinner_break_deduction_hours
+            ),
+            shifting_credits_enabled=bool(company.shifting_credits_enabled),
+            shifting_credit_block_hours=Decimal(company.shifting_credit_block_hours),
+            shifting_credit_required_blocks=int(company.shifting_credit_required_blocks),
+            shifting_credit_cutoff_day=int(company.shifting_credit_cutoff_day),
+            additional_vl_threshold_hours=Decimal(
+                company.shifting_credit_additional_vl_threshold_hours
+            ),
+            additional_vl_days=Decimal(company.shifting_credit_additional_vl_days),
+            excluded_positions=self._excluded_positions(company),
+        )
+
+    def shifting_eligibility(
+        self, *, company_id: int, employee_id: int
+    ) -> tuple[bool, str | None]:
+        rules = self.rule_snapshot(company_id)
+        employee = self._employee(company_id, employee_id)
+        return self._is_shifting_eligible(employee, rules), employee.job_title
+
+    @staticmethod
+    def payable_hours_before_shifting(
+        gross_hours: Decimal,
+        *,
+        dinner_break_flag: bool,
+        dinner_break_deduction_hours: Decimal,
+    ) -> Decimal:
+        deduction = dinner_break_deduction_hours if dinner_break_flag else Decimal("0")
+        return max(Decimal("0.00"), Decimal(gross_hours) - deduction).quantize(
+            Decimal("0.01")
+        )
+
+    @classmethod
+    def _is_shifting_eligible(
+        cls, employee: Employee, rules: OvertimeRuleSnapshot
+    ) -> bool:
+        employee_tokens = cls._position_tokens(employee.job_title)
+        if not employee_tokens:
+            return True
+        excluded_tokens: set[str] = set()
+        for position in rules.excluded_positions:
+            excluded_tokens.update(cls._position_tokens(position))
+        return employee_tokens.isdisjoint(excluded_tokens)
+
+    @staticmethod
+    def _cutoff_range(work_date: date, cutoff_day: int) -> tuple[date, date]:
+        last_day = calendar.monthrange(work_date.year, work_date.month)[1]
+        split = min(max(int(cutoff_day), 1), last_day - 1)
+        if work_date.day <= split:
+            return date(work_date.year, work_date.month, 1), date(
+                work_date.year, work_date.month, split
+            )
+        return date(work_date.year, work_date.month, split + 1), date(
+            work_date.year, work_date.month, last_day
+        )
+
+    def _recalculate_payable(
+        self, request: OvertimeRequest, rules: OvertimeRuleSnapshot
+    ) -> None:
+        dinner_deduction = (
+            rules.dinner_break_deduction_hours
+            if request.dinner_break_flag
+            else Decimal("0")
+        )
+        request.payable_hours = max(
+            Decimal("0.00"),
+            Decimal(request.estimated_hours)
+            - dinner_deduction
+            - Decimal(request.shifting_credit_hours or 0),
+        ).quantize(Decimal("0.01"))
+
+    def _apply_shifting_credit_rules(
+        self, request: OvertimeRequest, *, reviewed_by_user_id: int
+    ) -> None:
+        """Apply dinner deduction, 4-hour pairing, and automatic VL credit."""
+
+        company = self._company(request.company_id)
+        rules = self.rule_snapshot(request.company_id)
+        employee = self._employee(request.company_id, request.employee_id)
+
+        request.shifting_credit_hours = Decimal("0.00")
+        request.shifting_credit_group = None
+        request.additional_vl_days = Decimal("0.00")
+        self._recalculate_payable(request, rules)
+
+        if not rules.shifting_credits_enabled or not self._is_shifting_eligible(
+            employee, rules
+        ):
+            return
+
+        gross_hours = Decimal(request.estimated_hours)
+        if gross_hours >= rules.additional_vl_threshold_hours:
+            if rules.additional_vl_days > 0:
+                LeaveService(self.session).grant_overtime_additional_vl(
+                    company_id=request.company_id,
+                    employee_id=request.employee_id,
+                    overtime_public_id=request.public_id,
+                    overtime_date=request.date_rendered,
+                    days=rules.additional_vl_days,
+                    created_by_user_id=reviewed_by_user_id,
+                )
+                request.additional_vl_days = rules.additional_vl_days
+            return
+
+        if gross_hours < rules.shifting_credit_block_hours:
+            return
+
+        cutoff_start, cutoff_end = self._cutoff_range(
+            request.date_rendered, rules.shifting_credit_cutoff_day
+        )
+        needed_previous = rules.shifting_credit_required_blocks - 1
+        previous = list(
+            self.session.scalars(
+                select(OvertimeRequest)
+                .where(
+                    OvertimeRequest.company_id == request.company_id,
+                    OvertimeRequest.employee_id == request.employee_id,
+                    OvertimeRequest.id != request.id,
+                    OvertimeRequest.status == "approved",
+                    OvertimeRequest.date_rendered >= cutoff_start,
+                    OvertimeRequest.date_rendered <= cutoff_end,
+                    OvertimeRequest.estimated_hours >= rules.shifting_credit_block_hours,
+                    OvertimeRequest.estimated_hours < rules.additional_vl_threshold_hours,
+                    OvertimeRequest.shifting_credit_hours == Decimal("0.00"),
+                )
+                .order_by(
+                    OvertimeRequest.date_rendered.asc(), OvertimeRequest.id.asc()
+                )
+                .limit(needed_previous)
+            ).all()
+        )
+        if len(previous) < needed_previous:
+            return
+
+        group_key = (
+            f"SC_{request.company_id}_{request.employee_id}_"
+            f"{cutoff_start:%Y%m%d}_{cutoff_end:%Y%m%d}_{request.id}"
+        )
+        for item in [*previous, request]:
+            item.shifting_credit_hours = rules.shifting_credit_block_hours
+            item.shifting_credit_group = group_key
+            self._recalculate_payable(item, rules)
 
     def _employee(self, company_id: int, employee_id: int) -> Employee:
         employee = self.session.scalar(
@@ -188,6 +401,12 @@ class OvertimeService:
             or abs(Decimal(values.estimated_hours) - reference.estimated_hours) > tolerance
         )
         approver_id = employee.leader_id or employee.manager_id
+        rules = self.rule_snapshot(values.company_id)
+        payable_hours = self.payable_hours_before_shifting(
+            Decimal(values.estimated_hours),
+            dinner_break_flag=values.dinner_break_flag,
+            dinner_break_deduction_hours=rules.dinner_break_deduction_hours,
+        )
         request = OvertimeRequest(
             public_id=self._next_public_id(),
             company_id=values.company_id,
@@ -204,6 +423,9 @@ class OvertimeService:
             ot_time_start=start_utc,
             ot_time_end=end_utc,
             estimated_hours=values.estimated_hours,
+            payable_hours=payable_hours,
+            shifting_credit_hours=Decimal("0.00"),
+            additional_vl_days=Decimal("0.00"),
             ot_type=values.ot_type,
             ot_purpose=values.ot_purpose,
             travel_fare=values.travel_fare,
@@ -270,6 +492,10 @@ class OvertimeService:
         request.reviewer_comment = values.comment
         request.reviewed_by_user_id = values.reviewed_by_user_id
         request.reviewed_at = datetime.now(timezone.utc)
+        if values.decision == "approved":
+            self._apply_shifting_credit_rules(
+                request, reviewed_by_user_id=values.reviewed_by_user_id
+            )
         owner = self._employee(values.company_id, request.employee_id)
         if owner.user_id is not None:
             NotificationService(self.session).create(
@@ -280,6 +506,11 @@ class OvertimeService:
                 message=(
                     f"{request.public_id} for {request.date_rendered:%b %d, %Y} "
                     f"was {values.decision}."
+                    + (
+                        f" Payable OT: {Decimal(request.payable_hours):.2f} hour(s)."
+                        if values.decision == "approved"
+                        else ""
+                    )
                 ),
                 related_entity_type="overtime_request",
                 related_entity_id=request.id,

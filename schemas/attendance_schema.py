@@ -158,3 +158,42 @@ class CompanyAttendanceCalendarInput(BaseModel):
             )
         self.work_dates = sorted(set(self.work_dates))
         return self
+
+
+class CompanyOvertimeRulesInput(BaseModel):
+    """Company-editable OT and shifting-credit settings."""
+
+    company_id: int
+    dinner_break_deduction_hours: Decimal = Field(ge=0, le=8)
+    shifting_credits_enabled: bool = True
+    shifting_credit_block_hours: Decimal = Field(gt=0, le=24)
+    shifting_credit_required_blocks: int = Field(ge=2, le=10)
+    shifting_credit_cutoff_day: int = Field(ge=1, le=28)
+    additional_vl_threshold_hours: Decimal = Field(gt=0, le=24)
+    additional_vl_days: Decimal = Field(ge=0, le=5)
+    excluded_positions: list[str] = Field(default_factory=list)
+
+    @field_validator("excluded_positions")
+    @classmethod
+    def normalize_excluded_positions(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            value = " ".join(str(raw or "").strip().split())
+            if not value:
+                continue
+            token = value.casefold()
+            if token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(value)
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_thresholds(self):
+        if self.additional_vl_threshold_hours < self.shifting_credit_block_hours:
+            raise ValueError(
+                "Additional VL qualifying hours cannot be lower than the "
+                "shifting-credit block hours."
+            )
+        return self

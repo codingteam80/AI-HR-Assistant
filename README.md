@@ -4,6 +4,10 @@ AI HR Assistant is a local Streamlit HR portal with separate administrator and e
 
 This README is an execution and setup guide. Release history is intentionally not maintained here.
 
+### Authoritative setup files
+
+Use the project-root `README.md` and `requirements.txt` as the single source of truth for setup and dependencies. The legacy `schemas/README.md` and `schemas/requirements.txt` are compatibility pointers only and must not maintain a separate dependency/setup copy.
+
 ## 1. Requirements
 
 Recommended local environment:
@@ -136,6 +140,15 @@ The default local Ollama endpoint is:
 ```text
 http://localhost:11434
 ```
+
+The Chat Assistant uses a hybrid company-knowledge design: deterministic
+company-scoped queries for structured HR records and permission-sensitive
+data, plus grounded retrieval for published policies, portal workflows, and
+readable Company Form/Documents file content. Admin questions can return live
+employee lists, hierarchy-derived Manager/Leader sets, date-aware HR results,
+follow-up counts/lists, and charts when the requested comparison benefits from
+a visual. Employee responses remain restricted to the employee's authorized
+self/team scope and published company information.
 
 ## 7. Run the Application
 

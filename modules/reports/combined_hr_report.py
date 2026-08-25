@@ -381,7 +381,7 @@ def _build_ot_sheet(
             "travel_fare",
             "travel_route",
             "dinner_break_flag",
-            "",
+            "approval/remarks",
         ]
     )
     approved_requests = sorted(
@@ -407,13 +407,31 @@ def _build_ot_sheet(
                 local_start.strftime("%p") if local_start else "",
                 _clock_text(local_end),
                 local_end.strftime("%p") if local_end else "",
-                float(request.estimated_hours),
+                float(request.payable_hours),
                 request.ot_type,
                 request.ot_purpose,
                 float(request.travel_fare) if request.travel_fare is not None else None,
                 request.travel_route or "",
                 1 if request.dinner_break_flag else 0,
-                "CC",
+                "; ".join(
+                    value
+                    for value in (
+                        "CC",
+                        (
+                            f"Shifting Credit: "
+                            f"{Decimal(request.shifting_credit_hours):.2f} hrs"
+                            if Decimal(request.shifting_credit_hours or 0) > 0
+                            else ""
+                        ),
+                        (
+                            f"Additional VL: "
+                            f"{Decimal(request.additional_vl_days):.2f}"
+                            if Decimal(request.additional_vl_days or 0) > 0
+                            else ""
+                        ),
+                    )
+                    if value
+                ),
             ]
         )
 

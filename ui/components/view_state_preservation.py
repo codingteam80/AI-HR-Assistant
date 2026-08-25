@@ -1,11 +1,10 @@
 """Application-wide browser view preservation across Streamlit reruns.
 
 Streamlit intentionally reruns the page after widget callbacks and save
-actions. This component keeps the browser on the same visible workspace by
-remembering scroll position, selected native tabs, and expanded sections for
-the signed-in user and current page. It does not write widget keys through the
-Session State API, so it cannot trigger duplicate default/session-state
-warnings.
+actions. This component keeps scroll position and expanded sections stable for
+the signed-in user and current page. Native horizontal/sub-tab selection is
+restored separately by ``persistent_tabs`` before widget creation, using URL
+query state that survives a full browser refresh.
 """
 
 from __future__ import annotations
@@ -96,27 +95,6 @@ def preserve_current_view(
                 return output;
             }};
 
-            const activeTabStates = () => {{
-                const output = {{}};
-                parentDocument
-                    .querySelectorAll('[data-testid="stTabs"]')
-                    .forEach((container, groupIndex) => {{
-                        const tabs = Array.from(
-                            container.querySelectorAll('button[role="tab"]')
-                        );
-                        const selected = tabs.findIndex((tab) =>
-                            tab.getAttribute("aria-selected") === "true"
-                        );
-                        if (selected >= 0) {{
-                            output[String(groupIndex)] = {{
-                                index: selected,
-                                label: normalize(tabs[selected].textContent),
-                            }};
-                        }}
-                    }});
-                return output;
-            }};
-
             let restoring = true;
             let writeTimer = null;
             const writeState = (force = false) => {{
@@ -124,7 +102,6 @@ def preserve_current_view(
                 const scroller = scrollContainer();
                 const state = {{
                     scrollTop: Number(scroller.scrollTop || parentWindow.scrollY || 0),
-                    tabs: activeTabStates(),
                     expanders: expanderStates(),
                     savedAt: Date.now(),
                 }};
@@ -170,25 +147,6 @@ def preserve_current_view(
                         }}
                     }});
 
-                const storedTabs = saved.tabs || {{}};
-                parentDocument
-                    .querySelectorAll('[data-testid="stTabs"]')
-                    .forEach((container, groupIndex) => {{
-                        const requested = storedTabs[String(groupIndex)];
-                        if (!requested) return;
-                        const tabs = Array.from(
-                            container.querySelectorAll('button[role="tab"]')
-                        );
-                        const current = tabs.findIndex((tab) =>
-                            tab.getAttribute("aria-selected") === "true"
-                        );
-                        let target = tabs.findIndex(
-                            (tab) => normalize(tab.textContent) === requested.label
-                        );
-                        if (target < 0) target = Number(requested.index);
-                        if (tabs[target] && target !== current) tabs[target].click();
-                    }});
-
                 const scroller = scrollContainer();
                 const targetTop = Math.max(0, Number(saved.scrollTop || 0));
                 scroller.scrollTo({{ top: targetTop, behavior: "auto" }});
@@ -197,7 +155,7 @@ def preserve_current_view(
                 }}
             }};
 
-            // Capture before a button submit can start the Streamlit rerun.
+            // Capture browser-only view details before Streamlit actions rerun.
             const handlePointerDown = () => writeState(true);
             const handleClick = () => scheduleWrite();
             const handleChange = () => scheduleWrite();
