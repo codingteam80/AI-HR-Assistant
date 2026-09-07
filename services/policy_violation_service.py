@@ -21,6 +21,7 @@ from schemas.policy_violation_schema import (
     PolicyViolationCreateRequest,
     PolicyViolationUpdateRequest,
 )
+from utils.search_utils import text_matches_search_terms
 
 
 VIOLATION_SEVERITIES = ("Minor", "Moderate", "Major", "Grave")
@@ -622,6 +623,9 @@ class PolicyViolationService:
                 item.second_offense_action,
                 item.third_offense_action,
                 item.final_action,
+                getattr(item, "effective_date", None),
+                item.status,
+                getattr(item, "related_policy_id", None),
                 item.notes,
             )
         ).casefold()
@@ -630,12 +634,11 @@ class PolicyViolationService:
         self,
         items: Iterable[PolicyViolation],
         *,
-        search_text: str = "",
+        search_text: object = "",
         category: str | None = None,
         severity: str | None = None,
         status: str | None = None,
     ) -> list[PolicyViolation]:
-        needle = str(search_text or "").strip().casefold()
         output: list[PolicyViolation] = []
         for item in items:
             if category and item.category != category:
@@ -644,7 +647,7 @@ class PolicyViolationService:
                 continue
             if status and item.status != status:
                 continue
-            if needle and needle not in self.searchable_text(item):
+            if not text_matches_search_terms(search_text, self.searchable_text(item)):
                 continue
             output.append(item)
         return output

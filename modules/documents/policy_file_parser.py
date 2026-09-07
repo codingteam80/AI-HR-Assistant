@@ -17,8 +17,14 @@ from pathlib import Path
 import mimetypes
 import re
 
-from docx import Document
 from pypdf import PdfReader
+
+from modules.documents.docx_structure_extractor import DOCXStructureExtractor
+from modules.documents.pdf_layout_extractor import (
+    PDFLayoutEncryptedError,
+    PDFLayoutExtractionError,
+    PDFLayoutExtractor,
+)
 
 
 ALLOWED_POLICY_EXTENSIONS = {
@@ -122,6 +128,65 @@ class PolicyFileParser:
         return False
 
     @classmethod
+    def _section_parts(
+        cls,
+        *,
+        heading: str,
+        text: str,
+        page_number: int | None,
+    ) -> list[ParsedPolicySection]:
+        """Preserve the existing safe section-size behavior for one section."""
+
+        normalized = cls._normalize_text(text)
+        if not normalized:
+            return []
+
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n", normalized)
+            if paragraph.strip()
+        ]
+        chunk = ""
+        part_number = 1
+        sections: list[ParsedPolicySection] = []
+
+        for paragraph in paragraphs or [normalized]:
+            candidate = f"{chunk}\n\n{paragraph}".strip()
+            if len(candidate) > 1800 and chunk:
+                display_heading = (
+                    heading
+                    if part_number == 1
+                    else f"{heading} — Part {part_number}"
+                )
+                sections.append(
+                    ParsedPolicySection(
+                        heading=display_heading[:250],
+                        text=chunk,
+                        page_number=page_number,
+                    )
+                )
+                part_number += 1
+                chunk = paragraph
+            else:
+                chunk = candidate
+
+        if chunk:
+            display_heading = (
+                heading
+                if part_number == 1
+                else f"{heading} — Part {part_number}"
+            )
+            sections.append(
+                ParsedPolicySection(
+                    heading=display_heading[:250],
+                    text=chunk,
+                    page_number=page_number,
+                )
+            )
+
+        return sections
+
+    @classmethod
     def _sections_from_lines(
         cls,
         lines: list[str],
@@ -143,55 +208,13 @@ class PolicyFileParser:
             )
 
             if text:
-                # Split long sections by paragraph to keep retrieval focused.
-                paragraphs = [
-                    paragraph.strip()
-                    for paragraph in re.split(
-                        r"\n\s*\n",
-                        text,
+                sections.extend(
+                    cls._section_parts(
+                        heading=heading,
+                        text=text,
+                        page_number=page_number,
                     )
-                    if paragraph.strip()
-                ]
-
-                chunk = ""
-                part_number = 1
-
-                for paragraph in paragraphs or [text]:
-                    candidate = (
-                        f"{chunk}\n\n{paragraph}".strip()
-                    )
-
-                    if len(candidate) > 1800 and chunk:
-                        display_heading = (
-                            heading
-                            if part_number == 1
-                            else f"{heading} — Part {part_number}"
-                        )
-                        sections.append(
-                            ParsedPolicySection(
-                                heading=display_heading[:250],
-                                text=chunk,
-                                page_number=page_number,
-                            )
-                        )
-                        part_number += 1
-                        chunk = paragraph
-                    else:
-                        chunk = candidate
-
-                if chunk:
-                    display_heading = (
-                        heading
-                        if part_number == 1
-                        else f"{heading} — Part {part_number}"
-                    )
-                    sections.append(
-                        ParsedPolicySection(
-                            heading=display_heading[:250],
-                            text=chunk,
-                            page_number=page_number,
-                        )
-                    )
+                )
 
             body_lines = []
 
@@ -270,7 +293,37 @@ class PolicyFileParser:
         cls,
         file_bytes: bytes,
     ) -> tuple[str, list[ParsedPolicySection], int]:
-        """Extract page-aware sections from a text-based PDF."""
+        """Extract layout-aware page sections, retaining a safe legacy fallback."""
+
+        try:
+            extracted = PDFLayoutExtractor.extract(file_bytes)
+        except PDFLayoutEncryptedError as error:
+            raise ValueError(
+                "Encrypted PDF files are not supported."
+            ) from error
+        except PDFLayoutExtractionError:
+            extracted = None
+
+        if extracted is not None and extracted.full_text:
+            sections: list[ParsedPolicySection] = []
+            for section in extracted.sections:
+                sections.extend(
+                    cls._section_parts(
+                        heading=section.heading,
+                        text=section.text,
+                        page_number=section.page_number,
+                    )
+                )
+            return (
+                extracted.full_text,
+                sections,
+                extracted.page_count,
+            )
+
+        # Compatibility fallback for unusual text PDFs that one extraction
+        # engine can read while the other cannot. This preserves the former
+        # behavior instead of making the layout enhancement a hard dependency
+        # for successful indexing.
 
         reader = PdfReader(BytesIO(file_bytes))
 
@@ -330,73 +383,43 @@ class PolicyFileParser:
         cls,
         file_bytes: bytes,
     ) -> tuple[str, list[ParsedPolicySection], None]:
-        """Extract headings, paragraphs, and table rows from DOCX."""
+        """Extract ordered DOCX structure without requiring Heading styles."""
 
         try:
-            document = Document(BytesIO(file_bytes))
+            extracted = DOCXStructureExtractor.extract(
+                file_bytes,
+                default_heading="Policy Details",
+            )
         except Exception as error:
             raise ValueError(
                 "The DOCX file is damaged or unreadable."
             ) from error
 
-        lines: list[str] = []
-
-        for paragraph in document.paragraphs:
-            text = paragraph.text.strip()
-
-            if not text:
-                lines.append("")
-                continue
-
-            style_name = (
-                paragraph.style.name.lower()
-                if paragraph.style
-                and paragraph.style.name
-                else ""
-            )
-
-            if style_name.startswith("heading"):
-                lines.append(f"# {text}")
-            else:
-                lines.append(text)
-
-        for table_index, table in enumerate(
-            document.tables,
-            start=1,
-        ):
-            lines.append(f"# Table {table_index}")
-
-            for row in table.rows:
-                values = [
-                    cell.text.strip()
-                    for cell in row.cells
-                ]
-
-                row_text = " | ".join(
-                    value
-                    for value in values
-                    if value
-                )
-
-                if row_text:
-                    lines.append(row_text)
-
-        full_text = cls._normalize_text(
-            "\n".join(lines)
-        )
-
-        if not full_text:
+        if not extracted.full_text:
             raise ValueError(
                 "No readable text was found in the DOCX file."
             )
 
-        sections = cls._sections_from_lines(
-            lines,
-            default_heading="Policy Details",
-            page_number=None,
-        )
+        sections: list[ParsedPolicySection] = []
+        for section in extracted.sections:
+            sections.extend(
+                cls._section_parts(
+                    heading=section.heading,
+                    text=section.text,
+                    page_number=None,
+                )
+            )
 
-        return full_text, sections, None
+        if not sections:
+            sections = [
+                ParsedPolicySection(
+                    heading="Policy Details",
+                    text=extracted.full_text,
+                    page_number=None,
+                )
+            ]
+
+        return extracted.full_text, sections, None
 
     @classmethod
     def _parse_text(

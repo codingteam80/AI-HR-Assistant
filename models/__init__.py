@@ -34,6 +34,7 @@ from models.onboarding import (
     OnboardingChecklistItem,
 )
 from models.overtime_request import OvertimeRequest
+from models.shifting_credit import ShiftingCredit
 from models.password_reset_token import PasswordResetToken
 from models.role import Role
 from models.user import User
@@ -71,6 +72,7 @@ __all__ = [
     "EmployeeOnboardingProgress",
     "OnboardingChecklistItem",
     "OvertimeRequest",
+    "ShiftingCredit",
     "PasswordResetToken",
     "Role",
     "User",

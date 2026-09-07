@@ -37,9 +37,10 @@ from ui.components.confirmation_guard import (
     invalidate_confirmation_on_change,
 )
 from ui.components.live_search import (
-    clear_live_search,
-    live_search_input,
+    clear_multi_search,
+    multi_search_input,
 )
+from utils.search_utils import matches_search_terms
 from ui.pages.admin.leave_change_review import render_hr_change_review
 from ui.components.operation_feedback import (
     render_operation_feedback,
@@ -571,7 +572,13 @@ def _render_credit_breakdown(
         return
 
     with SessionFactory() as session:
-        table_rows = LeaveService(session).credit_table_rows(
+        service = LeaveService(session)
+        table_rows = service.credit_table_rows(
+            company_id=company_id,
+            employee_id=employee_id,
+            year=year,
+        )
+        ob_summary = service.official_business_credit_summary(
             company_id=company_id,
             employee_id=employee_id,
             year=year,
@@ -642,6 +649,16 @@ def _render_credit_breakdown(
         max_height=330,
     )
     st.caption(
+        "OB lifecycle — "
+        f"Earned: {_days(ob_summary.earned_days)} · "
+        f"Pending: {_days(ob_summary.pending_days)} · "
+        f"Available: {_days(ob_summary.available_days)} · "
+        f"Reserved: {_days(ob_summary.reserved_days)} · "
+        f"Used: {_days(ob_summary.used_days)} · "
+        f"Expired: {_days(ob_summary.expired_days)} · "
+        f"Regular OT Restored: {_days(ob_summary.restored_regular_ot_hours)} hr(s)."
+    )
+    st.caption(
         "Beginning Credit is the carried balance before the current annual "
         "accrual. Credit shows only the annual or approved event allocation "
         "for the selected year. Administrator corrections affect Available "
@@ -650,7 +667,9 @@ def _render_credit_breakdown(
         "Paternity rows display N/A. Only Vacation and Sick Leave may be "
         "converted to cash. Vacation Leave utilization is a monitoring "
         "target and is not deducted in advance; only an unmet target is "
-        "forfeited at year end."
+        "forfeited at year end. Official Business (OB) credits are earned "
+        "from qualifying Shifting Credit OT blocks and become usable only "
+        "after their configured availability delay."
     )
 
 
@@ -672,6 +691,7 @@ def _render_credit_balance_editor(
             "MATERNITY",
             "PATERNITY",
             "BEREAVEMENT",
+            "OB",
             "LWOP",
         }
     }
@@ -689,7 +709,8 @@ def _render_credit_balance_editor(
         "Leave when an EL request is approved. Honeymoon, Maternity, "
         "Paternity, and Bereavement credits are also not manually editable; "
         "their fixed credits are created only after manager approval of a "
-        "qualifying event request."
+        "qualifying event request. Official Business (OB) is system-managed "
+        "from approved 4+4 same-cutoff Shifting Credits."
     )
 
     selected_leave_type_id = st.selectbox(
@@ -1013,11 +1034,11 @@ def _render_leave_history(
 ) -> None:
     """Render company-scoped leave request and immutable credit transactions."""
 
-    search_text = live_search_input(
+    search_terms = multi_search_input(
         "Search Leave History",
-        placeholder="Search any request, employee, action, status, date, or credit column…",
+        placeholder="Type any value shown in the Leave History table, then press Enter…",
         key=f"leave_history_search_{year}",
-    ).strip().casefold()
+    )
 
     rows: list[dict[str, str]] = []
     for request in requests:
@@ -1079,10 +1100,10 @@ def _render_leave_history(
         ),
         reverse=True,
     )
-    if search_text:
+    if search_terms:
         rows = [
             row for row in rows
-            if search_text in " ".join(str(value) for value in row.values()).casefold()
+            if matches_search_terms(search_terms, row.values())
         ]
     st.caption(f"{len(rows)} leave process/transaction history record(s) shown.")
     if not rows:
@@ -1103,11 +1124,10 @@ def _filtered_requests(
     department: str,
     leave_type: str,
     status: str,
-    employee_search: str,
+    employee_search,
 ):
-    """Apply the visible monitoring filters to detached request objects."""
+    """Apply visible filters plus free-text multi-search terms."""
 
-    normalized_search = employee_search.strip().casefold()
     output = []
 
     for request in requests:
@@ -1136,34 +1156,29 @@ def _filtered_requests(
         ):
             continue
 
-        if (
-            normalized_search
-            and normalized_search
-            not in " ".join(
-                str(value)
-                for value in (
-                    request.public_id,
-                    request.employee.employee_number,
-                    request.employee.full_name,
-                    request.filed_by_employee.full_name if request.filed_by_employee else "",
-                    request_department,
-                    request.leave_type.code,
-                    request.leave_type.name,
-                    request.start_date,
-                    request.end_date,
-                    _request_duration(request),
-                    request.requested_days,
-                    _request_reason(request),
-                    request.manager.full_name if request.manager else "",
-                    request.current_approver.full_name if request.current_approver else "",
-                    request.approval_stage,
-                    request_status,
-                    request.cancellation_status,
-                    LeaveService.allocation_breakdown(request),
-                    request.email_status,
-                )
-                if value not in (None, "")
-            ).casefold()
+        if not matches_search_terms(
+            employee_search,
+            (
+                request.public_id,
+                request.employee.employee_number,
+                request.employee.full_name,
+                request.filed_by_employee.full_name if request.filed_by_employee else "",
+                request_department,
+                request.leave_type.code,
+                request.leave_type.name,
+                request.start_date,
+                request.end_date,
+                _request_duration(request),
+                request.requested_days,
+                _request_reason(request),
+                request.manager.full_name if request.manager else "",
+                request.current_approver.full_name if request.current_approver else "",
+                request.approval_stage,
+                request_status,
+                request.cancellation_status,
+                LeaveService.allocation_breakdown(request),
+                request.email_status,
+            ),
         ):
             continue
 
@@ -1454,7 +1469,7 @@ def _render_requests(
         st.session_state[f"leave_request_status_{year}"] = (
             "All Statuses"
         )
-        clear_live_search(
+        clear_multi_search(
             f"leave_request_employee_search_{year}"
         )
 
@@ -1490,22 +1505,10 @@ def _render_requests(
             key=f"leave_request_status_{year}",
         )
 
-    employee_search = live_search_input(
+    employee_search = multi_search_input(
         "Search Leave Requests",
-        placeholder="Search any displayed leave-request column…",
+        placeholder="Type request, employee, department, leave type, status, or date, then press Enter…",
         key=f"leave_request_employee_search_{year}",
-        suggestions=(
-            value
-            for request in requests
-            for value in (
-                request.employee.employee_number,
-                request.employee.full_name,
-                request.public_id,
-                request.leave_type.name,
-                _status_label(request.status),
-                request.approval_stage,
-            )
-        ),
     )
     # Previous label kept only as migration context: "Find Employee".
 

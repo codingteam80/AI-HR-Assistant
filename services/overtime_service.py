@@ -17,6 +17,7 @@ from models.attendance_record import AttendanceRecord
 from models.company import Company
 from models.employee import Employee
 from models.overtime_request import OvertimeRequest
+from models.shifting_credit import ShiftingCredit
 from models.user import User
 from repositories.attendance_repository import AttendanceRepository
 from repositories.overtime_repository import OvertimeRequestRepository
@@ -49,7 +50,12 @@ class OvertimeRuleSnapshot:
     shifting_credit_cutoff_day: int
     additional_vl_threshold_hours: Decimal
     additional_vl_days: Decimal
+    additional_vl_also_payable: bool
     excluded_positions: tuple[str, ...]
+    availability_cutoffs: int
+    expiration_mode: str
+    expiration_month: int
+    expiration_day: int
 
 
 class OvertimeService:
@@ -125,7 +131,14 @@ class OvertimeService:
                 company.shifting_credit_additional_vl_threshold_hours
             ),
             additional_vl_days=Decimal(company.shifting_credit_additional_vl_days),
+            additional_vl_also_payable=bool(
+                company.shifting_credit_additional_vl_also_payable
+            ),
             excluded_positions=self._excluded_positions(company),
+            availability_cutoffs=int(company.shifting_credit_availability_cutoffs),
+            expiration_mode=str(company.shifting_credit_expiration_mode or "follow_leave_reset"),
+            expiration_month=int(company.shifting_credit_expiration_month),
+            expiration_day=int(company.shifting_credit_expiration_day),
         )
 
     def shifting_eligibility(
@@ -171,6 +184,354 @@ class OvertimeService:
             work_date.year, work_date.month, last_day
         )
 
+    @staticmethod
+    def _safe_annual_date(year: int, month: int, day: int) -> date:
+        maximum = calendar.monthrange(year, month)[1]
+        return date(year, month, min(day, maximum))
+
+    @classmethod
+    def _availability_after_cutoffs(
+        cls, cutoff_end: date, *, cutoff_day: int, completed_cutoffs: int
+    ) -> date:
+        cursor = cutoff_end + timedelta(days=1)
+        for _ in range(max(0, int(completed_cutoffs))):
+            _start, end = cls._cutoff_range(cursor, cutoff_day)
+            cursor = end + timedelta(days=1)
+        return cursor
+
+    def _credit_expiration_date(
+        self, *, company_id: int, availability_date: date, rules: OvertimeRuleSnapshot
+    ) -> date:
+        if rules.expiration_mode == "custom_date":
+            candidate = self._safe_annual_date(
+                availability_date.year, rules.expiration_month, rules.expiration_day
+            )
+            if candidate < availability_date:
+                candidate = self._safe_annual_date(
+                    availability_date.year + 1,
+                    rules.expiration_month,
+                    rules.expiration_day,
+                )
+            return candidate
+
+        leave_service = LeaveService(self.session)
+        cycle_year = leave_service.leave_cycle_year(company_id, availability_date)
+        return leave_service.leave_cycle_end(company_id, cycle_year)
+
+    def _ensure_shifting_credit_records(self, *, company_id: int) -> None:
+        """Backfill lifecycle rows for already-approved paired OT from older checkpoints."""
+
+        rules = self.rule_snapshot(company_id)
+        requests = list(
+            self.session.scalars(
+                select(OvertimeRequest)
+                .where(
+                    OvertimeRequest.company_id == company_id,
+                    OvertimeRequest.status == "approved",
+                    OvertimeRequest.shifting_credit_group.is_not(None),
+                    OvertimeRequest.shifting_credit_hours > Decimal("0.00"),
+                )
+                .order_by(OvertimeRequest.date_rendered, OvertimeRequest.id)
+            ).all()
+        )
+        grouped: dict[str, list[OvertimeRequest]] = {}
+        for request in requests:
+            if request.shifting_credit_group:
+                grouped.setdefault(request.shifting_credit_group, []).append(request)
+        if not grouped:
+            return
+
+        existing_groups = set(
+            self.session.scalars(
+                select(ShiftingCredit.group_key).where(
+                    ShiftingCredit.company_id == company_id,
+                    ShiftingCredit.group_key.in_(list(grouped)),
+                )
+            ).all()
+        )
+        for group_key, items in grouped.items():
+            if group_key in existing_groups:
+                continue
+            first = min(items, key=lambda item: (item.date_rendered, item.id))
+            cutoff_start, cutoff_end = self._cutoff_range(
+                first.date_rendered, rules.shifting_credit_cutoff_day
+            )
+            availability_date = self._availability_after_cutoffs(
+                cutoff_end,
+                cutoff_day=rules.shifting_credit_cutoff_day,
+                completed_cutoffs=rules.availability_cutoffs,
+            )
+            expiration_date = self._credit_expiration_date(
+                company_id=company_id,
+                availability_date=availability_date,
+                rules=rules,
+            )
+            qualifying_hours = sum(
+                (Decimal(item.shifting_credit_hours or 0) for item in items),
+                start=Decimal("0.00"),
+            ).quantize(Decimal("0.01"))
+            self.session.add(
+                ShiftingCredit(
+                    company_id=company_id,
+                    employee_id=first.employee_id,
+                    group_key=group_key,
+                    cutoff_start=cutoff_start,
+                    cutoff_end=cutoff_end,
+                    earned_date=max(item.date_rendered for item in items),
+                    availability_date=availability_date,
+                    expiration_date=expiration_date,
+                    qualifying_hours=qualifying_hours,
+                    ob_credit_days=Decimal("1.00"),
+                    status=(
+                        "available"
+                        if datetime.now(self.timezone).date() >= availability_date
+                        else "pending"
+                    ),
+                )
+            )
+        self.session.flush()
+
+    def refresh_shifting_credit_statuses(
+        self, *, company_id: int, as_of: date | None = None
+    ) -> list[ShiftingCredit]:
+        """Advance pending credits and restore unused expired credits safely."""
+
+        selected_date = as_of or datetime.now(self.timezone).date()
+        rules = self.rule_snapshot(company_id)
+        self._ensure_shifting_credit_records(company_id=company_id)
+        credits = list(
+            self.session.scalars(
+                select(ShiftingCredit)
+                .where(ShiftingCredit.company_id == company_id)
+                .order_by(ShiftingCredit.availability_date, ShiftingCredit.id)
+            ).all()
+        )
+        changed = False
+        for credit in credits:
+            if credit.status == "pending" and selected_date >= credit.availability_date:
+                credit.status = "available"
+                changed = True
+            if credit.status == "available" and selected_date > credit.expiration_date:
+                credit.status = "expired"
+                source_requests = list(
+                    self.session.scalars(
+                        select(OvertimeRequest).where(
+                            OvertimeRequest.company_id == company_id,
+                            OvertimeRequest.employee_id == credit.employee_id,
+                            OvertimeRequest.shifting_credit_group == credit.group_key,
+                        )
+                    ).all()
+                )
+                restored = Decimal("0.00")
+                for request in source_requests:
+                    amount = Decimal(request.shifting_credit_hours or 0)
+                    request.shifting_credit_restored_hours = amount
+                    restored += amount
+                    self._recalculate_payable(request, rules)
+                credit.restored_regular_ot_hours = restored.quantize(Decimal("0.01"))
+                changed = True
+        if changed:
+            self.session.flush()
+        return credits
+
+    def list_shifting_credits(
+        self, *, company_id: int, employee_ids: list[int] | None = None, as_of: date | None = None
+    ) -> list[ShiftingCredit]:
+        self.refresh_shifting_credit_statuses(company_id=company_id, as_of=as_of)
+        statement = select(ShiftingCredit).where(ShiftingCredit.company_id == company_id)
+        if employee_ids is not None:
+            if not employee_ids:
+                return []
+            statement = statement.where(ShiftingCredit.employee_id.in_(employee_ids))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    ShiftingCredit.employee_id,
+                    ShiftingCredit.cutoff_start,
+                    ShiftingCredit.id,
+                )
+            ).all()
+        )
+
+    def available_shifting_credit_count(
+        self, *, company_id: int, employee_id: int, as_of: date | None = None
+    ) -> int:
+        today = datetime.now(self.timezone).date()
+        selected_date = as_of or today
+        credits = self.list_shifting_credits(
+            company_id=company_id, employee_ids=[employee_id], as_of=today
+        )
+        return sum(
+            1
+            for credit in credits
+            if credit.status == "available"
+            and credit.availability_date <= selected_date <= credit.expiration_date
+        )
+
+    def reserve_shifting_credit_for_leave(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        usage_date: date,
+        leave_request_id: int,
+    ) -> ShiftingCredit:
+        """Reserve one currently available whole-day OB for Leave Management."""
+
+        today = datetime.now(self.timezone).date()
+        self.refresh_shifting_credit_statuses(company_id=company_id, as_of=today)
+        existing = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.leave_request_id == leave_request_id,
+            )
+        )
+        if existing is not None:
+            return existing
+
+        credit = self.session.scalar(
+            select(ShiftingCredit)
+            .where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.employee_id == employee_id,
+                ShiftingCredit.status == "available",
+                ShiftingCredit.availability_date <= today,
+                ShiftingCredit.availability_date <= usage_date,
+                ShiftingCredit.expiration_date >= usage_date,
+            )
+            .order_by(ShiftingCredit.expiration_date, ShiftingCredit.id)
+            .limit(1)
+        )
+        if credit is None:
+            raise ValueError(
+                "No available Official Business (OB) credit can cover the selected date."
+            )
+        credit.status = "reserved"
+        credit.usage_date = usage_date
+        credit.leave_request_id = leave_request_id
+        credit.usage_attendance_record_id = None
+        credit.restored_regular_ot_hours = Decimal("0.00")
+        self.session.flush()
+        return credit
+
+    def confirm_shifting_credit_leave_usage(
+        self, *, company_id: int, leave_request_id: int
+    ) -> ShiftingCredit:
+        """Convert one Leave Management OB reservation into a used credit."""
+
+        credit = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.leave_request_id == leave_request_id,
+            )
+        )
+        if credit is None:
+            raise ValueError("The reserved Official Business (OB) credit is unavailable.")
+        if credit.status == "used":
+            return credit
+        if credit.status != "reserved":
+            raise ValueError("The Official Business (OB) credit is no longer reserved.")
+        credit.status = "used"
+        credit.restored_regular_ot_hours = Decimal("0.00")
+        self.session.flush()
+        return credit
+
+    def release_shifting_credit_leave_reservation(
+        self, *, company_id: int, leave_request_id: int
+    ) -> ShiftingCredit | None:
+        """Release a rejected/cancelled OB request without duplicating the credit."""
+
+        credit = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.leave_request_id == leave_request_id,
+            )
+        )
+        if credit is None:
+            return None
+        credit.leave_request_id = None
+        credit.usage_date = None
+        credit.usage_attendance_record_id = None
+        today = datetime.now(self.timezone).date()
+        credit.status = "pending" if today < credit.availability_date else "available"
+        self.session.flush()
+        self.refresh_shifting_credit_statuses(company_id=company_id, as_of=today)
+        return credit
+
+    def use_shifting_credit(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        usage_date: date,
+        attendance_record_id: int | None = None,
+    ) -> ShiftingCredit:
+        """Consume one available whole-day OB credit for an attendance date."""
+
+        today = datetime.now(self.timezone).date()
+        self.refresh_shifting_credit_statuses(company_id=company_id, as_of=today)
+        existing = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.employee_id == employee_id,
+                ShiftingCredit.status == "used",
+                ShiftingCredit.usage_date == usage_date,
+                ShiftingCredit.leave_request_id.is_(None),
+            )
+        )
+        if existing is not None:
+            if attendance_record_id is not None:
+                existing.usage_attendance_record_id = attendance_record_id
+            return existing
+
+        credit = self.session.scalar(
+            select(ShiftingCredit)
+            .where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.employee_id == employee_id,
+                ShiftingCredit.status == "available",
+                ShiftingCredit.leave_request_id.is_(None),
+                ShiftingCredit.availability_date <= usage_date,
+                ShiftingCredit.expiration_date >= usage_date,
+            )
+            .order_by(ShiftingCredit.expiration_date, ShiftingCredit.id)
+            .limit(1)
+        )
+        if credit is None:
+            raise ValueError(
+                "No available Shifting/OB credit can be used for the selected date."
+            )
+        credit.status = "used"
+        credit.usage_date = usage_date
+        credit.usage_attendance_record_id = attendance_record_id
+        credit.restored_regular_ot_hours = Decimal("0.00")
+        self.session.flush()
+        return credit
+
+    def release_shifting_credit_usage(
+        self, *, company_id: int, employee_id: int, usage_date: date
+    ) -> ShiftingCredit | None:
+        """Release a credit when an OB attendance status is changed back."""
+
+        credit = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == company_id,
+                ShiftingCredit.employee_id == employee_id,
+                ShiftingCredit.status == "used",
+                ShiftingCredit.usage_date == usage_date,
+                ShiftingCredit.leave_request_id.is_(None),
+            )
+        )
+        if credit is None:
+            return None
+        credit.usage_date = None
+        credit.usage_attendance_record_id = None
+        today = datetime.now(self.timezone).date()
+        credit.status = "pending" if today < credit.availability_date else "available"
+        self.session.flush()
+        self.refresh_shifting_credit_statuses(company_id=company_id, as_of=today)
+        return credit
+
     def _recalculate_payable(
         self, request: OvertimeRequest, rules: OvertimeRuleSnapshot
     ) -> None:
@@ -183,7 +544,8 @@ class OvertimeService:
             Decimal("0.00"),
             Decimal(request.estimated_hours)
             - dinner_deduction
-            - Decimal(request.shifting_credit_hours or 0),
+            - Decimal(request.shifting_credit_hours or 0)
+            + Decimal(request.shifting_credit_restored_hours or 0),
         ).quantize(Decimal("0.01"))
 
     def _apply_shifting_credit_rules(
@@ -196,8 +558,10 @@ class OvertimeService:
         employee = self._employee(request.company_id, request.employee_id)
 
         request.shifting_credit_hours = Decimal("0.00")
+        request.shifting_credit_restored_hours = Decimal("0.00")
         request.shifting_credit_group = None
         request.additional_vl_days = Decimal("0.00")
+        request.straight_vl_also_payable = False
         self._recalculate_payable(request, rules)
 
         if not rules.shifting_credits_enabled or not self._is_shifting_eligible(
@@ -217,6 +581,13 @@ class OvertimeService:
                     created_by_user_id=reviewed_by_user_id,
                 )
                 request.additional_vl_days = rules.additional_vl_days
+                request.straight_vl_also_payable = rules.additional_vl_also_payable
+                if not rules.additional_vl_also_payable:
+                    request.payable_hours = max(
+                        Decimal("0.00"),
+                        Decimal(request.payable_hours)
+                        - rules.additional_vl_threshold_hours,
+                    ).quantize(Decimal("0.01"))
             return
 
         if gross_hours < rules.shifting_credit_block_hours:
@@ -253,10 +624,56 @@ class OvertimeService:
             f"SC_{request.company_id}_{request.employee_id}_"
             f"{cutoff_start:%Y%m%d}_{cutoff_end:%Y%m%d}_{request.id}"
         )
-        for item in [*previous, request]:
+        paired_requests = [*previous, request]
+        for item in paired_requests:
             item.shifting_credit_hours = rules.shifting_credit_block_hours
+            item.shifting_credit_restored_hours = Decimal("0.00")
             item.shifting_credit_group = group_key
             self._recalculate_payable(item, rules)
+
+        qualifying_hours = (
+            rules.shifting_credit_block_hours * rules.shifting_credit_required_blocks
+        ).quantize(Decimal("0.01"))
+        availability_date = self._availability_after_cutoffs(
+            cutoff_end,
+            cutoff_day=rules.shifting_credit_cutoff_day,
+            completed_cutoffs=rules.availability_cutoffs,
+        )
+        expiration_date = self._credit_expiration_date(
+            company_id=request.company_id,
+            availability_date=availability_date,
+            rules=rules,
+        )
+        if expiration_date < availability_date:
+            raise ValueError(
+                "Shifting Credit expiration cannot be earlier than its availability date."
+            )
+        credit = self.session.scalar(
+            select(ShiftingCredit).where(
+                ShiftingCredit.company_id == request.company_id,
+                ShiftingCredit.group_key == group_key,
+            )
+        )
+        if credit is None:
+            credit = ShiftingCredit(
+                company_id=request.company_id,
+                employee_id=request.employee_id,
+                group_key=group_key,
+                cutoff_start=cutoff_start,
+                cutoff_end=cutoff_end,
+                earned_date=max(item.date_rendered for item in paired_requests),
+                availability_date=availability_date,
+                expiration_date=expiration_date,
+                qualifying_hours=qualifying_hours,
+                ob_credit_days=Decimal("1.00"),
+                status=(
+                    "available"
+                    if datetime.now(self.timezone).date() >= availability_date
+                    else "pending"
+                ),
+            )
+            self.session.add(credit)
+            self.session.flush()
 
     def _employee(self, company_id: int, employee_id: int) -> Employee:
         employee = self.session.scalar(

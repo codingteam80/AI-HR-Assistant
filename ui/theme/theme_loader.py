@@ -70,83 +70,235 @@ def _get_theme_tokens(
 
 def _synchronize_theme_with_browser(
     active_theme: str,
+    background_color: str,
 ) -> None:
-    """Synchronize URL theme state with browser localStorage.
+    """Keep the fixed Light Mode shell stable across Streamlit reruns.
 
-    The browser stores only the value ``light`` or ``dark``. No account,
-    password, company, or employee information is written to localStorage.
+    The browser-level shell persists the *actual computed portal artwork*
+    (not only its fallback background color) in ``<head>``. This prevents the
+    browser's default white canvas from becoming visible while Streamlit
+    temporarily replaces the app DOM during navigation or action reruns.
+
+    No visible loading indicator is injected here. A short, non-visual
+    rapid-click guard only suppresses accidental duplicate button submits.
     """
 
-    # A template replacement avoids Python f-string conflicts with
-    # JavaScript braces.
     script = """
         <script>
         (() => {
             const storageKey = "ai_hr_assistant_theme";
             const activeTheme = "__ACTIVE_THEME__";
-            const validThemes = new Set(["light"]);
             const parentWindow = window.parent;
-            const currentUrl = new URL(parentWindow.location.href);
-            const urlTheme = currentUrl.searchParams.get("theme");
+            const parentDocument = parentWindow.document;
+            const background = "__BACKGROUND__";
+            const shellStyleId = "ai-hr-persistent-streamlit-shell";
+            const rapidGuardMarker = "__aiHrRapidActionGuardInstalled";
 
-            let savedTheme = null;
-
-            try {
-                savedTheme = parentWindow.localStorage.getItem(
-                    storageKey
-                );
-            } catch (error) {
-                // URL persistence still works when storage is disabled.
+            // v8.8.208 injected a visible processing pill. Remove any stale
+            // instance immediately so an in-place app restart/upgrade does
+            // not require the user to hard-refresh the browser first.
+            const legacyProcessing = parentDocument.getElementById(
+                "ai-hr-global-processing"
+            );
+            if (legacyProcessing) {
+                legacyProcessing.remove();
             }
 
-            if (validThemes.has(urlTheme)) {
-                try {
-                    parentWindow.localStorage.setItem(
-                        storageKey,
-                        urlTheme
-                    );
-                } catch (error) {
-                    // Safe to ignore blocked browser storage.
+            const appView = parentDocument.querySelector(
+                '[data-testid="stAppViewContainer"]'
+            );
+            const computedView = appView
+                ? parentWindow.getComputedStyle(appView)
+                : null;
+
+            // Capture the fully rendered portal artwork while it is present.
+            // These values live in the persistent <head> stylesheet and remain
+            // available even if Streamlit briefly replaces the app container.
+            const portalImage = (
+                computedView?.backgroundImage
+                && computedView.backgroundImage !== "none"
+            ) ? computedView.backgroundImage : "none";
+            const portalSize = computedView?.backgroundSize || "cover";
+            const portalPosition = (
+                computedView?.backgroundPosition
+                || "center center"
+            );
+            const portalRepeat = computedView?.backgroundRepeat || "no-repeat";
+            const portalAttachment = (
+                computedView?.backgroundAttachment
+                || "fixed"
+            );
+
+            const shellCss = `
+                html,
+                body,
+                #root,
+                .stApp,
+                [data-testid="stApp"],
+                [data-testid="stAppViewContainer"] {
+                    min-height: 100vh !important;
+                    background-color: ${background} !important;
+                    background-image: ${portalImage} !important;
+                    background-size: ${portalSize} !important;
+                    background-position: ${portalPosition} !important;
+                    background-repeat: ${portalRepeat} !important;
+                    background-attachment: ${portalAttachment} !important;
                 }
-                return;
+
+                body {
+                    margin: 0 !important;
+                }
+
+                [data-testid="stMain"],
+                [data-testid="stAppViewContainer"] > .main,
+                [data-testid="stMainBlockContainer"],
+                [data-testid="stAppViewBlockContainer"],
+                .stApp > .main {
+                    background-color: transparent !important;
+                }
+
+                [data-testid="stHeader"] {
+                    background: transparent !important;
+                }
+
+                #MainMenu,
+                [data-testid="stMainMenu"],
+                [data-testid="stToolbar"],
+                [data-testid="stToolbarActions"],
+                [data-testid="stHeaderActionElements"],
+                [data-testid="stStatusWidget"],
+                [data-testid="stAppDeployButton"],
+                .stDeployButton {
+                    display: none !important;
+                    visibility: hidden !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                }
+            `;
+
+            let shellStyle = parentDocument.getElementById(shellStyleId);
+            if (!shellStyle) {
+                shellStyle = parentDocument.createElement("style");
+                shellStyle.id = shellStyleId;
+                parentDocument.head.appendChild(shellStyle);
+            }
+            if (shellStyle.textContent !== shellCss) {
+                shellStyle.textContent = shellCss;
             }
 
-            if (
-                validThemes.has(savedTheme)
-                && savedTheme !== activeTheme
-            ) {
-                currentUrl.searchParams.set("theme", savedTheme);
+            // Pre-paint every outer browser surface as well. This is the layer
+            // visible during the short interval in which Streamlit swaps root
+            // descendants, so it must never fall back to browser white.
+            parentDocument.documentElement.style.setProperty(
+                "background-color",
+                background,
+                "important"
+            );
+            const outerSurfaces = [
+                parentDocument.documentElement,
+                parentDocument.body,
+                parentDocument.getElementById("root"),
+            ].filter(Boolean);
+            outerSurfaces.forEach((surface) => {
+                surface.style.setProperty(
+                    "background-color",
+                    background,
+                    "important"
+                );
+                if (portalImage !== "none") {
+                    surface.style.setProperty(
+                        "background-image",
+                        portalImage,
+                        "important"
+                    );
+                    surface.style.setProperty(
+                        "background-size",
+                        portalSize,
+                        "important"
+                    );
+                    surface.style.setProperty(
+                        "background-position",
+                        portalPosition,
+                        "important"
+                    );
+                    surface.style.setProperty(
+                        "background-repeat",
+                        portalRepeat,
+                        "important"
+                    );
+                    surface.style.setProperty(
+                        "background-attachment",
+                        portalAttachment,
+                        "important"
+                    );
+                }
+            });
 
-                // Reload once so Python receives the restored theme.
-                parentWindow.location.replace(
+            const currentUrl = new URL(parentWindow.location.href);
+            if (currentUrl.searchParams.has("theme")) {
+                currentUrl.searchParams.delete("theme");
+                parentWindow.history.replaceState(
+                    null,
+                    "",
                     currentUrl.toString()
                 );
-                return;
             }
 
             try {
-                parentWindow.localStorage.setItem(
-                    storageKey,
-                    activeTheme
-                );
+                parentWindow.localStorage.setItem(storageKey, activeTheme);
             } catch (error) {
-                // The query parameter remains the fallback.
+                // Fixed Light Mode remains active even when storage is blocked.
             }
 
-            currentUrl.searchParams.set("theme", activeTheme);
+            // Keep duplicate-submit protection without showing any loading UI
+            // or changing button geometry. The first click always reaches
+            // Streamlit; only a rapid repeat on the same live button is blocked.
+            if (!parentWindow[rapidGuardMarker]) {
+                const lastActionAt = new WeakMap();
+                parentDocument.addEventListener(
+                    "click",
+                    (event) => {
+                        const rawTarget = event.target;
+                        const target = (
+                            rawTarget && rawTarget.nodeType === 1
+                                ? rawTarget
+                                : rawTarget?.parentElement
+                        );
+                        if (!target || typeof target.closest !== "function") {
+                            return;
+                        }
 
-            // Update the address without triggering another rerun.
-            parentWindow.history.replaceState(
-                null,
-                "",
-                currentUrl.toString()
-            );
+                        const button = target.closest(
+                            'div.stButton > button, '
+                            + '[data-testid="stFormSubmitButton"] button'
+                        );
+                        if (!button || button.disabled) {
+                            return;
+                        }
+
+                        const now = parentWindow.performance.now();
+                        const previous = lastActionAt.get(button) || 0;
+                        if (previous && now - previous < 850) {
+                            event.preventDefault();
+                            event.stopImmediatePropagation();
+                            return;
+                        }
+                        lastActionAt.set(button, now);
+                    },
+                    true
+                );
+                parentWindow[rapidGuardMarker] = true;
+            }
         })();
         </script>
-    """.replace("__ACTIVE_THEME__", active_theme)
+    """
+    script = (
+        script
+        .replace("__ACTIVE_THEME__", active_theme)
+        .replace("__BACKGROUND__", background_color)
+    )
 
     render_browser_bridge(script)
-
 
 def _enforce_input_value_contrast(
     tokens: dict[str, str],
@@ -1429,6 +1581,22 @@ def apply_theme(
 
     [data-testid="stHeader"] {{
         background: transparent !important;
+    }}
+
+    /* Hide Streamlit's built-in top-right viewer toolbar without removing the
+       header shell used by Streamlit for stable page geometry. */
+    #MainMenu,
+    [data-testid="stMainMenu"],
+    [data-testid="stToolbar"],
+    [data-testid="stToolbarActions"],
+    [data-testid="stHeaderActionElements"],
+    [data-testid="stStatusWidget"],
+    [data-testid="stAppDeployButton"],
+    .stDeployButton {{
+        display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
     }}
 
     /* Headings and normal markdown must follow the current theme. */
@@ -4696,6 +4864,82 @@ div[class*="st-key-employee_policy_content_"]
 }}
 
 /* =========================================================
+   v8.8.209 — GLOBAL CLEAN UI (NO PROCESS FEEDBACK)
+   Keep the existing product layout while standardizing the most visible
+   controls without injecting global processing/loading indicators. Selectors use stable test IDs
+   or project-owned keys to reduce upgrade risk.
+========================================================= */
+
+/* Stable control heights reduce layout jump between normal/processing states. */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stTimeInput"] input,
+[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] div[data-baseweb="select"] > div {{
+    min-height: 42px !important;
+}}
+
+[data-testid="stTextArea"] textarea {{
+    min-height: 92px;
+}}
+
+div.stButton > button,
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stDownloadButton"] > button,
+[data-testid="stDownloadButton"] > a {{
+    min-height: 40px !important;
+    border-radius: 10px !important;
+}}
+
+/* Cleaner, consistent form/alert rhythm without changing module layout. */
+[data-testid="stForm"] {{
+    padding: 1rem 1.05rem !important;
+}}
+
+[data-testid="stAlert"],
+[data-testid="stNotification"] {{
+    border-radius: 12px !important;
+    box-shadow: none !important;
+}}
+
+/* Custom fixed-height Chat Assistant shell: no generic Streamlit box look. */
+.st-key-admin_chat_conversation,
+.st-key-employee_chat_conversation {{
+    padding: 0.45rem 0.55rem !important;
+    background: rgba(255, 255, 255, 0.82) !important;
+    border: 1px solid rgba(var(--hr-primary-rgb), 0.13) !important;
+    border-radius: 14px !important;
+    box-shadow: 0 4px 18px rgba(24, 36, 74, 0.06) !important;
+}}
+
+.st-key-admin_chat_conversation [data-testid="stVerticalBlockBorderWrapper"],
+.st-key-employee_chat_conversation [data-testid="stVerticalBlockBorderWrapper"] {{
+    border: 0 !important;
+    border-radius: 10px !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}}
+
+/* Keep the conversation scrollbar inside the fixed chat shell. */
+.st-key-admin_chat_conversation [data-testid="stVerticalBlock"],
+.st-key-employee_chat_conversation [data-testid="stVerticalBlock"] {{
+    scrollbar-width: thin;
+    scrollbar-color: rgba(var(--hr-primary-rgb), 0.34) transparent;
+}}
+
+@media (max-width: 900px) {{
+    [data-testid="stForm"] {{
+        padding: 0.85rem 0.9rem !important;
+    }}
+
+    .block-container {{
+        padding-left: 1.25rem !important;
+        padding-right: 1.25rem !important;
+    }}
+}}
+
+/* =========================================================
    CHAT ASSISTANT ALIGNMENT + INPUT CONTRAST — v8.8.120
    Keep assistant responses on the left and move each signed-in user's
    question to the right without changing message behavior.
@@ -4841,7 +5085,10 @@ div[class*="st-key-employee_quick_action_card_"] [data-testid="stMarkdownContain
     st.markdown(css, unsafe_allow_html=True)
 
     # Restore and save the browser's last theme selection.
-    _synchronize_theme_with_browser(get_active_theme())
+    _synchronize_theme_with_browser(
+        get_active_theme(),
+        tokens["background"],
+    )
 
     # Apply browser-level behavior after the CSS is injected.
     _enforce_input_value_contrast(tokens)

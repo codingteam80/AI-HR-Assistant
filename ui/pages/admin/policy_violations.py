@@ -26,10 +26,11 @@ from services.policy_violation_bulk_import_service import (
 )
 from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.data_table import render_admin_table
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
 from ui.components.operation_feedback import render_operation_feedback, set_operation_feedback
 from ui.components.persistent_tabs import persistent_tabs
 from ui.components.validation_feedback import render_action_warning
+from utils.search_utils import matches_visible_row
 
 
 _VIOLATION_ADD_NONCE_KEY = "_policy_violation_add_nonce"
@@ -111,20 +112,10 @@ def _current_list(
     )
 
     categories = sorted({item.category for item in items})
-    search = live_search_input(
+    search = multi_search_input(
         "Search Violations",
-        placeholder="Search code, category, offense, severity, description, or action...",
-        key="admin_policy_violation_search",
-        suggestions=(
-            value
-            for item in items
-            for value in (
-                item.violation_code,
-                item.category,
-                item.offense_title,
-                item.severity,
-            )
-        ),
+        placeholder="Type any value shown in the violations table, then press Enter…",
+        key="admin_policy_violation_search"
     )
     cols = st.columns(3)
     with cols[0]:
@@ -146,14 +137,24 @@ def _current_list(
             key="admin_policy_violation_status_filter",
         )
 
-    with SessionFactory() as session:
-        filtered = PolicyViolationService(session).filter_items(
-            items,
-            search_text=search,
-            category=None if category == "All Categories" else category,
-            severity=None if severity == "All Severities" else severity,
-            status=None if status == "All Statuses" else status.casefold(),
-        )
+    candidate_items = [
+        item for item in items
+        if (category == "All Categories" or item.category == category)
+        and (severity == "All Severities" or item.severity == severity)
+        and (status == "All Statuses" or item.status == status.casefold())
+    ]
+    candidate_rows = _table_rows(
+        candidate_items,
+        company_id=current_user.company_id,
+        policy_labels=policy_labels,
+    )
+    filtered_pairs = [
+        (item, row)
+        for item, row in zip(candidate_items, candidate_rows, strict=True)
+        if matches_visible_row(search, row)
+    ]
+    filtered = [item for item, _ in filtered_pairs]
+    filtered_rows = [row for _, row in filtered_pairs]
 
     st.caption(f"{len(filtered)} of {len(items)} current violation rule(s) shown.")
     if not filtered:
@@ -161,11 +162,7 @@ def _current_list(
         return
 
     render_admin_table(
-        _table_rows(
-            filtered,
-            company_id=current_user.company_id,
-            policy_labels=policy_labels,
-        ),
+        filtered_rows,
         key="policy-violation-current-list",
         min_width=1800,
         max_height=430,

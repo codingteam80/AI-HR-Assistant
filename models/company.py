@@ -110,11 +110,26 @@ class Company(TimestampMixin, Base):
         server_default="0.50",
         nullable=False,
     )
+    shifting_credit_additional_vl_also_payable: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
     shifting_credit_excluded_positions_json: Mapped[str] = mapped_column(
         Text,
         default='["Trainee", "Design Engineer I", "Design Engineer II"]',
         server_default='["Trainee", "Design Engineer I", "Design Engineer II"]',
         nullable=False,
+    )
+    shifting_credit_availability_cutoffs: Mapped[int] = mapped_column(
+        Integer, default=2, server_default="2", nullable=False
+    )
+    shifting_credit_expiration_mode: Mapped[str] = mapped_column(
+        String(30), default="follow_leave_reset", server_default="follow_leave_reset", nullable=False
+    )
+    shifting_credit_expiration_month: Mapped[int] = mapped_column(
+        Integer, default=12, server_default="12", nullable=False
+    )
+    shifting_credit_expiration_day: Mapped[int] = mapped_column(
+        Integer, default=31, server_default="31", nullable=False
     )
     work_monday: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1", nullable=False

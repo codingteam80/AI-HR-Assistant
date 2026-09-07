@@ -150,6 +150,22 @@ follow-up counts/lists, and charts when the requested comparison benefits from
 a visual. Employee responses remain restricted to the employee's authorized
 self/team scope and published company information.
 
+Long policy and Company Form/Documents content is indexed with document-aware
+retrieval. Each file keeps its own file/title/section/page/chunk metadata; the
+retriever first selects the most relevant company files, then ranks chunks
+inside those files with BM25 plus the optional local Chroma semantic path.
+Policy chunks use sentence/row-aware 180-word targets with 24-word overlap;
+Company Form/Documents chunks use 220-word targets with 32-word overlap. The
+final context limits seed chunks per file and can add an adjacent chunk from
+the same section when a rule crosses a chunk boundary. Structured employee,
+attendance, leave, overtime, and other live HR records remain deterministic
+and are not flattened into document chunks.
+
+The company-only boundary is unchanged: retrieval is scoped to the authenticated
+company and current portal role before ranking, Chroma queries are restricted
+to the exact authorized document-set snapshot, and Qwen must not answer from
+outside/general knowledge when company evidence is unavailable.
+
 ## 7. Run the Application
 
 From the project root with the virtual environment active:
@@ -359,3 +375,82 @@ data\smart_ai\
 ```
 
 Do not replace a working production database with a sample database from another package.
+
+## 15. Chat Assistant Terminal Retrieval Trace (v0.8.8.217)
+
+The Admin and Employee Chat Assistants can print a developer-only retrieval
+trace to the Streamlit server terminal. Nothing from this trace is rendered in
+the portal UI.
+
+Default package setting:
+
+```text
+SMART_AI_TERMINAL_DEBUG_ENABLED=true
+```
+
+The trace shows the user question, contextual retrieval query, authorized
+knowledge counts, file-stage BM25/vector/hybrid scores, selected files,
+chunk-stage BM25 scores, vector cosine nearest-neighbor scores, hybrid/RRF
+ranking, selected/final evidence chunks, bounded chunk excerpts, deterministic
+router answer, Ollama model/timing/retry status, raw Qwen answer, and final Chat
+Assistant answer.
+
+To disable the terminal trace, set:
+
+```text
+SMART_AI_TERMINAL_DEBUG_ENABLED=false
+```
+
+and restart Streamlit. Additional display limits are controlled by
+`SMART_AI_TERMINAL_DEBUG_TOP_K`, `SMART_AI_TERMINAL_DEBUG_EXCERPT_CHARS`, and
+`SMART_AI_TERMINAL_DEBUG_ANSWER_CHARS`.
+
+## 16. Terminal Candidate Answers Trace (v0.8.8.218)
+
+The Chat Assistant terminal diagnostics now also print **Candidate Answers — Retrieved Evidence**. Each candidate includes the final retrieval score, answer-fit diagnostic score, source document, section/page/chunk metadata, and a bounded question-focused `possible_answer` excerpt. The terminal also shows `ANSWER OPTION — ROUTER`, `ANSWER OPTION — QWEN`, and an `ANSWER SELECTION` line explaining which path produced the final chat answer. These diagnostics are terminal-only and do not add Streamlit UI elements or alter retrieval/ranking/generation behavior.
+
+## v8.8.219 — Readable Chat Retrieval Debug + Relevance Guard + Top Source
+
+This checkpoint keeps the v8.8.218 retrieval/chunking/parser architecture and focuses on Chat Assistant diagnostics and answer safety:
+
+- Terminal retrieval diagnostics are rendered as a structured per-question report (question analysis, file/chunk ranking, candidate answers, final evidence, relevance decision, top nearest source, Ollama/Qwen status, final answer selection, and request summary).
+- Each enabled terminal trace is mirrored to a request-local `.log` file under `logs/chat_assistant/` by default. Log writing is best-effort and cannot break the Chat Assistant if the folder is unavailable.
+- A retrieval relevance/no-match guard prevents an unrelated nearest policy chunk from being forced into an answer. Existing out-of-company/HR scope behavior and current no-information answer categories are retained.
+- Policy Q&A also applies a lightweight topic-support guard before accepting a deterministic policy match, so the same fail-closed behavior remains when Ollama is unavailable and Smart AI enhancement is skipped.
+- Admin and Employee Chat UI display only one top approved policy source. Supporting chunks/sources remain visible in terminal/log diagnostics for debugging.
+- The previously discussed special broad-topic coverage expansion (for example, expanding `Leave policy` into every leave-policy section) is intentionally **not** included. Short valid topics continue through the normal existing retrieval path.
+
+Default diagnostics settings:
+
+```text
+SMART_AI_TERMINAL_DEBUG_ENABLED=true
+SMART_AI_TERMINAL_DEBUG_LOG_ENABLED=true
+SMART_AI_TERMINAL_DEBUG_LOG_DIR=logs/chat_assistant
+```
+
+## v8.8.220 — Compact Live Terminal + Full Forensic Log
+
+This checkpoint is based strictly on v8.8.219 and changes only Chat Assistant
+diagnostic presentation/version/tests. Retrieval ranking, relevance guard,
+Qwen prompting, source selection, parsers, permissions, and HR workflows are
+retained.
+
+When the request-local evidence log is available, the **live terminal** now
+shows only the information needed for fast debugging:
+
+- user question;
+- files/chunks searched and matched;
+- final chunks used;
+- top selected source files with file-level score, matched/total chunk count,
+  and best chunk;
+- up to three candidate answers with answer-fit score, retrieval score, source,
+  chunk, and concise possible answer;
+- final answer, top source/chunk/final score; and
+- Ollama/retry/result timing plus the full-log path.
+
+The per-request `.log` still keeps the **full forensic trace** from v8.8.219:
+question analysis, all BM25/vector/hybrid stages, chunk excerpts, selected
+evidence, relevance/no-match decision, router/Qwen options, top-nearest source,
+runtime events, and request summary. If the log cannot be created, the terminal
+automatically falls back to the verbose trace so diagnostic evidence is not
+silently lost.

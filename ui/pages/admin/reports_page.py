@@ -17,6 +17,7 @@ from modules.reports.leave_conversion_report import (
     build_leave_conversion_excel,
     build_leave_conversion_rows,
 )
+from modules.reports.shifting_credits_report import build_shifting_credits_excel
 from repositories.employee_repository import EmployeeRepository
 from repositories.leave_repository import (
     LeaveBalanceRepository,
@@ -27,7 +28,8 @@ from services.admin_management_service import AdminManagementService
 from services.disciplinary_record_service import DisciplinaryRecordService, CASE_STATUSES
 from services.attendance_service import AttendanceService
 from services.overtime_service import OvertimeService
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_search_terms
 from ui.components.persistent_tabs import persistent_tabs
 
 
@@ -251,24 +253,16 @@ def _render_leave_conversion_report(
             leave_year=leave_year,
         )
 
-    search = live_search_input(
+    search_terms = multi_search_input(
         "Search Leave Conversion",
-        placeholder="Search any report column…",
+        placeholder="Type any value shown in the Leave Conversion table, then press Enter…",
         key="leave_conversion_report_search",
-        suggestions=(
-            value
-            for row in rows
-            for value in row.values()
-            if value not in (None, "")
-        ),
-    ).strip().casefold()
-    if search:
+    )
+    if search_terms:
         rows = [
             row
             for row in rows
-            if search in " ".join(
-                str(value).casefold() for value in row.values()
-            )
+            if matches_search_terms(search_terms, row.values())
         ]
 
     total_conversion = sum(
@@ -303,6 +297,122 @@ def _render_leave_conversion_report(
         disabled=not rows,
     )
 
+
+
+def _render_shifting_credits_report(current_user: AuthenticatedUser) -> None:
+    """Review/export the approved Shifting/OB lifecycle report."""
+
+    st.markdown("## Shifting Credits Report")
+    st.caption(
+        "Review eligible employees, same-cutoff 4+4 OB credits, delayed availability, "
+        "usage/expiration, restored Regular OT, and the separate straight-8h VL credit."
+    )
+    today = date.today()
+    report_year = int(
+        st.number_input(
+            "Report Year",
+            min_value=2020,
+            max_value=2100,
+            value=today.year,
+            step=1,
+            key="shifting_credits_report_year",
+        )
+    )
+    start_date = date(report_year, 1, 1)
+    end_date = date(report_year, 12, 31)
+
+    with SessionFactory() as session:
+        employees = EmployeeRepository(session).list_with_details(
+            current_user.company_id, archived=False
+        )
+        service = OvertimeService(session)
+        eligible_employees = [
+            employee
+            for employee in employees
+            if service.shifting_eligibility(
+                company_id=current_user.company_id, employee_id=employee.id
+            )[0]
+        ]
+        eligible_ids = [employee.id for employee in eligible_employees]
+        overtime_requests = [
+            request
+            for request in service.list_company_range(
+                company_id=current_user.company_id,
+                start_date=start_date,
+                end_date=end_date,
+                employee_ids=eligible_ids,
+            )
+            if request.status == "approved"
+        ]
+        credits = service.list_shifting_credits(
+            company_id=current_user.company_id,
+            employee_ids=eligible_ids,
+            as_of=today,
+        )
+        rules = service.rule_snapshot(current_user.company_id)
+        session.commit()
+        workbook_bytes = build_shifting_credits_excel(
+            employees=eligible_employees,
+            overtime_requests=overtime_requests,
+            credits=credits,
+            report_year=report_year,
+            cutoff_day=rules.shifting_credit_cutoff_day,
+            availability_cutoffs=rules.availability_cutoffs,
+            expiration_mode=rules.expiration_mode,
+            expiration_month=rules.expiration_month,
+            expiration_day=rules.expiration_day,
+            block_hours=rules.shifting_credit_block_hours,
+            required_blocks=rules.shifting_credit_required_blocks,
+            straight_ot_threshold_hours=rules.additional_vl_threshold_hours,
+            straight_ot_vl_days=rules.additional_vl_days,
+            straight_ot_also_payable=rules.additional_vl_also_payable,
+            excluded_positions=rules.excluded_positions,
+            timezone_name=get_settings().display_timezone,
+        )
+
+    year_credits = [credit for credit in credits if credit.cutoff_start.year == report_year]
+    metrics = st.columns(4)
+    metrics[0].metric("Eligible Employees", len(eligible_employees))
+    metrics[1].metric(
+        "OB Earned",
+        f"{sum(float(credit.ob_credit_days) for credit in year_credits):.2f}",
+    )
+    metrics[2].metric(
+        "Available OB",
+        f"{sum(float(credit.ob_credit_days) for credit in year_credits if credit.status == 'available'):.2f}",
+    )
+    metrics[3].metric(
+        "Used / Expired",
+        sum(1 for credit in year_credits if credit.status in {"used", "expired"}),
+    )
+
+    with st.container(border=True):
+        st.markdown("**Workbook contents**")
+        st.markdown(
+            "- `Summary` — eligible employee balances and rule reference\n"
+            "- `Cut-Off Date` — 1–15 / 16–month-end calendar cutoffs and availability dates\n"
+            "- One worksheet per eligible employee — source OT, OB lifecycle, excess/restored OT, and VL credit"
+        )
+        st.caption(
+            "Trainee, DE1 / Design Engineer I, and DE2 / Design Engineer II remain excluded. "
+            "Only approved OT is used for Shifting/OB and straight-OT VL processing. "
+            + (
+                "Current straight-OT setting: VL credit + OT payable."
+                if rules.additional_vl_also_payable
+                else "Current straight-OT setting: conversion to VL only; qualifying hours are not also OT payable."
+            )
+        )
+
+    st.download_button(
+        "Download Shifting Credits Report",
+        data=workbook_bytes,
+        file_name=f"shifting_credits_report_{report_year}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        width="stretch",
+        disabled=not eligible_employees,
+        key="download_shifting_credits_report",
+    )
 
 
 def _render_disciplinary_report(current_user: AuthenticatedUser) -> None:
@@ -422,9 +532,10 @@ def render_admin_reports_page(current_user: AuthenticatedUser) -> None:
     """Render stateful report workspaces without duplicating sidebar pages."""
 
     st.title("Reports")
-    combined_tab, conversion_tab, disciplinary_tab = persistent_tabs(
+    combined_tab, shifting_tab, conversion_tab, disciplinary_tab = persistent_tabs(
         (
             "Combined HR Report",
+            "Shifting Credits",
             "Leave Conversion to Cash",
             "Disciplinary Records",
         ),
@@ -433,6 +544,9 @@ def render_admin_reports_page(current_user: AuthenticatedUser) -> None:
     if combined_tab.open:
         with combined_tab:
             _render_combined_hr_report(current_user)
+    elif shifting_tab.open:
+        with shifting_tab:
+            _render_shifting_credits_report(current_user)
     elif conversion_tab.open:
         with conversion_tab:
             _render_leave_conversion_report(current_user)

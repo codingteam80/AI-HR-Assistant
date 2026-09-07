@@ -573,3 +573,55 @@ render_operation_feedback()
 
 Use the shared operation-feedback component for future form operations that
 must survive a Streamlit rerun.
+
+## Chat Assistant terminal diagnostics (v0.8.8.217)
+
+`modules/smart_ai/terminal_trace.py` provides request-local terminal-only
+retrieval diagnostics. `SmartPortalAssistant` creates one trace per request and
+passes it into `HybridRetriever`; no trace object is stored in Streamlit Session
+State, returned in `HRAssistantResponse`, or rendered by either Chat page.
+
+When enabled, the trace exposes bounded, already-authorized evidence only and
+prints to stderr. It includes file-stage and chunk-stage BM25/vector/hybrid
+scores, selected files/chunks, final Qwen evidence, deterministic/router output,
+model timing/retry events, raw Qwen output, and the final normalized answer.
+
+Keep this diagnostic path side-effect free: it must never change ranking,
+permission scoping, prompt content, retry count, or UI state. Disable it with
+`SMART_AI_TERMINAL_DEBUG_ENABLED=false` when console traces are not needed.
+
+## Chat Assistant terminal candidate-answer diagnostics (v0.8.8.218)
+
+v0.8.8.218 extends the existing terminal-only trace with source-labeled candidate answer excerpts. Set `SMART_AI_TERMINAL_DEBUG_CANDIDATE_ANSWER_CHARS` to bound each candidate excerpt. Candidate diagnostics are observational only: they are not stored in Session State, returned in `HRAssistantResponse`, or used as an extra ranking/generation signal. The trace also prints router and Qwen answer options plus the selected final answer path for easier FAIL/PARTIAL diagnosis.
+
+## v8.8.219 Chat Assistant diagnostics and relevance hardening
+
+- Base: exact v8.8.218 package.
+- Terminal-only retrieval trace is structured for human debugging and mirrored to per-request files in `logs/chat_assistant/`.
+- Trace/log output may contain authorized HR/policy evidence for the current request; keep the project/log folder access-controlled like the rest of the local HR data.
+- Log file failures are fail-safe and do not alter the answer path.
+- Relevance/no-match guard rejects a mathematically nearest chunk when its specific topic anchors do not sufficiently match the question.
+- Existing out-of-scope behavior (e.g. unrelated general-knowledge questions) remains in place.
+- PolicyService adds the same topic-support check before accepting deterministic policy search matches, covering the preflight/Ollama-unavailable path.
+- Streamlit displays one top approved policy source only; internal evidence selection and terminal diagnostics can still use/show multiple supporting chunks.
+- No special broad-topic `COVERAGE` retrieval mode is present in this checkpoint.
+- PDF/DOCX extraction, company/role isolation, BM25/vector/RRF architecture, chunk sizes/overlap, and unrelated HR workflows are intentionally retained.
+
+
+## v8.8.220 compact terminal / full-log diagnostic contract
+
+- Base: exact v8.8.219 package.
+- Normal runtime with `SMART_AI_TERMINAL_DEBUG_LOG_ENABLED=true`: keep stderr
+  compact and human-scannable; preserve the full retrieval/generation evidence
+  in one request-local `logs/chat_assistant/chat_trace_*.log` file.
+- Compact stderr must show retrieval totals, selected source scores/chunk counts,
+  up to three candidate-answer scores, final answer/source, and runtime status.
+- Full log must retain detailed BM25/vector/hybrid stages, excerpts, final
+  evidence, relevance decision, router/Qwen options, top-nearest source, and
+  request summary.
+- If the log path cannot be opened or writing fails, diagnostics must remain
+  fail-safe and the terminal may fall back to verbose output rather than lose
+  evidence.
+- Diagnostic formatting must never change ranking, prompt content, answer
+  normalization, retry count, tenant/role scoping, Streamlit state, or visible
+  source-selection behavior.

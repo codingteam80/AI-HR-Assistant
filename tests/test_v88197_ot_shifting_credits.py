@@ -123,7 +123,7 @@ def test_two_four_hour_blocks_pair_within_cutoff_and_leave_excess_payable() -> N
         assert first.shifting_credit_group == second.shifting_credit_group
 
 
-def test_eight_hour_ot_stays_payable_and_grants_half_vl() -> None:
+def test_eight_hour_ot_converts_to_half_vl_and_is_not_payable_by_default() -> None:
     factory = _factory()
     rendered = date(2026, 8, 28)
     with factory() as session:
@@ -133,9 +133,10 @@ def test_eight_hour_ot_stays_payable_and_grants_half_vl() -> None:
         service = OvertimeService(session)
         request = service.submit(_request(seed, rendered, Decimal("8.00")))
         _approve(service, seed, request)
-        assert Decimal(request.payable_hours) == Decimal("8.00")
+        assert Decimal(request.payable_hours) == Decimal("0.00")
         assert Decimal(request.shifting_credit_hours) == Decimal("0.00")
         assert Decimal(request.additional_vl_days) == Decimal("0.50")
+        assert request.straight_vl_also_payable is False
         tx = session.scalar(
             select(LeaveCreditTransaction).where(
                 LeaveCreditTransaction.company_id == seed["company"].id,
@@ -145,6 +146,35 @@ def test_eight_hour_ot_stays_payable_and_grants_half_vl() -> None:
         )
         assert tx is not None
         assert Decimal(tx.amount_days) == Decimal("0.50")
+
+
+def test_straight_eight_hour_can_also_remain_payable_when_enabled() -> None:
+    factory = _factory()
+    rendered = date(2026, 8, 29)
+    with factory() as session:
+        seed = seed_initial_data(session, _settings())
+        AttendanceService(session).save_overtime_rules(
+            CompanyOvertimeRulesInput(
+                company_id=seed["company"].id,
+                dinner_break_deduction_hours=Decimal("0.75"),
+                shifting_credits_enabled=True,
+                shifting_credit_block_hours=Decimal("4.00"),
+                shifting_credit_required_blocks=2,
+                shifting_credit_cutoff_day=15,
+                additional_vl_threshold_hours=Decimal("8.00"),
+                additional_vl_days=Decimal("0.50"),
+                additional_vl_also_payable=True,
+                excluded_positions=["Trainee", "Design Engineer I", "Design Engineer II"],
+            )
+        )
+        session.add(_record(seed, rendered, Decimal("8.00")))
+        session.commit()
+        service = OvertimeService(session)
+        request = service.submit(_request(seed, rendered, Decimal("8.00"), dinner=True))
+        _approve(service, seed, request)
+        assert Decimal(request.payable_hours) == Decimal("7.25")
+        assert Decimal(request.additional_vl_days) == Decimal("0.50")
+        assert request.straight_vl_also_payable is True
 
 
 def test_excluded_design_engineer_i_does_not_receive_shifting_or_vl() -> None:
@@ -177,12 +207,14 @@ def test_ot_shifting_settings_are_editable_and_persisted() -> None:
                 shifting_credit_cutoff_day=14,
                 additional_vl_threshold_hours=Decimal("7.00"),
                 additional_vl_days=Decimal("0.50"),
+                additional_vl_also_payable=True,
                 excluded_positions=["Trainee", "Design Engineer I", "Design Engineer II"],
             )
         )
         assert Decimal(company.ot_dinner_break_deduction_hours) == Decimal("0.50")
         assert Decimal(company.shifting_credit_block_hours) == Decimal("3.50")
         assert company.shifting_credit_cutoff_day == 14
+        assert company.shifting_credit_additional_vl_also_payable is True
 
 
 def test_four_hour_blocks_do_not_pair_across_cutoff_boundary() -> None:
@@ -219,5 +251,6 @@ def test_eight_hour_dinner_break_uses_gross_hours_for_vl_but_net_payable_ot() ->
             _request(seed, rendered, Decimal("8.00"), dinner=True)
         )
         _approve(service, seed, request)
-        assert Decimal(request.payable_hours) == Decimal("7.25")
+        assert Decimal(request.payable_hours) == Decimal("0.00")
         assert Decimal(request.additional_vl_days) == Decimal("0.50")
+        assert request.straight_vl_also_payable is False

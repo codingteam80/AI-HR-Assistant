@@ -46,8 +46,8 @@ def test_admin_monthly_dtr_has_case_insensitive_employee_search() -> None:
 
     assert '"Search Employee / Attendance / DTR / OT"' in source
     assert 'key="admin_dtr_employee_search"' in source
-    assert ".strip().casefold()" in source
-    assert "search in searchable_employee(employee)" in source
+    assert "multi_search_input(" in source
+    assert "text_matches_search_terms(search_terms, searchable_employee(employee))" in source
     assert "total_employee_count" in source
     assert "employee(s) shown" in source
 

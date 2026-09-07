@@ -16,6 +16,8 @@ from services.attendance_service import (
 ATTENDANCE_VISIBLE_ROWS = 7
 ATTENDANCE_HEADER_HEIGHT = 54
 ATTENDANCE_ROW_HEIGHT = 82
+ATTENDANCE_DATE_COLUMN_WIDTH = 170
+ATTENDANCE_EMPLOYEE_COLUMN_WIDTH = 190
 ATTENDANCE_VIEWPORT_HEIGHT = (
     ATTENDANCE_HEADER_HEIGHT
     + (ATTENDANCE_VISIBLE_ROWS * ATTENDANCE_ROW_HEIGHT)
@@ -123,9 +125,11 @@ def render_attendance_matrix(
             color:#10172A; font-size:.78rem;
         }}
         .attendance-{css_key} th, .attendance-{css_key} td {{
-            width:118px; min-width:118px; padding:9px 8px; text-align:center;
+            width:{ATTENDANCE_DATE_COLUMN_WIDTH}px;
+            min-width:{ATTENDANCE_DATE_COLUMN_WIDTH}px;
+            padding:9px 8px; text-align:center;
             border-right:1px solid #D8DEEA; border-bottom:1px solid #D8DEEA;
-            vertical-align:top; line-height:1.35; box-sizing:border-box;
+            vertical-align:middle; line-height:1.35; box-sizing:border-box;
         }}
         .attendance-{css_key} th {{
             position:sticky; top:0; z-index:3; background:#F1F4F9;
@@ -138,7 +142,9 @@ def render_attendance_matrix(
             display:block; margin-top:3px; color:#3F4A61;
         }}
         .attendance-{css_key} .employee {{
-            position:sticky; left:0; z-index:2; width:190px; min-width:190px;
+            position:sticky; left:0; z-index:2;
+            width:{ATTENDANCE_EMPLOYEE_COLUMN_WIDTH}px;
+            min-width:{ATTENDANCE_EMPLOYEE_COLUMN_WIDTH}px;
             text-align:left; background:#FFFFFF; font-weight:700;
         }}
         .attendance-{css_key} th.employee {{z-index:4;background:#F1F4F9}}

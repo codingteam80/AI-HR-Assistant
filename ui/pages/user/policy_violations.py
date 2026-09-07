@@ -12,7 +12,8 @@ from config.settings import get_settings
 from database.session import SessionFactory
 from services.policy_service import PolicyService
 from services.policy_violation_service import PolicyViolationService, VIOLATION_SEVERITIES
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_search_terms
 
 
 def render_employee_policy_violations(
@@ -43,20 +44,10 @@ def render_employee_policy_violations(
     }
 
     categories = sorted({item.category for item in items})
-    search = live_search_input(
+    search = multi_search_input(
         "Search Violations",
-        placeholder="Search code, violation, category, severity, or disciplinary action...",
-        key="employee_policy_violation_search",
-        suggestions=(
-            value
-            for item in items
-            for value in (
-                item.violation_code,
-                item.offense_title,
-                item.category,
-                item.severity,
-            )
-        ),
+        placeholder="Type code, violation, category, severity, or action, then press Enter…",
+        key="employee_policy_violation_search"
     )
     cols = st.columns(2)
     with cols[0]:
@@ -72,14 +63,25 @@ def render_employee_policy_violations(
             key="employee_policy_violation_severity",
         )
 
-    with SessionFactory() as session:
-        filtered = PolicyViolationService(session).filter_items(
-            items,
-            search_text=search,
-            category=None if category == "All Categories" else category,
-            severity=None if severity == "All Severities" else severity,
-            status="active",
+    filtered = []
+    for item in items:
+        if category != "All Categories" and item.category != category:
+            continue
+        if severity != "All Severities" and item.severity != severity:
+            continue
+        related_policy = (
+            policy_labels.get(item.related_policy_id, "Unavailable / not linked")
+            if item.related_policy_id else "Not linked"
         )
+        visible_values = (
+            item.violation_code, item.offense_title, item.severity, item.category,
+            item.effective_date.isoformat() if item.effective_date else "Immediate",
+            related_policy, item.description, item.first_offense_action,
+            item.second_offense_action, item.third_offense_action, item.final_action,
+            item.notes or "",
+        )
+        if matches_search_terms(search, visible_values):
+            filtered.append(item)
 
     st.caption(f"{len(filtered)} of {len(items)} active violation rule(s) shown.")
     if not filtered:

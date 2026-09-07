@@ -19,7 +19,8 @@ from schemas.announcement_schema import (
 )
 from services.announcement_service import AnnouncementService
 from services.notification_service import NotificationService
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import text_matches_search_terms
 
 
 def _target_announcement_id() -> int | None:
@@ -250,21 +251,11 @@ def render_employee_announcements_page(
         )
 
     with filter_right:
-        search_text = live_search_input(
+        search_terms = multi_search_input(
             "Search Announcements",
-            placeholder="Search title, summary, or content...",
+            placeholder="Type title, category, summary, or content, then press Enter…",
             key="employee_announcement_search",
-            suggestions=(
-                value
-                for announcement in announcements
-                for value in (
-                    announcement.title,
-                    announcement.category,
-                )
-            ),
         )
-
-    normalized_search = search_text.strip().casefold()
     filtered = []
 
     for announcement in announcements:
@@ -286,10 +277,7 @@ def render_employee_announcements_page(
             f"{'Pinned' if announcement.is_pinned else 'Not Pinned'}"
         ).casefold()
 
-        if (
-            normalized_search
-            and normalized_search not in searchable
-        ):
+        if not text_matches_search_terms(search_terms, searchable):
             continue
 
         filtered.append(announcement)

@@ -34,7 +34,8 @@ from services.employee_bulk_import_service import (
     EmployeeBulkImportService,
 )
 from services.edit_conflict import EditConflictError
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import filter_aligned_visible_rows, matches_visible_row
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -249,80 +250,15 @@ def _employee_rows(
         )
     return rows
 
-def _employee_search_value(employee) -> str:
-    """Build one normalized searchable value for an employee record."""
-
-    values = [
-        employee.employee_number,
-        employee.full_name,
-        employee.first_name,
-        employee.middle_name,
-        employee.last_name,
-        employee.suffix,
-        employee.work_email,
-        employee.telephone_mobile_no,
-        employee.job_title,
-        employee.hire_date,
-        employee.years_of_service,
-        employee.employment_status,
-        (
-            employee.department.name
-            if employee.department
-            else ""
-        ),
-        (
-            employee.manager.full_name
-            if employee.manager
-            else ""
-        ),
-        (
-            employee.leader.full_name
-            if employee.leader
-            else ""
-        ),
-        employee.gender,
-        employee.civil_status,
-        employee.date_of_birth,
-        employee.age,
-        (
-            employee.user.username
-            if employee.user
-            else ""
-        ),
-        (
-            "active"
-            if employee.user and employee.user.is_active
-            else "inactive"
-        ),
-        *(
-            item.title
-            for item in employee.trainings
-        ),
-    ]
-
-    return " ".join(
-        str(value).strip().casefold()
-        for value in values
-        if value not in (None, "")
-    )
-
-
 def _filter_employees(
     employees,
-    search_text: str,
+    search_terms,
 ):
-    """Filter by employee, account, department, manager, or training text."""
+    """Filter Employee Master rows across every value shown in the table."""
 
-    normalized = search_text.strip().casefold()
-
-    if not normalized:
-        return list(employees)
-
-    return [
-        employee
-        for employee in employees
-        if normalized in _employee_search_value(employee)
-    ]
+    rows = _employee_rows(employees)
+    filtered, _ = filter_aligned_visible_rows(employees, rows, search_terms)
+    return filtered
 
 
 def _assignment_options(
@@ -691,29 +627,17 @@ def _render_employee_list(
         with column:
             st.metric(label, value)
 
-    search_text = live_search_input(
+    search_terms = multi_search_input(
         "Search Employees",
         placeholder=(
-            "Search employee number, name, email, telephone/mobile, "
-            "department, manager, position, username, or training..."
+            "Type any value shown in the employee table, then press Enter…"
         ),
         key="employee_master_search",
-        suggestions=(
-            value
-            for employee in employees
-            for value in (
-                employee.employee_number,
-                employee.full_name,
-                employee.work_email,
-                employee.telephone_mobile_no,
-            )
-            if value
-        ),
     )
 
     filtered = _filter_employees(
         employees,
-        search_text,
+        search_terms,
     )
     rows = _employee_rows(filtered)
 
@@ -1796,54 +1720,27 @@ def _render_employee_history(history_rows, user_labels: dict[int, str]) -> None:
         "Employee creation, Excel uploads, profile/account edits, archiving, "
         "and restoration are retained here. Plain-text passwords are never audited."
     )
-    search_text = live_search_input(
+    search_terms = multi_search_input(
         "Search Employee History",
-        placeholder="Search employee, action, administrator, upload, or change…",
+        placeholder="Type any value shown in the history table, then press Enter…",
         key="employee_history_search",
-        suggestions=(
-            value
-            for history in history_rows
-            for value in (
-                history.employee_number,
-                history.employee_name,
-                history.action_type,
-                history.source,
-                history.upload_filename,
-            )
-            if value
-        ),
     )
-    normalized = search_text.strip().casefold()
     filtered = []
     for history in history_rows:
         actor = user_labels.get(history.performed_by_user_id, "System / Former User")
         changes = _history_changes(history)
-        searchable = " ".join(
-            str(value or "")
-            for value in (
-                history.employee_number,
-                history.employee_name,
-                history.action_type,
-                history.source,
-                history.summary,
-                history.upload_filename,
-                actor,
-                changes,
-            )
-        ).casefold()
-        if not normalized or normalized in searchable:
-            filtered.append(
-                {
-                    "Date / Time": history.created_at.strftime("%Y-%m-%d %I:%M %p"),
-                    "Employee": f"{history.employee_number} — {history.employee_name}",
-                    "Action": history.action_type.replace("_", " ").title(),
-                    "Source": history.source.replace("_", " ").title(),
-                    "Performed By": actor,
-                    "Summary": history.summary,
-                    "Changes": changes,
-                    "Upload File": _display_value(history.upload_filename),
-                }
-            )
+        row = {
+            "Date / Time": history.created_at.strftime("%Y-%m-%d %I:%M %p"),
+            "Employee": f"{history.employee_number} — {history.employee_name}",
+            "Action": history.action_type.replace("_", " ").title(),
+            "Source": history.source.replace("_", " ").title(),
+            "Performed By": actor,
+            "Summary": history.summary,
+            "Changes": changes,
+            "Upload File": _display_value(history.upload_filename),
+        }
+        if matches_visible_row(search_terms, row):
+            filtered.append(row)
     st.caption(f"Showing {len(filtered)} of {len(history_rows)} history record(s).")
     if not filtered:
         st.info("No employee history matches the current search.")
@@ -1867,25 +1764,11 @@ def _render_employee_archive(
         "Resigned employees remain available with all related attendance, leave, "
         "OT, documents, and history. Restoring reuses the same employee and account records."
     )
-    search_text = live_search_input(
+    search_terms = multi_search_input(
         "Search Archived Employees",
-        placeholder="Search archived employee number, name, email, department, or position…",
+        placeholder="Type any value shown in the archive table, then press Enter…",
         key="employee_archive_search",
-        suggestions=(
-            value
-            for employee in archived_employees
-            for value in (employee.employee_number, employee.full_name, employee.work_email)
-            if value
-        ),
     )
-    filtered = _filter_employees(archived_employees, search_text)
-    st.caption(
-        f"Showing {len(filtered)} of {len(archived_employees)} archived employee record(s)."
-    )
-    if not filtered:
-        st.info("No archived employee matches the current search.")
-        return
-
     archive_rows = [
         {
             "Employee Number": employee.employee_number,
@@ -1902,8 +1785,17 @@ def _render_employee_archive(
                 else "N/A"
             ),
         }
-        for employee in filtered
+        for employee in archived_employees
     ]
+    filtered, archive_rows = filter_aligned_visible_rows(
+        archived_employees, archive_rows, search_terms
+    )
+    st.caption(
+        f"Showing {len(filtered)} of {len(archived_employees)} archived employee record(s)."
+    )
+    if not filtered:
+        st.info("No archived employee matches the current search.")
+        return
     _render_employee_workspace_table(
         archive_rows,
         aria_label="Scrollable archived employee list",

@@ -27,6 +27,7 @@ from ui.navigation_state import set_navigation_state
 
 ADMIN_CHAT_STATE_PREFIX = "admin_hr_assistant_chat_messages__"
 ADMIN_CHAT_INPUT_PREFIX = "admin_hr_assistant_chat_input__"
+CHAT_CONVERSATION_HEIGHT = 500
 _ADMIN_ACTION_QUERY_KEYS = {
     "announcement_id",
     "employee_id",
@@ -60,26 +61,32 @@ def _admin_chat_input_key(current_user: AuthenticatedUser) -> str:
 
 
 def _source_lines(sources) -> list[str]:
-    """Convert approved-policy source objects into readable lines."""
+    """Show one best approved-policy source in the chat UI.
 
-    lines = []
-    for source in sources:
-        effective_date = (
-            source.effective_date.isoformat()
-            if source.effective_date
-            else "Not specified"
-        )
-        filename = source.filename or "Manual policy entry"
-        page = (
-            f", page {source.page_number}"
-            if source.page_number is not None
-            else ""
-        )
-        lines.append(
-            f"{filename} — {source.title} — {source.section_heading} "
-            f"(v{source.version}{page}, effective {effective_date})"
-        )
-    return lines
+    Multiple chunks/sections from the same policy remain available to the RAG
+    pipeline and terminal trace, but the user-facing chat keeps one clean top
+    source instead of rendering every supporting chunk as another source line.
+    """
+
+    if not sources:
+        return []
+
+    source = sources[0]
+    effective_date = (
+        source.effective_date.isoformat()
+        if source.effective_date
+        else "Not specified"
+    )
+    file_label = source.filename or "Manual policy entry"
+    page_label = (
+        f", page {source.page_number}"
+        if source.page_number is not None
+        else ""
+    )
+    return [
+        f"{file_label} — {source.title} — {source.section_heading} "
+        f"(v{source.version}{page_label}, effective {effective_date})"
+    ]
 
 
 def _open_admin_action(action: dict) -> None:
@@ -168,7 +175,11 @@ def render_admin_chat_page(current_user: AuthenticatedUser) -> None:
         # Reserve the complete conversation area before the input. Re-entering
         # this container after a submission keeps the pending user message,
         # loading state, and final history above the chat input.
-        conversation_area = st.container()
+        conversation_area = st.container(
+            height=CHAT_CONVERSATION_HEIGHT,
+            border=False,
+            key="admin_chat_conversation",
+        )
         welcome_placeholder = None
 
         with conversation_area:
@@ -202,7 +213,7 @@ def render_admin_chat_page(current_user: AuthenticatedUser) -> None:
                             )
 
                         if message.get("sources"):
-                            st.markdown("**Approved policy sources**")
+                            st.markdown("**Approved policy source**")
                             for source_line in message["sources"]:
                                 st.caption(source_line)
 

@@ -23,7 +23,8 @@ from services.policy_service import PolicyAdminView, PolicyService
 from ui.pages.admin.policy_violations import render_admin_policy_violations
 from ui.components.data_table import render_admin_table
 from ui.components.confirmation_guard import invalidate_confirmation_on_change
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_search_terms, matches_visible_row
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -40,6 +41,8 @@ _POLICY_LIBRARY_PREVIEW_STATE_KEY = "_policy_library_preview_policy_id"
 
 _POLICY_UPLOAD_NONCE_STATE_KEY = "_policy_upload_nonce"
 _POLICY_UPLOAD_WIDGET_PREFIX = "policy_upload_"
+_POLICY_UPLOAD_RESULT_STATE_KEY = "_policy_upload_batch_result"
+_AUTO_VERSION_LINK_LABEL = "Auto-detect from filename"
 
 
 def _get_policy_upload_nonce() -> int:
@@ -458,6 +461,12 @@ def _render_policy_table(
         document_map,
         include_bin_date=include_bin_date,
     )
+    search_terms = multi_search_input(
+        "Search Policies",
+        placeholder="Type any value shown in the policy table, then press Enter…",
+        key=f"{key}_multi_search",
+    )
+    rows = [row for row in rows if matches_visible_row(search_terms, row)]
 
     if not rows:
         st.info(
@@ -556,22 +565,17 @@ def _render_extracted_content(view: PolicyAdminView) -> None:
 def _render_sections(view: PolicyAdminView) -> None:
     """Render searchable policy sections in a bounded scroll box."""
 
-    section_search = live_search_input(
+    section_search = multi_search_input(
         "Find in Sections",
-        placeholder="Search a heading or extracted text...",
+        placeholder="Type a heading or extracted-text term, then press Enter…",
         key=f"section_search_{view.policy.id}",
-        suggestions=(
-            section.heading
-            for section in view.sections
-        ),
-    ).strip().lower()
+    )
     matches = [
         section
         for section in view.sections
-        if (
-            not section_search
-            or section_search in section.heading.lower()
-            or section_search in section.text.lower()
+        if matches_search_terms(
+            section_search,
+            (section.sequence_number, section.heading, section.text, section.page_number or ""),
         )
     ]
     st.caption(
@@ -655,8 +659,14 @@ def _render_version_history(current_user: AuthenticatedUser, view: PolicyAdminVi
     """Render complete version history in a fixed-height table."""
 
     rows = _version_rows(current_user, view.policy.title)
+    search_terms = multi_search_input(
+        "Search Version History",
+        placeholder="Type any value shown in the version table, then press Enter…",
+        key=f"policy_version_history_search_{view.policy.id}",
+    )
+    rows = [row for row in rows if matches_visible_row(search_terms, row)]
     st.caption(
-        f"{len(rows)} version(s) · scroll inside the table when the "
+        f"{len(rows)} matching version(s) · scroll inside the table when the "
         "history exceeds the fixed view"
     )
     render_admin_table(
@@ -720,200 +730,375 @@ def _render_move_to_bin(current_user: AuthenticatedUser, view: PolicyAdminView) 
             render_action_warning(error)
 
 
+def _render_policy_upload_result() -> None:
+    """Show one batch result after the uploader is safely remounted."""
+
+    result = st.session_state.pop(
+        _POLICY_UPLOAD_RESULT_STATE_KEY,
+        None,
+    )
+    if not isinstance(result, dict):
+        return
+
+    successes = list(result.get("successes") or [])
+    failures = list(result.get("failures") or [])
+
+    if successes:
+        st.success(
+            f"{len(successes)} policy file(s) uploaded and published "
+            "successfully."
+        )
+        st.caption(" · ".join(str(item) for item in successes))
+
+    if failures:
+        lines = []
+        for failure in failures:
+            if isinstance(failure, dict):
+                filename = str(failure.get("filename") or "Policy file")
+                message = str(
+                    failure.get("message")
+                    or "The file could not be processed."
+                )
+                lines.append(f"- **{filename}** — {message}")
+        if lines:
+            st.warning(
+                f"{len(lines)} policy file(s) were not uploaded.\n\n"
+                + "\n".join(lines)
+            )
+
+
+def _policy_upload_validation_message(error: ValidationError) -> str:
+    """Return a short validation message suitable for one batch row."""
+
+    errors = error.errors()
+    if not errors:
+        return "The policy metadata is invalid."
+    return str(errors[0].get("msg") or "The policy metadata is invalid.")
+
+
 def _render_upload(current_user: AuthenticatedUser, all_versions) -> None:
+    """Render single- or multi-file policy upload without batch-wide failure."""
+
     settings = get_settings()
 
     upload_nonce = _get_policy_upload_nonce()
     _cleanup_old_policy_upload_state(upload_nonce)
     st.subheader("Upload Policy File")
     st.caption(
-        "The filename becomes the policy title automatically. Category is "
-        "suggested from file headings and remains editable. Every successful "
-        "upload is published immediately."
+        "Select one or multiple policy documents. Each file becomes its own "
+        "published policy/version, with independent title, category, version "
+        "history, extraction, and Policy Q&A content."
     )
-    uploaded = st.file_uploader(
-        "Policy File *",
+    _render_policy_upload_result()
+
+    uploaded_files = st.file_uploader(
+        "Policy File(s) *",
         type=[ext.lstrip(".") for ext in sorted(ALLOWED_POLICY_EXTENSIONS)],
+        accept_multiple_files=True,
         help=(
-            f"Maximum size: {settings.policy_upload_max_mb} MB. "
-            "Scanned image-only PDFs are not supported yet."
+            f"Maximum size: {settings.policy_upload_max_mb} MB per file. "
+            "Supported files are processed independently, so one invalid "
+            "document does not cancel the rest of the batch. Scanned "
+            "image-only PDFs are not supported yet."
         ),
         key=_policy_upload_widget_key(
             upload_nonce,
             "file",
         ),
     )
-    if uploaded is None:
-        st.info("Choose a file to generate its title, category suggestion, version history, and preview.")
+    if not uploaded_files:
+        st.info(
+            "Choose one or more files to generate titles, category suggestions, "
+            "version history, and document previews."
+        )
         return
+
+    uploaded_files = list(uploaded_files)
+    st.caption(
+        f"{len(uploaded_files)} file(s) selected · "
+        f"{settings.policy_upload_max_mb} MB maximum per file"
+    )
 
     unique_titles = sorted({p.title for p in all_versions})
-    mode = st.radio(
-        "Version linking",
-        options=[
-            "Auto-detect from filename",
-            "Select existing policy",
-        ],
-        horizontal=True,
-        help=(
-            "Auto-detect matches the cleaned filename. Select existing policy "
-            "when the new file uses a different filename."
-        ),
-        key=_policy_upload_widget_key(
-            upload_nonce,
-            "version_linking",
-        ),
-    )
-    selected_title = None
-    if mode == "Select existing policy":
-        if unique_titles:
-            selected_title = st.selectbox(
-                "Existing Policy",
-                options=unique_titles,
+    prepared: list[dict] = []
+    preview_failures: list[dict] = []
+    seen_document_hashes: set[str] = set()
+
+    for file_index, uploaded in enumerate(uploaded_files, start=1):
+        file_bytes = uploaded.getvalue()
+        selection_fingerprint = hashlib.sha256(file_bytes).hexdigest()[:12]
+
+        with st.container(border=True):
+            st.markdown(f"**{file_index}. {uploaded.name}**")
+
+            link_options = [
+                _AUTO_VERSION_LINK_LABEL,
+                *unique_titles,
+            ]
+            link_choice = st.selectbox(
+                "Version linking",
+                options=link_options,
                 key=_policy_upload_widget_key(
                     upload_nonce,
-                    "existing_policy",
+                    f"version_linking_{selection_fingerprint}_{file_index}",
+                ),
+                help=(
+                    "Keep Auto-detect when the filename identifies the policy. "
+                    "Choose an existing policy only when this file is a new "
+                    "version with a different filename."
                 ),
             )
-        else:
-            st.info("No existing policy is available yet; filename auto-detection will be used.")
-
-    try:
-        with SessionFactory() as session:
-            preview = PolicyService(session).preview_policy_upload(
-                company_id=current_user.company_id,
-                filename=uploaded.name,
-                file_bytes=uploaded.getvalue(),
-                maximum_size_bytes=settings.policy_upload_max_mb * 1024 * 1024,
-                mime_type=uploaded.type,
-                selected_existing_title=selected_title,
+            selected_title = (
+                None
+                if link_choice == _AUTO_VERSION_LINK_LABEL
+                else link_choice
             )
-    except ValueError as error:
-        render_action_warning(error)
+
+            try:
+                with SessionFactory() as session:
+                    preview = PolicyService(session).preview_policy_upload(
+                        company_id=current_user.company_id,
+                        filename=uploaded.name,
+                        file_bytes=file_bytes,
+                        maximum_size_bytes=(
+                            settings.policy_upload_max_mb * 1024 * 1024
+                        ),
+                        mime_type=uploaded.type,
+                        selected_existing_title=selected_title,
+                    )
+            except ValueError as error:
+                message = str(error)
+                st.error(message)
+                preview_failures.append(
+                    {
+                        "filename": uploaded.name,
+                        "message": message,
+                    }
+                )
+                continue
+
+            if preview.parsed.sha256 in seen_document_hashes:
+                message = "The same file was selected more than once in this batch."
+                st.error(message)
+                preview_failures.append(
+                    {
+                        "filename": uploaded.name,
+                        "message": message,
+                    }
+                )
+                continue
+            seen_document_hashes.add(preview.parsed.sha256)
+
+            fingerprint = hashlib.sha256(
+                (preview.parsed.sha256 + preview.display_title).encode("utf-8")
+            ).hexdigest()[:12]
+            category_key = _policy_upload_widget_key(
+                upload_nonce,
+                f"category_{fingerprint}",
+            )
+            version_key = _policy_upload_widget_key(
+                upload_nonce,
+                f"version_{fingerprint}",
+            )
+            if category_key not in st.session_state:
+                st.session_state[category_key] = preview.suggested_category
+            if version_key not in st.session_state:
+                st.session_state[version_key] = (
+                    "1.0" if not preview.previous_versions else ""
+                )
+
+            columns = st.columns([1.35, 1.0, 0.7, 0.9], gap="small")
+            with columns[0]:
+                st.text_input(
+                    "Policy Filename / Title",
+                    value=preview.display_title,
+                    disabled=True,
+                    key=_policy_upload_widget_key(
+                        upload_nonce,
+                        f"title_{fingerprint}",
+                    ),
+                )
+            with columns[1]:
+                category = st.text_input(
+                    "Category *",
+                    key=category_key,
+                    max_chars=100,
+                    help=(
+                        "Used for filtering and organizing Policy Q&A. "
+                        "The suggestion is editable."
+                    ),
+                )
+            with columns[2]:
+                version = st.text_input(
+                    "Version *",
+                    key=version_key,
+                    max_chars=30,
+                    placeholder="Example: 1.1",
+                    help="Manual input. Previous versions are shown below.",
+                )
+            with columns[3]:
+                st.text_input(
+                    "Date Uploaded",
+                    value=_format_datetime(datetime.now(timezone.utc)),
+                    disabled=True,
+                    key=_policy_upload_widget_key(
+                        upload_nonce,
+                        f"date_{fingerprint}",
+                    ),
+                    help=(
+                        "The final date and time are recorded automatically "
+                        "when this file is uploaded."
+                    ),
+                )
+
+            if preview.previous_versions:
+                st.markdown("**Previous versions**")
+                render_admin_table(
+                    [
+                        {
+                            "Policy ID": item.public_id,
+                            "Version": item.version,
+                            "Date Uploaded": _format_datetime(item.uploaded_at),
+                            "Location": "Bin" if item.in_bin else "Policies",
+                        }
+                        for item in preview.previous_versions
+                    ],
+                    key=(
+                        f"upload-history-{upload_nonce}-"
+                        f"{fingerprint}-{file_index}"
+                    ),
+                    min_width=700,
+                    column_widths=("130px", "120px", "260px", "130px"),
+                    compact=True,
+                    max_height=POLICY_VERSION_HISTORY_HEIGHT,
+                )
+            else:
+                st.caption("No previous version was detected for this title.")
+
+            with st.expander(
+                f"Document Preview — {file_index}. {uploaded.name}",
+                expanded=(len(uploaded_files) == 1),
+            ):
+                st.caption(
+                    f"{len(preview.parsed.sections)} searchable sections · "
+                    f"{_format_size(preview.parsed.size_bytes)} · "
+                    f"{preview.parsed.original_filename}"
+                )
+                _render_detected_headings(preview.parsed.sections)
+                _render_full_section_preview(preview.parsed.sections)
+
+            prepared.append(
+                {
+                    "uploaded": uploaded,
+                    "file_bytes": file_bytes,
+                    "preview": preview,
+                    "category": category,
+                    "version": version,
+                }
+            )
+
+    if preview_failures:
+        st.warning(
+            f"{len(preview_failures)} selected file(s) cannot be prepared. "
+            "Ready files can still be uploaded independently."
+        )
+
+    if not prepared:
         return
 
-    fingerprint = hashlib.sha256(
-        (preview.parsed.sha256 + preview.display_title).encode("utf-8")
-    ).hexdigest()[:12]
-    category_key = _policy_upload_widget_key(
-        upload_nonce,
-        f"category_{fingerprint}",
+    submit_label = (
+        "Upload and Process Policy"
+        if len(uploaded_files) == 1
+        else f"Upload and Process {len(prepared)} Policy Files"
     )
-    version_key = _policy_upload_widget_key(
-        upload_nonce,
-        f"version_{fingerprint}",
-    )
-    if category_key not in st.session_state:
-        st.session_state[category_key] = preview.suggested_category
-    if version_key not in st.session_state:
-        st.session_state[version_key] = "1.0" if not preview.previous_versions else ""
-
-    columns = st.columns(3)
-    with columns[0]:
-        st.text_input("Policy Filename / Title", value=preview.display_title, disabled=True)
-    with columns[1]:
-        category = st.text_input(
-            "Category *",
-            key=category_key,
-            max_chars=100,
-            help="Used for filtering and organizing Policy Q&A. The suggestion is editable.",
-        )
-    with columns[2]:
-        version = st.text_input(
-            "Version *",
-            key=version_key,
-            max_chars=30,
-            placeholder="Example: 1.1",
-            help="Manual input. Previous versions are shown below.",
-        )
-
-    st.text_input(
-        "Date Uploaded",
-        value=_format_datetime(datetime.now(timezone.utc)),
-        disabled=True,
-        help="The final date and time are recorded automatically when upload completes.",
-    )
-
-    if preview.previous_versions:
-        st.markdown("**Previous versions**")
-        render_admin_table(
-            [
-                {
-                    "Policy ID": v.public_id,
-                    "Version": v.version,
-                    "Date Uploaded": _format_datetime(v.uploaded_at),
-                    "Location": "Bin" if v.in_bin else "Policies",
-                }
-                for v in preview.previous_versions
-            ],
-            key=(
-                f"upload-history-"
-                f"{upload_nonce}-{fingerprint}"
-            ),
-            min_width=700,
-            column_widths=("130px", "120px", "260px", "130px"),
-            compact=True,
-        )
-    else:
-        st.caption("No previous version was detected for this title.")
-
-    with st.expander("Document Preview", expanded=True):
-        st.caption(
-            f"{len(preview.parsed.sections)} searchable sections · "
-            f"{_format_size(preview.parsed.size_bytes)} · "
-            f"{preview.parsed.original_filename}"
-        )
-        _render_detected_headings(
-            preview.parsed.sections
-        )
-        _render_full_section_preview(
-            preview.parsed.sections
-        )
-
-    if st.button(
-        "Upload and Process Policy",
+    submitted = st.button(
+        submit_label,
         type="primary",
         width="stretch",
         key=_policy_upload_widget_key(
             upload_nonce,
             "submit",
         ),
+    )
+    if not submitted:
+        return
+
+    successes: list[str] = []
+    failures: list[dict] = list(preview_failures)
+
+    with st.spinner(
+        f"Uploading, extracting, and publishing {len(prepared)} policy file(s)…"
     ):
-        try:
-            request = PolicyUploadRequest(
-                company_id=current_user.company_id,
-                created_by_user_id=current_user.user_id,
-                title=preview.display_title,
-                category=category,
-                version=version,
-            )
-            with st.spinner("Uploading, extracting, and publishing policy…"):
+        for item in prepared:
+            uploaded = item["uploaded"]
+            preview = item["preview"]
+
+            try:
+                request = PolicyUploadRequest(
+                    company_id=current_user.company_id,
+                    created_by_user_id=current_user.user_id,
+                    title=preview.display_title,
+                    category=item["category"],
+                    version=item["version"],
+                )
+                # A separate transaction/session per file prevents one failed
+                # document from rolling back successful files in the batch.
                 with SessionFactory() as session:
                     policy = PolicyService(session).create_policy_from_upload(
                         values=request,
                         filename=uploaded.name,
-                        file_bytes=uploaded.getvalue(),
+                        file_bytes=item["file_bytes"],
                         mime_type=uploaded.type,
-                        maximum_size_bytes=settings.policy_upload_max_mb * 1024 * 1024,
+                        maximum_size_bytes=(
+                            settings.policy_upload_max_mb * 1024 * 1024
+                        ),
                     )
-            # Use a new uploader/widget generation on the next rerun.
-            # The selected file, generated preview, previous-version table,
-            # category, version, and linking choice are therefore cleared.
-            _advance_policy_upload_state(
-                upload_nonce
-            )
+                successes.append(
+                    f"{_policy_id(policy)} · {policy.title} v{policy.version}"
+                )
+            except ValidationError as error:
+                failures.append(
+                    {
+                        "filename": uploaded.name,
+                        "message": _policy_upload_validation_message(error),
+                    }
+                )
+            except ValueError as error:
+                failures.append(
+                    {
+                        "filename": uploaded.name,
+                        "message": str(error),
+                    }
+                )
+            except Exception:
+                failures.append(
+                    {
+                        "filename": uploaded.name,
+                        "message": (
+                            "The file could not be processed. Confirm that it "
+                            "is readable and supported."
+                        ),
+                    }
+                )
 
-            set_operation_feedback(
-                f"Uploaded and published {_policy_id(policy)} · {policy.title} v{policy.version}.",
-                namespace="policy",
-            )
-            st.rerun()
-        except ValidationError as error:
-            render_action_warning(error)
-        except ValueError as error:
-            render_action_warning(error)
-        except Exception:
-            st.error("The file could not be processed. Confirm that it is readable and supported.")
+    st.session_state[_POLICY_UPLOAD_RESULT_STATE_KEY] = {
+        "successes": successes,
+        "failures": failures,
+    }
+
+    # Remount the uploader after every attempted batch. Successful files are
+    # already committed individually; failed files can be reselected without
+    # accidentally resubmitting the successful documents.
+    _advance_policy_upload_state(upload_nonce)
+
+    if successes:
+        set_operation_feedback(
+            f"Policy upload completed: {len(successes)} successful, "
+            f"{len(failures)} failed.",
+            namespace="policy",
+        )
+
+    st.rerun()
 
 
 def _render_edit_policy_details(
@@ -1259,18 +1444,15 @@ def _render_permanent_delete(
         "version, its original file, extracted text, and searchable "
         "sections. Other versions remain."
     )
-
-    confirmation_input_key = f"permanent_delete_policy_id_input_{policy.id}"
-    confirmation_checkbox_key = f"permanent_delete_policy_ack_{policy.id}"
-    confirmation = st.text_input(
-        "Type the exact Policy ID to confirm",
-        placeholder=public_id,
-        max_chars=30,
-        key=confirmation_input_key,
+    st.info(
+        f"Selected target: {public_id} · {policy.title} v{policy.version}"
     )
+
+    confirmation_checkbox_key = f"permanent_delete_policy_ack_{policy.id}"
     invalidate_confirmation_on_change(
         confirmation_key=confirmation_checkbox_key,
-        dependencies={"typed_policy_id": confirmation.strip()},
+        dependencies={"policy_id": policy.id},
+        tracker_key="__policy_permanent_delete_target_confirmation",
     )
     acknowledged = st.checkbox(
         "I understand that this policy version and its file "
@@ -1288,13 +1470,14 @@ def _render_permanent_delete(
         return
 
     try:
+        # The selected Bin version is the confirmation target. Keep the
+        # service-level public-ID match as a defense-in-depth guard without
+        # requiring the administrator to retype an ID already selected above.
         request = PolicyPermanentDeleteRequest(
             company_id=current_user.company_id,
             policy_id=policy.id,
-            confirmation_public_id=confirmation,
-            permanent_delete_acknowledged=(
-                acknowledged
-            ),
+            confirmation_public_id=public_id,
+            permanent_delete_acknowledged=acknowledged,
         )
 
         with st.spinner(

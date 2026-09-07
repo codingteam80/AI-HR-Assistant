@@ -19,7 +19,8 @@ from services.benefit_bulk_import_service import (
     BenefitBulkImportService,
 )
 from ui.components.data_table import render_admin_table
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_search_terms
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
@@ -78,23 +79,15 @@ def _render_employee_progress(
         "Monitor each employee's required onboarding steps. Automatic items "
         "follow the linked account, attendance, or training record."
     )
-    search = live_search_input(
+    search_terms = multi_search_input(
         "Search Onboarding Progress",
         key="admin_onboarding_progress_search",
-        placeholder="Search any employee-progress column…",
-        suggestions=(
-            value
-            for row in progress_rows
-            for value in row.values()
-            if value is not None
-        ),
-    ).strip().casefold()
+        placeholder="Type any value shown in the onboarding table, then press Enter…",
+    )
     filtered = [
         row
         for row in progress_rows
-        if not search
-        or search
-        in " ".join(str(value or "") for value in row.values()).casefold()
+        if matches_search_terms(search_terms, row.values())
     ]
     st.caption(f"Showing {len(filtered)} of {len(progress_rows)} employee record(s).")
     if filtered:

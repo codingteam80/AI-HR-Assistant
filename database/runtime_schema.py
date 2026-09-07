@@ -25,7 +25,12 @@ _LOGIN_REQUIRED_COMPANY_COLUMNS = {
     "shifting_credit_cutoff_day",
     "shifting_credit_additional_vl_threshold_hours",
     "shifting_credit_additional_vl_days",
+    "shifting_credit_additional_vl_also_payable",
     "shifting_credit_excluded_positions_json",
+    "shifting_credit_availability_cutoffs",
+    "shifting_credit_expiration_mode",
+    "shifting_credit_expiration_month",
+    "shifting_credit_expiration_day",
     "work_monday",
     "work_tuesday",
     "work_wednesday",
@@ -44,6 +49,7 @@ _REQUIRED_RUNTIME_TABLES = {
     "company_workdays",
     "attendance_sessions",
     "overtime_requests",
+    "shifting_credits",
     "employee_history",
     "onboarding_checklist_items",
     "employee_onboarding_progress",
@@ -83,11 +89,17 @@ _REQUIRED_DISCIPLINARY_RECORD_COLUMNS = {
     "archived_by_user_id",
 }
 
+_REQUIRED_SHIFTING_CREDIT_COLUMNS = {
+    "leave_request_id",
+}
+
 _REQUIRED_OVERTIME_REQUEST_COLUMNS = {
     "payable_hours",
     "shifting_credit_hours",
+    "shifting_credit_restored_hours",
     "shifting_credit_group",
     "additional_vl_days",
+    "straight_vl_also_payable",
 }
 
 
@@ -142,6 +154,10 @@ def _has_runtime_schema(database_engine: Engine) -> bool:
         column["name"]
         for column in schema_inspector.get_columns("overtime_requests")
     }
+    shifting_credit_columns = {
+        column["name"]
+        for column in schema_inspector.get_columns("shifting_credits")
+    }
     return (
         _REQUIRED_LEAVE_REQUEST_COLUMNS.issubset(leave_columns)
         and _REQUIRED_ATTENDANCE_RECORD_COLUMNS.issubset(attendance_columns)
@@ -149,6 +165,7 @@ def _has_runtime_schema(database_engine: Engine) -> bool:
         and _REQUIRED_EMPLOYEE_COLUMNS.issubset(employee_columns)
         and _REQUIRED_DISCIPLINARY_RECORD_COLUMNS.issubset(disciplinary_columns)
         and _REQUIRED_OVERTIME_REQUEST_COLUMNS.issubset(overtime_columns)
+        and _REQUIRED_SHIFTING_CREDIT_COLUMNS.issubset(shifting_credit_columns)
     )
 
 

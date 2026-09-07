@@ -36,6 +36,64 @@ class RuntimeServiceUnavailableError(Exception):
         super().__init__(f"{self.service} is unavailable")
 
 
+class RuntimeServiceTimeoutError(Exception):
+    """Typed wrapper for a reachable/runtime operation that exceeded its limit."""
+
+    def __init__(
+        self,
+        service: str,
+        *,
+        operation: str,
+        timeout_seconds: float | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        self.service = (service or "service").strip().casefold()
+        self.operation = (operation or "request").strip().casefold()
+        self.timeout_seconds = timeout_seconds
+        self.cause = cause
+        super().__init__(f"{self.service} {self.operation} timed out")
+
+
+class RuntimeServiceModelUnavailableError(Exception):
+    """Typed wrapper for a running local AI service with a missing model."""
+
+    def __init__(
+        self,
+        service: str,
+        *,
+        model: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        self.service = (service or "service").strip().casefold()
+        self.model = (model or "configured model").strip()
+        self.cause = cause
+        super().__init__(f"{self.service} model is unavailable: {self.model}")
+
+
+class RuntimeServiceResponseError(Exception):
+    """Typed wrapper for a reachable service that rejected/failed a request.
+
+    ``detail`` is kept for server-side diagnostics only. UI classification
+    below always returns a fixed safe message and never exposes it directly.
+    """
+
+    def __init__(
+        self,
+        service: str,
+        *,
+        status_code: int | None = None,
+        detail: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        self.service = (service or "service").strip().casefold()
+        self.status_code = status_code
+        self.detail = (detail or "").strip()[:2000]
+        self.cause = cause
+        label = f" HTTP {status_code}" if status_code is not None else ""
+        diagnostic = f": {self.detail}" if self.detail else ""
+        super().__init__(f"{self.service}{label} request failed{diagnostic}")
+
+
 def _exception_chain(exc: BaseException) -> Iterable[BaseException]:
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -61,7 +119,23 @@ def classify_runtime_connection_issue(
     """Return a safe issue only for recognizable connection/service failures."""
 
     explicit_service = ""
+    response_error: RuntimeServiceResponseError | None = None
+    timeout_error: RuntimeServiceTimeoutError | None = None
+    model_error: RuntimeServiceModelUnavailableError | None = None
+
     for item in _exception_chain(exc):
+        if isinstance(item, RuntimeServiceResponseError):
+            explicit_service = item.service
+            response_error = item
+            break
+        if isinstance(item, RuntimeServiceTimeoutError):
+            explicit_service = item.service
+            timeout_error = item
+            break
+        if isinstance(item, RuntimeServiceModelUnavailableError):
+            explicit_service = item.service
+            model_error = item
+            break
         if isinstance(item, RuntimeServiceUnavailableError):
             explicit_service = item.service
             break
@@ -79,14 +153,87 @@ def classify_runtime_connection_issue(
     )
 
     if hint in {"ollama", "ai", "ai_service", "chat_assistant"}:
+        if model_error is not None:
+            return RuntimeConnectionIssue(
+                code="ollama_model_missing",
+                title="AI model unavailable",
+                message=(
+                    f"Ollama is running, but the configured local model "
+                    f"'{model_error.model}' is not available. Install or restore "
+                    "that model, then try the question again. The HR Assistant "
+                    "will keep any verified company answer it already produced."
+                ),
+                service="Ollama",
+            )
+
+        if timeout_error is not None:
+            operation = timeout_error.operation
+            if operation == "health_check":
+                return RuntimeConnectionIssue(
+                    code="ollama_health_timeout",
+                    title="AI service check timed out",
+                    message=(
+                        "Ollama did not answer the local availability check within "
+                        "the allowed time. The service may still be starting or "
+                        "busy. The HR Assistant will keep any verified company "
+                        "answer it already produced; try again after Ollama is ready."
+                    ),
+                    service="Ollama",
+                )
+            return RuntimeConnectionIssue(
+                code="ollama_response_timeout",
+                title="AI response timed out",
+                message=(
+                    "The local AI model took too long to complete the response. "
+                    "A smaller one-time retry was attempted when safe. The HR "
+                    "Assistant will keep any verified company answer it already "
+                    "produced."
+                ),
+                service="Ollama",
+            )
+
+        if response_error is not None:
+            detail = response_error.detail.casefold()
+            context_limit_terms = (
+                "context length",
+                "context window",
+                "too many tokens",
+                "prompt too long",
+                "input too long",
+                "maximum context",
+            )
+            if any(term in detail for term in context_limit_terms):
+                return RuntimeConnectionIssue(
+                    code="ollama_context_limit",
+                    title="AI request was too large",
+                    message=(
+                        "The local AI model could not process the full request "
+                        "within its safe context limit. The HR Assistant will "
+                        "keep any verified portal answer it already produced. "
+                        "Try narrowing the question if more detail is needed."
+                    ),
+                    service="Ollama",
+                )
+            return RuntimeConnectionIssue(
+                code="ollama_generation_failed",
+                title="AI response generation issue",
+                message=(
+                    "Ollama is running, but the local model could not complete "
+                    "this enhancement request. Any verified HR result already "
+                    "produced by the portal is kept. Try the question again; "
+                    "if it repeats, review the local Ollama log."
+                ),
+                service="Ollama",
+            )
+
         return RuntimeConnectionIssue(
             code="ollama_unavailable",
             title="AI service unavailable",
             message=(
-                "The local AI service cannot be reached right now. Make sure "
-                "Ollama is running and the configured model is available, then "
-                "try your question again. Direct HR records remain protected "
-                "and are not sent to another service."
+                "The local Ollama service cannot be reached right now. Make sure "
+                "Ollama is running, then try your question again. Any verified "
+                "company answer already produced by the HR Assistant is kept, and "
+                "private HR records are not sent to another service."
             ),
             service="Ollama",
         )

@@ -7,12 +7,16 @@ from io import BytesIO, StringIO
 from pathlib import Path
 import re
 
-from docx import Document
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from models.company_form import CompanyForm
 from modules.documents.company_form_file_storage import CompanyFormFileStorage
+from modules.documents.docx_structure_extractor import DOCXStructureExtractor
+from modules.documents.pdf_layout_extractor import (
+    PDFLayoutExtractionError,
+    PDFLayoutExtractor,
+)
 
 
 class CompanyFormKnowledgeExtractor:
@@ -24,7 +28,7 @@ class CompanyFormKnowledgeExtractor:
     text-searchable when no safe parser is available.
     """
 
-    MAX_CHARACTERS = 60_000
+    MAX_CHARACTERS = 150_000
     MAX_PDF_PAGES = 120
     MAX_SHEETS = 20
     MAX_ROWS_PER_SHEET = 1_000
@@ -58,6 +62,32 @@ class CompanyFormKnowledgeExtractor:
 
     @classmethod
     def _pdf(cls, data: bytes) -> str:
+        try:
+            extracted = PDFLayoutExtractor.extract(
+                data,
+                max_pages=cls.MAX_PDF_PAGES,
+            )
+        except PDFLayoutExtractionError:
+            extracted = None
+
+        if extracted is not None and extracted.full_text:
+            sections: list[str] = []
+            for section in extracted.sections:
+                page_heading = f"Page {section.page_number}"
+                section_heading = section.heading.strip()
+                if section_heading.casefold() == page_heading.casefold():
+                    display_heading = page_heading
+                else:
+                    display_heading = f"{page_heading} — {section_heading}"
+                sections.append(
+                    f"## {display_heading}\n{section.text}"
+                )
+            if sections:
+                return "\n\n".join(sections)
+
+        # Compatibility fallback for unusual PDFs that PyPDF can extract even
+        # when layout parsing cannot. This keeps one damaged/unusual document
+        # from breaking or reducing the existing company-wide search surface.
         reader = PdfReader(BytesIO(data))
         if reader.is_encrypted:
             try:
@@ -74,18 +104,23 @@ class CompanyFormKnowledgeExtractor:
 
     @classmethod
     def _docx(cls, data: bytes) -> str:
-        document = Document(BytesIO(data))
-        lines: list[str] = []
-        for paragraph in document.paragraphs:
-            if paragraph.text.strip():
-                lines.append(paragraph.text.strip())
-        for table_index, table in enumerate(document.tables, start=1):
-            lines.append(f"Table {table_index}")
-            for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
-                if any(cells):
-                    lines.append(" | ".join(cells))
-        return "\n".join(lines)
+        """Emit ordered semantic markers while retaining a file-level fallback."""
+
+        extracted = DOCXStructureExtractor.extract(
+            data,
+            default_heading="Document",
+        )
+        if not extracted.full_text:
+            return ""
+        if extracted.reliable_heading_count == 0:
+            # No dependable section structure: keep the file intact here and
+            # let the existing bounded chunker split it per file with overlap.
+            return extracted.full_text
+        return "\n\n".join(
+            f"## {section.heading}\n{section.text}"
+            for section in extracted.sections
+            if section.text.strip()
+        )
 
     @classmethod
     def _csv(cls, data: bytes) -> str:

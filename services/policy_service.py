@@ -43,6 +43,7 @@ from schemas.policy_schema import (
     PolicyPermanentDeleteRequest,
     PolicyUploadRequest,
 )
+from utils.search_utils import normalize_search_terms, text_matches_search_terms
 
 
 POLICY_STATUSES = {"draft", "published", "archived", "trashed"}
@@ -85,6 +86,14 @@ _STOP_WORDS = {
     "who",
     "why",
     "with",
+}
+
+# Generic company/policy words are not sufficient evidence that a policy
+# actually covers the user's requested subject.  This prevents a nearest
+# Leave Policy from answering an unrelated query such as ``Laptop policy``.
+_POLICY_GENERIC_QUERY_TERMS = {
+    "company", "detail", "details", "employee", "employees", "information",
+    "policy", "policies", "rule", "rules",
 }
 
 
@@ -393,6 +402,56 @@ class PolicyService:
             if len(token) >= 2
             and token not in _STOP_WORDS
         }
+
+    @classmethod
+    def _topic_terms(cls, value: str) -> set[str]:
+        """Return lightly stemmed subject terms for fail-closed topic matching."""
+
+        terms: set[str] = set()
+        for token in cls._tokens(value):
+            if token in _POLICY_GENERIC_QUERY_TERMS:
+                continue
+            stem = token
+            if stem.endswith("ies") and len(stem) > 5:
+                stem = stem[:-3] + "y"
+            else:
+                for suffix in ("ingly", "edly", "ing", "ed", "es", "s"):
+                    if stem.endswith(suffix) and len(stem) - len(suffix) >= 4:
+                        stem = stem[:-len(suffix)]
+                        break
+            terms.add(stem)
+        return terms
+
+    @classmethod
+    def _topic_is_supported(
+        cls,
+        *,
+        question: str,
+        section: _SearchableSection,
+    ) -> bool:
+        """Require the best section to cover the question's specific subject."""
+
+        anchors = cls._topic_terms(question)
+        if not anchors:
+            return True
+        policy = section.policy
+        evidence_terms = cls._topic_terms(
+            " ".join(
+                [
+                    policy.title or "",
+                    policy.category or "",
+                    policy.summary or "",
+                    section.heading or "",
+                    section.text or "",
+                ]
+            )
+        )
+        matched = anchors.intersection(evidence_terms)
+        if len(anchors) == 1:
+            return len(matched) == 1
+        if len(anchors) == 2:
+            return len(matched) == 2
+        return len(matched) >= 2 and (len(matched) / len(anchors)) >= 0.50
 
     @staticmethod
     def _manual_sections(
@@ -1100,19 +1159,23 @@ class PolicyService:
         self,
         *,
         company_id: int,
-        search_text: str,
+        search_text: object = "",
         category: str | None = None,
     ) -> list[HRPolicy]:
-        """Search approved policies and extracted file text."""
+        """Search approved policies with one or more free-text OR terms."""
 
         policies = self.list_published(company_id)
-        normalized_search = search_text.strip().lower()
+        search_terms = normalize_search_terms(search_text)
         normalized_category = (
             category.strip().lower()
             if category
             else None
         )
 
+        documents = self.get_document_map(
+            company_id=company_id,
+            policies=policies,
+        )
         results = []
 
         for policy in policies:
@@ -1123,19 +1186,25 @@ class PolicyService:
             ):
                 continue
 
+            document = documents.get(policy.id)
             searchable = " ".join(
-                [
+                str(value or "")
+                for value in (
+                    self.public_id_for(policy),
                     policy.title,
                     policy.category,
-                    policy.summary or "",
+                    policy.version,
+                    policy.status,
+                    policy.summary,
                     policy.content,
-                ]
-            ).lower()
+                    document.original_filename if document else "Manual policy entry",
+                    document.file_extension if document else "",
+                    document.mime_type if document else "",
+                    self.format_datetime(policy.created_at),
+                )
+            )
 
-            if (
-                not normalized_search
-                or normalized_search in searchable
-            ):
+            if text_matches_search_terms(search_terms, searchable):
                 results.append(policy)
 
         return results
@@ -1175,18 +1244,129 @@ class PolicyService:
 
         return sections
 
+    @staticmethod
+    def _qa_question_profile(question: str) -> str:
+        clean = PolicyService._normalize_spaces(question).lower()
+        if re.search(r"\b(compare|comparison|difference|versus|vs\.?)\b", clean):
+            return "comparison"
+        if re.search(r"^\s*(?:what|which)\s+(?:benefits|requirements|reasons|documents|conditions|options|rules)\b|^\s*(?:list|show|give me)\b", clean):
+            return "list"
+        if re.search(r"^how much\b|\b(amount|allowance|reimbursement|cash award|cost)\b", clean):
+            return "amount"
+        if re.search(r"^how (?:many|long)\b", clean):
+            return "duration_or_count"
+        if re.search(r"^when\b|\bwhat (?:time|date)\b", clean):
+            return "date_or_time"
+        if re.search(r"\bwhat happens\b|\bpenalt(?:y|ies)\b|\bconsequence\b|\bdisciplin", clean):
+            return "consequence"
+        if re.search(r"\b(eligible|eligibility|qualify|qualified|entitled|covered|allowed|prohibited)\b", clean):
+            return "eligibility"
+        if re.search(r"^\s*(?:what should|how (?:do|does|can|should|to)|what do)\b|\bprocedure\b|\bprocess\b", clean):
+            return "procedure"
+        return "standard"
+
+    @classmethod
+    def _qa_answerability_bonus(cls, question: str, text: str) -> float:
+        profile = cls._qa_question_profile(question)
+        clean = cls._normalize_spaces(text).lower()
+        if profile == "amount":
+            if re.search(r"(?:₱|\$|¥|€)\s*\d|\b\d[\d,]*(?:\.\d+)?\s*(?:peso|pesos|php|yen|dollar|dollars)\b", clean):
+                return 4.0
+            if re.search(r"\b(amount|allowance|reimbursement|cash|pay|rate|cost|award)\b", clean):
+                return 2.0
+        elif profile == "duration_or_count":
+            if re.search(r"\b\d+(?:\.\d+)?\s*(?:day|days|week|weeks|month|months|year|years|hour|hours|minute|minutes|dependent|dependents|credit|credits)\b", clean):
+                return 4.0
+        elif profile == "date_or_time":
+            if re.search(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", clean):
+                return 4.0
+            if re.search(r"\b(before|after|within|effective|date|time|month|year|day)\b", clean):
+                return 2.0
+        elif profile == "consequence":
+            if re.search(r"\b(disqualif|absent|penalt|sanction|suspend|dismiss|forfeit|deduct|warning|violation|terminate)\w*\b", clean):
+                return 4.0
+            if re.search(r"\b(shall|will|must|required)\b", clean):
+                return 1.5
+        elif profile == "eligibility":
+            if re.search(r"\b(eligible|qualif|entitled|covered|allowed|prohibit|required|shall|may|must|not)\w*\b", clean):
+                return 3.0
+        elif profile == "procedure":
+            if re.search(r"\b(submit|notify|inform|request|approval|approve|form|report|contact|within|before|after)\w*\b", clean):
+                return 3.0
+        return 0.0
+
+    @classmethod
+    def _focused_policy_excerpt(
+        cls,
+        *,
+        question: str,
+        text: str,
+        max_chars: int = 1200,
+    ) -> str:
+        """Return the matching clause and nearby sentences instead of text[0:N]."""
+
+        clean = cls._normalize_spaces(text)
+        profile = cls._qa_question_profile(question)
+        if profile in {"amount", "duration_or_count", "date_or_time", "consequence", "eligibility"}:
+            target_chars = min(max_chars, 820)
+        elif profile in {"comparison", "list", "procedure"}:
+            target_chars = max_chars
+        else:
+            target_chars = min(max_chars, 950)
+
+        if len(clean) <= target_chars:
+            return clean
+
+        raw_units = [
+            cls._normalize_spaces(item)
+            for item in re.split(r"(?:\n+|(?<=[.!?])\s+(?=[A-Z0-9]))", str(text or ""))
+            if cls._normalize_spaces(item)
+        ]
+        if not raw_units:
+            return clean[:max_chars].rstrip()
+
+        question_tokens = cls._tokens(question)
+        normalized_question = " ".join(re.findall(r"[a-z0-9]+", question.lower()))
+
+        def score(unit: str) -> float:
+            unit_tokens = cls._tokens(unit)
+            lexical = len(question_tokens.intersection(unit_tokens)) * 2.0
+            cue = cls._qa_answerability_bonus(question, unit)
+            phrase = 0.0
+            normalized_unit = " ".join(re.findall(r"[a-z0-9]+", unit.lower()))
+            if normalized_question and len(normalized_question) <= 120 and normalized_question in normalized_unit:
+                phrase = 4.0
+            return lexical + cue + phrase
+
+        best_index = max(range(len(raw_units)), key=lambda index: score(raw_units[index]))
+        selected = [best_index]
+        radius = 1
+        while radius < len(raw_units):
+            changed = False
+            for candidate in (best_index - radius, best_index + radius):
+                if candidate < 0 or candidate >= len(raw_units) or candidate in selected:
+                    continue
+                indexes = sorted(selected + [candidate])
+                rendered = " ".join(raw_units[index] for index in indexes)
+                if len(rendered) <= target_chars:
+                    selected.append(candidate)
+                    changed = True
+            if not changed and len(" ".join(raw_units[index] for index in sorted(selected))) >= int(target_chars * 0.72):
+                break
+            radius += 1
+
+        return " ".join(raw_units[index] for index in sorted(selected))[:target_chars].rstrip()
+
     def answer_question(
         self,
         *,
         company_id: int,
         question: str,
     ) -> PolicyAnswer:
-        """Extract a direct answer from approved uploaded policy files."""
+        """Extract a direct, question-focused answer from approved policy files."""
 
         normalized_question = question.strip()
-        question_tokens = self._tokens(
-            normalized_question
-        )
+        question_tokens = self._tokens(normalized_question)
 
         if not question_tokens:
             return PolicyAnswer(
@@ -1195,53 +1375,54 @@ class PolicyService:
                 matched=False,
             )
 
-        candidates: list[
-            tuple[float, _SearchableSection]
-        ] = []
+        normalized_phrase = " ".join(
+            re.findall(r"[a-z0-9]+", normalized_question.lower())
+        )
+        candidates: list[tuple[float, _SearchableSection]] = []
 
         for section in self._searchable_sections(company_id):
             policy = section.policy
-            title_tokens = self._tokens(
-                f"{policy.title} {policy.category}"
-            )
-            summary_tokens = self._tokens(
-                policy.summary or ""
-            )
-            heading_tokens = self._tokens(
-                section.heading
-            )
+            title_tokens = self._tokens(f"{policy.title} {policy.category}")
+            summary_tokens = self._tokens(policy.summary or "")
+            heading_tokens = self._tokens(section.heading)
             text_tokens = self._tokens(section.text)
 
-            title_overlap = len(
-                question_tokens & title_tokens
-            )
-            summary_overlap = len(
-                question_tokens & summary_tokens
-            )
-            heading_overlap = len(
-                question_tokens & heading_tokens
-            )
-            text_overlap = len(
-                question_tokens & text_tokens
-            )
+            title_overlap = len(question_tokens & title_tokens)
+            summary_overlap = len(question_tokens & summary_tokens)
+            heading_overlap = len(question_tokens & heading_tokens)
+            text_overlap = len(question_tokens & text_tokens)
+            coverage = text_overlap / max(1, len(question_tokens))
 
             score = (
-                title_overlap * 4.0
-                + heading_overlap * 3.0
+                title_overlap * 4.5
+                + heading_overlap * 3.5
                 + summary_overlap * 2.0
                 + text_overlap
+                + coverage * 7.0
+                + self._qa_answerability_bonus(normalized_question, section.text)
             )
 
-            if (
-                normalized_question.lower()
-                in section.text.lower()
-            ):
-                score += 5.0
+            normalized_section = " ".join(
+                re.findall(r"[a-z0-9]+", section.text.lower())
+            )
+            if normalized_phrase and normalized_phrase in normalized_section:
+                score += 6.0
+            else:
+                meaningful = [
+                    token
+                    for token in re.findall(r"[a-z0-9]+", normalized_question.lower())
+                    if token not in _STOP_WORDS and len(token) >= 2
+                ]
+                phrase_hits = 0
+                for size in (3, 2):
+                    for index in range(0, max(0, len(meaningful) - size + 1)):
+                        phrase = " ".join(meaningful[index:index + size])
+                        if phrase and phrase in normalized_section:
+                            phrase_hits += 1
+                score += min(4.0, phrase_hits * 1.25)
 
             if score > 0:
-                candidates.append(
-                    (score, section)
-                )
+                candidates.append((score, section))
 
         if not candidates:
             return PolicyAnswer(
@@ -1250,12 +1431,17 @@ class PolicyService:
                 matched=False,
             )
 
-        candidates.sort(
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        best_score = candidates[0][0]
-
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_section = candidates[0]
+        if not self._topic_is_supported(
+            question=normalized_question,
+            section=best_section,
+        ):
+            return PolicyAnswer(
+                answer=NO_POLICY_ANSWER,
+                sources=[],
+                matched=False,
+            )
         if best_score < 2.0:
             return PolicyAnswer(
                 answer=NO_POLICY_ANSWER,
@@ -1263,41 +1449,60 @@ class PolicyService:
                 matched=False,
             )
 
+        profile = self._qa_question_profile(normalized_question)
+        if profile in {"comparison", "list", "procedure"}:
+            threshold_ratio = 0.38
+            max_distinct_policies = 3
+        elif profile in {"amount", "duration_or_count", "date_or_time"}:
+            threshold_ratio = 0.62
+            max_distinct_policies = 2
+        elif profile in {"consequence", "eligibility"}:
+            threshold_ratio = 0.55
+            max_distinct_policies = 2
+        else:
+            threshold_ratio = 0.50
+            max_distinct_policies = 2
+
+        threshold = max(2.0, best_score * threshold_ratio)
         selected: list[_SearchableSection] = []
-        seen: set[
-            tuple[int, str, int | None]
-        ] = set()
+        seen_sections: set[tuple[int, str, int | None]] = set()
+        seen_policies: set[int] = set()
 
+        # First pass preserves cross-policy coverage when the wording is broad
+        # enough to trigger more than one directly applicable company rule.
         for score, section in candidates:
-            if score < max(2.0, best_score * 0.45):
+            if score < threshold:
                 continue
-
-            key = (
-                section.policy.id,
-                section.heading,
-                section.page_number,
-            )
-
-            if key in seen:
+            key = (section.policy.id, section.heading, section.page_number)
+            if key in seen_sections or section.policy.id in seen_policies:
                 continue
-
             selected.append(section)
-            seen.add(key)
-
-            if len(selected) == 3:
+            seen_sections.add(key)
+            seen_policies.add(section.policy.id)
+            if len(selected) >= max_distinct_policies:
                 break
 
-        answer_parts: list[str] = []
+        # Second pass adds nearby/supporting clauses from already-relevant
+        # policies so conditions/exceptions are not lost.
+        for score, section in candidates:
+            if len(selected) >= 4:
+                break
+            if score < threshold:
+                continue
+            key = (section.policy.id, section.heading, section.page_number)
+            if key in seen_sections or section.policy.id not in seen_policies:
+                continue
+            selected.append(section)
+            seen_sections.add(key)
 
-        for section in selected:
-            text = self._normalize_spaces(
-                section.text
+        answer_parts = [
+            self._focused_policy_excerpt(
+                question=normalized_question,
+                text=section.text,
+                max_chars=1200,
             )
-
-            if len(text) > 700:
-                text = text[:697].rstrip() + "..."
-
-            answer_parts.append(text)
+            for section in selected
+        ]
 
         sources = [
             PolicySource(

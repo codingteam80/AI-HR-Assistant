@@ -17,7 +17,7 @@ def _source(relative_path: str) -> str:
 def test_conversation_container_is_reserved_before_chat_input() -> None:
     for relative_path in CHAT_PAGES:
         source = _source(relative_path)
-        assert source.index("conversation_area = st.container()") < source.index(
+        assert source.index("conversation_area = st.container(") < source.index(
             "question = st.chat_input("
         )
         assert source.count("with conversation_area:") >= 2

@@ -28,7 +28,8 @@ from services.disciplinary_record_bulk_import_service import (
 from services.policy_violation_service import PolicyViolationService
 from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.data_table import render_admin_table
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_visible_row
 from ui.components.operation_feedback import render_operation_feedback, set_operation_feedback
 from ui.components.persistent_tabs import persistent_tabs
 from ui.components.validation_feedback import render_action_warning
@@ -86,26 +87,10 @@ def _case_rows(records, service: DisciplinaryRecordService, user_labels: dict[in
     return rows
 
 
-def _matches(item, query: str) -> bool:
-    q = query.strip().casefold()
-    if not q:
-        return True
-    values = (
-        item.public_id,
-        item.employee_number,
-        item.employee_name,
-        item.violation_code,
-        item.violation_title,
-        item.incident_description,
-        item.evidence_remarks,
-        item.context_snapshot,
-        item.offense_level,
-        item.actual_action_taken,
-        item.employee_acknowledgment,
-        item.case_status,
-        item.notes,
-    )
-    return any(q in str(value or "").casefold() for value in values)
+def _matches(row: dict[str, object], search_terms) -> bool:
+    """Match against every value rendered in the disciplinary table row."""
+
+    return matches_visible_row(search_terms, row)
 
 
 def _user_select_options(users, *, include_none: bool) -> dict[str, int | None]:
@@ -285,22 +270,10 @@ def render_admin_disciplinary_records(current_user: AuthenticatedUser) -> None:
             "Confidential company records. Suggested penalties are always derived from "
             "Policies → Violations & Disciplinary Actions."
         )
-        search = live_search_input(
+        search = multi_search_input(
             "Search Disciplinary Records",
             key="disciplinary_record_search",
-            placeholder="Search employee, case ID, violation, incident, action, or status…",
-            suggestions=(
-                value
-                for item in records
-                for value in (
-                    item.public_id,
-                    item.employee_number,
-                    item.employee_name,
-                    item.violation_code,
-                    item.violation_title,
-                    item.case_status,
-                )
-            ),
+            placeholder="Type any value shown in the disciplinary table, then press Enter…",
         )
         status_filter = st.selectbox(
             "Case Status",
@@ -310,7 +283,7 @@ def render_admin_disciplinary_records(current_user: AuthenticatedUser) -> None:
         filtered_indexes = [
             index
             for index, item in enumerate(records)
-            if _matches(item, search)
+            if _matches(rows[index], search)
             and (status_filter == "All" or item.case_status == status_filter)
         ]
         filtered_rows = [rows[index] for index in filtered_indexes]

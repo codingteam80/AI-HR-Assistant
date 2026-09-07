@@ -9,14 +9,14 @@ import streamlit as st
 from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
 from services.hr_contact_service import HRContactService
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_search_terms
 
 
-def _matches_search(contact, query: str) -> bool:
-    if not query:
-        return True
-    haystack = " ".join(
-        [
+def _matches_search(contact, search_terms) -> bool:
+    return matches_search_terms(
+        search_terms,
+        (
             contact.name,
             contact.job_title,
             contact.team,
@@ -25,9 +25,8 @@ def _matches_search(contact, query: str) -> bool:
             contact.office_location,
             contact.availability,
             contact.notes,
-        ]
-    ).casefold()
-    return query.casefold() in haystack
+        ),
+    )
 
 
 def _render_contact_card(contact) -> None:
@@ -132,27 +131,13 @@ def render_employee_hr_contacts_page(current_user: AuthenticatedUser) -> None:
         st.info("No HR contacts are currently published by your company administrator.")
         return
 
-    search_suggestions = [
-        value
-        for contact in contacts
-        for value in (
-            contact.name,
-            contact.job_title,
-            contact.team,
-            contact.email,
-            contact.phone,
-            contact.office_location,
-        )
-        if value
-    ]
-    search_query = live_search_input(
+    search_terms = multi_search_input(
         "Search HR Contacts",
-        placeholder="Search by name, role, team, email, or location…",
+        placeholder="Type name, role, team, email, or location, then press Enter…",
         key="employee_hr_contacts_search",
-        suggestions=search_suggestions,
-    ).strip()
+    )
     visible_contacts = [
-        contact for contact in contacts if _matches_search(contact, search_query)
+        contact for contact in contacts if _matches_search(contact, search_terms)
     ]
 
     st.caption(

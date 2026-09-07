@@ -1,5 +1,6 @@
 """Validated contracts for attendance, schedule, status, and corrections."""
 
+import calendar
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
@@ -7,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-AttendanceStatus = Literal["WFO", "WFH", "VL", "SL", "EL"]
+AttendanceStatus = Literal["WFO", "WFH", "VL", "SL", "EL", "OB"]
 WorkLocation = Literal["WFO", "WFH"]
 
 
@@ -171,7 +172,14 @@ class CompanyOvertimeRulesInput(BaseModel):
     shifting_credit_cutoff_day: int = Field(ge=1, le=28)
     additional_vl_threshold_hours: Decimal = Field(gt=0, le=24)
     additional_vl_days: Decimal = Field(ge=0, le=5)
+    additional_vl_also_payable: bool = False
     excluded_positions: list[str] = Field(default_factory=list)
+    shifting_credit_availability_cutoffs: int = Field(default=2, ge=0, le=24)
+    shifting_credit_expiration_mode: Literal["follow_leave_reset", "custom_date"] = (
+        "follow_leave_reset"
+    )
+    shifting_credit_expiration_month: int = Field(default=12, ge=1, le=12)
+    shifting_credit_expiration_day: int = Field(default=31, ge=1, le=31)
 
     @field_validator("excluded_positions")
     @classmethod
@@ -195,5 +203,12 @@ class CompanyOvertimeRulesInput(BaseModel):
             raise ValueError(
                 "Additional VL qualifying hours cannot be lower than the "
                 "shifting-credit block hours."
+            )
+        maximum_day = 29 if self.shifting_credit_expiration_month == 2 else calendar.monthrange(
+            2024, self.shifting_credit_expiration_month
+        )[1]
+        if self.shifting_credit_expiration_day > maximum_day:
+            raise ValueError(
+                "The selected Shifting Credit expiration day is invalid for that month."
             )
         return self

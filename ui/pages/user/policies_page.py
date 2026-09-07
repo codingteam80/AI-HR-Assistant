@@ -9,7 +9,7 @@ from database.session import SessionFactory
 from modules.policy_qa.policy_assistant import PolicyAssistant
 from config.settings import get_settings
 from services.policy_service import PolicyService
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
 from ui.components.persistent_tabs import persistent_tabs
 from ui.pages.user.policy_violations import render_employee_policy_violations
 from ui.components.disciplinary_records import render_employee_disciplinary_records
@@ -88,17 +88,12 @@ def _render_employee_policy_library(
     filter_columns = st.columns([2, 1])
 
     with filter_columns[0]:
-        search_text = live_search_input(
+        search_terms = multi_search_input(
             "Search Policies",
             placeholder=(
-                "Search title, category, or extracted file content..."
+                "Type Policy ID, title, version, category, filename, or content, then press Enter…"
             ),
             key="employee_policy_search",
-            suggestions=(
-                value
-                for policy in all_policies
-                for value in (policy.title, policy.category)
-            ),
         )
 
     with filter_columns[1]:
@@ -112,7 +107,7 @@ def _render_employee_policy_library(
             session
         ).search_published(
             company_id=current_user.company_id,
-            search_text=search_text,
+            search_text=search_terms,
             category=(
                 None
                 if category == "All Categories"

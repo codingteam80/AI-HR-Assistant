@@ -1,10 +1,9 @@
 """Fixed Light Mode state management.
 
 Persistence layers:
-1. Streamlit session_state keeps the theme during widget reruns.
-2. The ``theme`` URL query parameter survives browser refreshes.
-3. Browser localStorage, synchronized by theme_loader.py, restores the
-   last selection when a completely new Streamlit session starts.
+1. Streamlit session_state keeps the fixed Light Mode during widget reruns.
+2. Browser localStorage is retained only for backward compatibility.
+3. The visible URL no longer carries a ``theme`` query parameter.
 
 Streamlit is imported lazily inside runtime functions so the pure theme
 normalization helpers can be unit-tested without a Streamlit runtime.
@@ -55,24 +54,9 @@ def resolve_initial_theme(
 
 
 def initialize_theme_state(default_theme: str) -> None:
-    """Initialize or restore the active Streamlit theme.
-
-    A valid URL query value has priority because it represents the saved
-    browser state after a refresh. When no query value exists, the app
-    uses its configured default temporarily; browser localStorage can then
-    restore a previous selection through theme_loader.py.
-    """
+    """Initialize the fixed Light Mode without depending on URL state."""
 
     import streamlit as st
-
-    query_theme = normalize_theme(
-        st.query_params.get(THEME_QUERY_KEY)
-    )
-
-    if query_theme is not None:
-        # This also corrects an existing session when the URL changes.
-        st.session_state.theme = query_theme
-        return
 
     if "theme" not in st.session_state:
         st.session_state.theme = resolve_initial_theme(
@@ -106,6 +90,8 @@ def set_active_theme(theme: str) -> str:
         )
 
     st.session_state.theme = normalized
-    st.query_params[THEME_QUERY_KEY] = normalized
 
+    # Older checkpoints persisted ``?theme=light``. It is no longer needed
+    # because Light Mode is fixed; browser-side cleanup removes it without a
+    # reload so navigation/query state for real portal views is untouched.
     return normalized

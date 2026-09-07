@@ -19,6 +19,7 @@ from models.attendance_session import AttendanceSession
 from models.company import Company
 from models.employee import Employee
 from models.leave_request import LeaveRequest
+from models.shifting_credit import ShiftingCredit
 from models.user import User
 from repositories.attendance_repository import AttendanceRepository
 from repositories.company_workday_repository import CompanyWorkdayRepository
@@ -46,6 +47,7 @@ ATTENDANCE_COLORS = {
     "VL": "#FFCCFF",
     "SL": "#FFCCFF",
     "EL": "#FFCCFF",
+    "OB": "#DDEBF7",
     "HYBRID": "#D9EAD3",
 }
 WEEKEND_COLOR = "#BFBFBF"
@@ -152,8 +154,23 @@ class AttendanceService:
             values.additional_vl_threshold_hours
         )
         company.shifting_credit_additional_vl_days = values.additional_vl_days
+        company.shifting_credit_additional_vl_also_payable = (
+            values.additional_vl_also_payable
+        )
         company.shifting_credit_excluded_positions_json = json.dumps(
             values.excluded_positions, ensure_ascii=False
+        )
+        company.shifting_credit_availability_cutoffs = (
+            values.shifting_credit_availability_cutoffs
+        )
+        company.shifting_credit_expiration_mode = (
+            values.shifting_credit_expiration_mode
+        )
+        company.shifting_credit_expiration_month = (
+            values.shifting_credit_expiration_month
+        )
+        company.shifting_credit_expiration_day = (
+            values.shifting_credit_expiration_day
         )
         self.session.commit()
         self.session.refresh(company)
@@ -217,6 +234,43 @@ class AttendanceService:
             self.session.add(record)
             self.session.flush()
         return record
+
+    def _sync_ob_credit_for_status(
+        self, *, record: AttendanceRecord, new_status: str | None
+    ) -> None:
+        """Consume/release one whole-day OB credit with the attendance status."""
+
+        from services.overtime_service import OvertimeService
+
+        overtime_service = OvertimeService(self.session)
+        was_ob = record.work_status == "OB"
+        wants_ob = new_status == "OB"
+        if was_ob and record.leave_request_id is not None and not wants_ob:
+            raise ValueError(
+                "Approved Official Business (OB) is controlled by Leave Management. "
+                "Cancel the approved OB request before recording WFO/WFH attendance."
+            )
+        if wants_ob:
+            if record.status_source == "approved_leave":
+                raise ValueError(
+                    "Approved Leave Management status controls this date; OB cannot replace it."
+                )
+            if record.sessions or record.time_in is not None or record.time_out is not None:
+                raise ValueError(
+                    "Whole-day OB cannot be used on a date that already has WFO/WFH attendance time."
+                )
+            overtime_service.use_shifting_credit(
+                company_id=record.company_id,
+                employee_id=record.employee_id,
+                usage_date=record.attendance_date,
+                attendance_record_id=record.id,
+            )
+        elif was_ob:
+            overtime_service.release_shifting_credit_usage(
+                company_id=record.company_id,
+                employee_id=record.employee_id,
+                usage_date=record.attendance_date,
+            )
 
     def _localize_input(self, value: datetime | None) -> datetime:
         if value is None:
@@ -461,6 +515,7 @@ class AttendanceService:
         record = self._get_or_create(company, values.employee_id, values.attendance_date)
         if record.status_source == "approved_leave":
             raise ValueError("Approved Leave Management status controls this date.")
+        self._sync_ob_credit_for_status(record=record, new_status=values.work_status)
         record.work_status = values.work_status
         record.status_source = "manual"
         self.session.commit()
@@ -490,6 +545,7 @@ class AttendanceService:
             values.attendance_date,
         )
         before = self._snapshot(record)
+        self._sync_ob_credit_for_status(record=record, new_status=values.work_status)
         record.work_status = values.work_status
         record.status_source = "employee_status_edit"
         record.corrected_by_user_id = values.user_id
@@ -518,6 +574,10 @@ class AttendanceService:
         )
         company = self._company(values.company_id)
         record = self._get_or_create(company, values.employee_id, values.attendance_date)
+        if record.work_status == "OB":
+            raise ValueError(
+                "Change the whole-day OB Work Status before recording WFO/WFH attendance."
+            )
         if values.work_status not in {"WFO", "WFH"}:
             raise ValueError("Login work location must be WFO or WFH.")
         if any(item.actual_time_out is None for item in record.sessions):
@@ -618,6 +678,8 @@ class AttendanceService:
             raise ValueError("Time Out must be later than Time In.")
 
         session_inputs = list(values.sessions)
+        if preserved_work_status == "OB" and (session_inputs or time_in is not None):
+            self._sync_ob_credit_for_status(record=record, new_status="WFO")
         if not session_inputs and time_in is not None:
             session_inputs = [
                 AttendanceSessionInput(
@@ -649,7 +711,9 @@ class AttendanceService:
         # Session/timestamp maintenance must not silently replace a Work
         # Status that the employee selected separately. New records still
         # receive the normal session-derived location.
-        if preserved_work_status is not None:
+        if preserved_work_status is not None and not (
+            preserved_work_status == "OB" and session_inputs
+        ):
             record.work_status = preserved_work_status
         self.session.flush()
         self.session.add(
@@ -776,6 +840,8 @@ class AttendanceService:
             return "SL"
         if "EMERGENCY" in label or label.strip().startswith("EL"):
             return "EL"
+        if "OFFICIAL BUSINESS" in label or label.strip().startswith("OB"):
+            return "OB"
         return "VL"
 
     def sync_approved_leaves(
@@ -838,6 +904,16 @@ class AttendanceService:
                 else Decimal(record.regular_hours_target)
             )
             record.leave_request_id = request.id
+            if self._leave_code(request) == "OB":
+                credit = self.session.scalar(
+                    select(ShiftingCredit).where(
+                        ShiftingCredit.company_id == request.company_id,
+                        ShiftingCredit.employee_id == request.employee_id,
+                        ShiftingCredit.leave_request_id == request.id,
+                    )
+                )
+                if credit is not None:
+                    credit.usage_attendance_record_id = record.id
             # Once an employee or administrator has explicitly replaced the
             # approved-leave default, later synchronization must preserve that
             # decision. A manual entry created before approval has no matching
@@ -1040,6 +1116,12 @@ class AttendanceService:
         record = self._get_or_create(company, values.employee_id, values.attendance_date)
         before = self._snapshot(record)
         session_inputs = list(values.sessions)
+        target_status = values.work_status
+        if target_status == "OB" and (session_inputs or values.time_in is not None):
+            raise ValueError(
+                "Whole-day OB cannot be combined with WFO/WFH attendance sessions."
+            )
+        self._sync_ob_credit_for_status(record=record, new_status=target_status)
         if not session_inputs and values.time_in is not None:
             session_inputs = [
                 AttendanceSessionInput(

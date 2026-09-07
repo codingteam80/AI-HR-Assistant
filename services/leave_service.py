@@ -28,10 +28,12 @@ from integrations.email.email_sender import (
 )
 from models.employee import Employee
 from models.company import Company
+from models.attendance_record import AttendanceRecord
 from models.leave_balance import LeaveBalance
 from models.leave_credit_transaction import LeaveCreditTransaction
 from models.leave_request import LeaveRequest
 from models.leave_type import LeaveType
+from models.shifting_credit import ShiftingCredit
 from models.user import User
 from modules.leave.leave_file_storage import LeaveFileStorage
 from repositories.employee_repository import EmployeeRepository
@@ -138,8 +140,20 @@ DEFAULT_LEAVE_TYPES = (
         "handover_plan_requirement": "recommended",
     },
     {
+        # Official Business is earned only from the approved Shifting Credit
+        # 4+4 same-cutoff rule. It has no annual grant of its own.
+        "code": "OB",
+        "name": "Official Business (OB)",
+        "annual_credits": Decimal("0.00"),
+        "is_paid": True,
+        "carry_over_limit": Decimal("0.00"),
+        "requires_attachment": False,
+        "minimum_notice_days": 0,
+        "handover_plan_requirement": "optional",
+    },
+    {
         # LWOP remains an internal fallback and is intentionally excluded
-        # from the seven-row employee leave-credit table.
+        # from the employee-facing leave-credit table.
         "code": "LWOP",
         "name": "Leave Without Pay",
         "annual_credits": Decimal("0.00"),
@@ -159,6 +173,7 @@ LEAVE_CREDIT_TABLE_CODES = (
     "MATERNITY",
     "PATERNITY",
     "BEREAVEMENT",
+    "OB",
 )
 LEAVE_CREDIT_TABLE_ORDER = {
     code: index
@@ -351,6 +366,20 @@ class LeaveCreditTableRow:
     leave_utilization: LeaveUtilizationSummary | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class OfficialBusinessCreditSummary:
+    """Live Shifting-credit lifecycle totals shown in Leave Management."""
+
+    earned_days: Decimal
+    pending_days: Decimal
+    available_days: Decimal
+    reserved_days: Decimal
+    used_days: Decimal
+    expired_days: Decimal
+    restored_regular_ot_hours: Decimal
+    last_updated: datetime | None = None
+
+
 class LeaveService:
     """Coordinate all leave-management business rules."""
 
@@ -376,6 +405,110 @@ class LeaveService:
         if company is None:
             raise ValueError("The company record is unavailable.")
         return company
+
+    def official_business_credit_summary(
+        self,
+        *,
+        company_id: int,
+        employee_id: int,
+        year: int | None = None,
+        as_of: date | None = None,
+    ) -> OfficialBusinessCreditSummary:
+        """Return the live OB lifecycle without creating independent credits."""
+
+        from services.overtime_service import OvertimeService
+
+        selected_date = as_of or self._today()
+        selected_year = year or self.leave_cycle_year(company_id, selected_date)
+        cycle_start = self.leave_cycle_start(company_id, selected_year)
+        cycle_end = self.leave_cycle_end(company_id, selected_year)
+        OvertimeService(self.session).refresh_shifting_credit_statuses(
+            company_id=company_id,
+            as_of=selected_date,
+        )
+        credits = list(
+            self.session.scalars(
+                select(ShiftingCredit)
+                .where(
+                    ShiftingCredit.company_id == company_id,
+                    ShiftingCredit.employee_id == employee_id,
+                    ShiftingCredit.availability_date <= cycle_end,
+                    ShiftingCredit.expiration_date >= cycle_start,
+                )
+                .order_by(ShiftingCredit.earned_date, ShiftingCredit.id)
+            ).all()
+        )
+
+        earned = Decimal("0.00")
+        pending = Decimal("0.00")
+        available = Decimal("0.00")
+        reserved = Decimal("0.00")
+        used = Decimal("0.00")
+        expired = Decimal("0.00")
+        restored = Decimal("0.00")
+        last_updated: datetime | None = None
+        for credit in credits:
+            days = Decimal(credit.ob_credit_days or Decimal("0.00"))
+            earned += days
+            status = str(credit.status or "pending").strip().lower()
+            if status == "pending":
+                pending += days
+            elif status == "available":
+                available += days
+            elif status == "reserved":
+                reserved += days
+            elif status == "used":
+                if credit.usage_date is not None and credit.usage_date > selected_date:
+                    reserved += days
+                else:
+                    used += days
+            elif status == "expired":
+                expired += days
+            restored += Decimal(
+                credit.restored_regular_ot_hours or Decimal("0.00")
+            )
+            candidate = getattr(credit, "updated_at", None)
+            if candidate is not None and (last_updated is None or candidate > last_updated):
+                last_updated = candidate
+
+        return OfficialBusinessCreditSummary(
+            earned_days=earned.quantize(Decimal("0.01")),
+            pending_days=pending.quantize(Decimal("0.01")),
+            available_days=available.quantize(Decimal("0.01")),
+            reserved_days=reserved.quantize(Decimal("0.01")),
+            used_days=used.quantize(Decimal("0.01")),
+            expired_days=expired.quantize(Decimal("0.01")),
+            restored_regular_ot_hours=restored.quantize(Decimal("0.01")),
+            last_updated=last_updated,
+        )
+
+    def _sync_official_business_balance(
+        self,
+        *,
+        balance: LeaveBalance,
+        year: int,
+        as_of: date | None = None,
+    ) -> OfficialBusinessCreditSummary:
+        """Mirror the live Shifting/OB lifecycle into the Leave Management row."""
+
+        summary = self.official_business_credit_summary(
+            company_id=balance.company_id,
+            employee_id=balance.employee_id,
+            year=year,
+            as_of=as_of,
+        )
+        active_credit = (
+            summary.available_days + summary.reserved_days + summary.used_days
+        ).quantize(Decimal("0.01"))
+        balance.allocated_days = active_credit
+        balance.carry_over_days = Decimal("0.00")
+        balance.adjustment_days = Decimal("0.00")
+        balance.used_days = summary.used_days
+        balance.reserved_days = summary.reserved_days
+        balance.beginning_credit_days = Decimal("0.00")
+        balance.credit_days = active_credit
+        balance.converted_to_cash_days = Decimal("0.00")
+        return summary
 
     @staticmethod
     def _safe_annual_date(year: int, month: int, day: int) -> date:
@@ -1031,6 +1164,28 @@ class LeaveService:
                 company_id,
                 spec["code"],
             )
+            if existing is None and spec["code"] == "OB":
+                named_ob = self.leave_type_repository.get_by_name(
+                    company_id, spec["name"]
+                )
+                if named_ob is None:
+                    # v8.8.204 and older databases may already contain a
+                    # manually-created legacy label without the visible code.
+                    named_ob = self.leave_type_repository.get_by_name(
+                        company_id, "Official Business"
+                    )
+                if named_ob is not None:
+                    named_ob.code = "OB"
+                    named_ob.name = spec["name"]
+                    named_ob.is_paid = True
+                    named_ob.annual_credits = Decimal("0.00")
+                    named_ob.carry_over_limit = Decimal("0.00")
+                    named_ob.requires_attachment = False
+                    named_ob.minimum_notice_days = 0
+                    named_ob.handover_plan_requirement = "optional"
+                    named_ob.is_active = True
+                    existing = named_ob
+                    changed = True
             if existing is None:
                 self.session.add(
                     LeaveType(
@@ -1244,7 +1399,7 @@ class LeaveService:
 
     @staticmethod
     def credit_table_balances(balances) -> list[LeaveBalance]:
-        """Return the seven employee-facing leave rows in required order."""
+        """Return the employee-facing leave rows in the required order."""
 
         return sorted(
             (
@@ -1630,7 +1785,7 @@ class LeaveService:
         year: int,
         balances=None,
     ) -> list[LeaveCreditTableRow]:
-        """Build the seven display rows without double-counting EL credits."""
+        """Build the display rows without double-counting EL credits."""
 
         selected_balances = list(
             balances
@@ -2063,6 +2218,7 @@ class LeaveService:
         if employee is None:
             raise ValueError("The employee record is unavailable.")
 
+        leave_code = (leave_type.code or "").strip().upper()
         previous = self.balance_repository.get_balance(
             company_id=company_id,
             employee_id=employee_id,
@@ -2087,6 +2243,13 @@ class LeaveService:
             year=year,
         )
         if existing is not None:
+            if leave_code == "OB":
+                self._sync_official_business_balance(
+                    balance=existing,
+                    year=year,
+                    as_of=as_of,
+                )
+                return existing
             # Historical records remain unchanged. The selected annual ledger
             # is synchronized idempotently to the January rules so databases
             # created by older checkpoints receive the corrected SL/VL credit.
@@ -2152,6 +2315,13 @@ class LeaveService:
         )
         self.session.add(balance)
         self.session.flush()
+        if leave_code == "OB":
+            self._sync_official_business_balance(
+                balance=balance,
+                year=year,
+                as_of=as_of,
+            )
+            return balance
         self.session.add(
             LeaveCreditTransaction(
                 company_id=company_id,
@@ -2236,6 +2406,18 @@ class LeaveService:
 
         existing_code = self.leave_type_repository.get_by_code(values.company_id, values.code)
         existing_name = self.leave_type_repository.get_by_name(values.company_id, values.name)
+        current = (
+            self.leave_type_repository.get_by_id(leave_type_id, values.company_id)
+            if leave_type_id is not None
+            else None
+        )
+        if values.code == "OB" or (
+            current is not None and (current.code or "").strip().upper() == "OB"
+        ):
+            raise ValueError(
+                "Official Business (OB) is system-managed from Shifting Credits "
+                "and its leave-type rules cannot be edited manually."
+            )
         if leave_type_id is None:
             if existing_code or existing_name:
                 raise ValueError("A leave type with that code or name already exists.")
@@ -2373,6 +2555,11 @@ class LeaveService:
                 "three-day annual allowance is automatically deducted from "
                 "Vacation Leave."
             )
+        if selected_code == "OB":
+            raise ValueError(
+                "Official Business (OB) credits are system-managed from approved "
+                "Shifting Credit OT blocks and cannot be adjusted manually."
+            )
         if selected_code in EVENT_LEAVE_CODES:
             raise ValueError(
                 f"{leave_type.name} credits are created automatically only "
@@ -2446,6 +2633,11 @@ class LeaveService:
                 "Emergency Leave has no independent credit balance. Its "
                 "three-day annual allowance is automatically deducted from "
                 "Vacation Leave."
+            )
+        if selected_code == "OB":
+            raise ValueError(
+                "Official Business (OB) credits are system-managed from approved "
+                "Shifting Credit OT blocks and cannot be adjusted manually."
             )
         if selected_code in EVENT_LEAVE_CODES:
             raise ValueError(
@@ -2850,6 +3042,22 @@ class LeaveService:
                 lwop_days=requested,
             )
 
+        if code == "OB":
+            summary = self.official_business_credit_summary(
+                company_id=company_id,
+                employee_id=employee.id,
+                year=year,
+                as_of=as_of,
+            )
+            covered = min(requested, summary.available_days)
+            return LeaveAllocationPlan(
+                primary_balance=None,
+                primary_days=covered,
+                fallback_balance=None,
+                fallback_days=Decimal("0.00"),
+                lwop_days=max(Decimal("0.00"), requested - covered),
+            )
+
         primary_balance = self._ensure_balance(
             company_id=company_id,
             employee_id=employee.id,
@@ -3007,6 +3215,12 @@ class LeaveService:
             raise ValueError("The selected leave type is unavailable.")
 
         selected_code = (leave_type.code or "").strip().upper()
+        if selected_code == "OB" and (
+            values.start_date != values.end_date or values.duration_code != "90503"
+        ):
+            raise ValueError(
+                "Official Business (OB) uses one whole Regular Workday per request."
+            )
         filer, filed_on_behalf = self._resolve_request_filer(
             company_id=values.company_id,
             leave_owner=employee,
@@ -3086,6 +3300,15 @@ class LeaveService:
             as_of=today,
             virtual_primary_credit=preview_event_credit,
         )
+        if selected_code == "OB" and (
+            requested_days != Decimal("1.00")
+            or allocation.primary_days != Decimal("1.00")
+            or allocation.lwop_days > Decimal("0.00")
+        ):
+            raise ValueError(
+                "No available Official Business (OB) credit can cover the selected date. "
+                "OB cannot fall back to Leave Without Pay."
+            )
 
         requirement = (leave_type.handover_plan_requirement or "optional").strip().lower()
         has_plan_text = bool((values.handover_plan or "").strip())
@@ -3155,6 +3378,23 @@ class LeaveService:
         try:
             self.session.flush()
             request.public_id = f"LRQ_{request.id:06d}"
+            if selected_code == "OB":
+                from services.overtime_service import OvertimeService
+
+                OvertimeService(self.session).reserve_shifting_credit_for_leave(
+                    company_id=request.company_id,
+                    employee_id=request.employee_id,
+                    usage_date=request.start_date,
+                    leave_request_id=request.id,
+                )
+                self._ensure_balance(
+                    company_id=request.company_id,
+                    employee_id=request.employee_id,
+                    leave_type=leave_type,
+                    year=self.leave_cycle_year(request.company_id, request.start_date),
+                    employee=employee,
+                    as_of=today,
+                )
             recipients = self._notification_recipients(
                 company_id=values.company_id,
                 employee=employee,
@@ -3602,6 +3842,21 @@ class LeaveService:
             request.approval_stage = "completed"
             request.current_approver_employee_id = None
             request.reservation_posted = False
+            if (request.leave_type.code or "").strip().upper() == "OB":
+                from services.overtime_service import OvertimeService
+
+                OvertimeService(self.session).release_shifting_credit_leave_reservation(
+                    company_id=request.company_id,
+                    leave_request_id=request.id,
+                )
+                self._ensure_balance(
+                    company_id=request.company_id,
+                    employee_id=request.employee_id,
+                    leave_type=request.leave_type,
+                    year=self.leave_cycle_year(request.company_id, request.start_date),
+                    employee=request.employee,
+                    as_of=self._today(),
+                )
             self._notify_cancellation(
                 request=request,
                 event_type="leave_request_cancelled_before_approval",
@@ -3674,6 +3929,22 @@ class LeaveService:
         """Release unused approved reservations and record an audit entry."""
 
         if leave_type is None or restore_days <= Decimal("0.00"):
+            return
+        if (leave_type.code or "").strip().upper() == "OB":
+            from services.overtime_service import OvertimeService
+
+            OvertimeService(self.session).release_shifting_credit_leave_reservation(
+                company_id=request.company_id,
+                leave_request_id=request.id,
+            )
+            self._ensure_balance(
+                company_id=request.company_id,
+                employee_id=request.employee_id,
+                leave_type=leave_type,
+                year=self.leave_cycle_year(request.company_id, request.start_date),
+                employee=request.employee,
+                as_of=self._today(),
+            )
             return
         balance = self._ensure_balance(
             company_id=request.company_id,
@@ -3906,6 +4177,75 @@ class LeaveService:
         self.session.refresh(request)
         return request
 
+    def _finalize_official_business_approval(
+        self, *, request: LeaveRequest
+    ) -> None:
+        """Consume the OB reservation at final approval without a second ledger."""
+
+        if (request.duration_code or "90503") != "90503" or request.start_date != request.end_date:
+            raise ValueError("Official Business (OB) must cover one whole Regular Workday.")
+        requested_days = self._requested_days_for_duration(
+            company_id=request.company_id,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            duration_code="90503",
+        )
+        if requested_days != Decimal("1.00"):
+            raise ValueError(
+                "Official Business (OB) must be scheduled on one saved company Regular Workday."
+            )
+        attendance = self.session.scalar(
+            select(AttendanceRecord).where(
+                AttendanceRecord.company_id == request.company_id,
+                AttendanceRecord.employee_id == request.employee_id,
+                AttendanceRecord.attendance_date == request.start_date,
+            )
+        )
+        if attendance is not None and (
+            attendance.sessions
+            or attendance.time_in is not None
+            or attendance.time_out is not None
+        ):
+            raise ValueError(
+                "Official Business (OB) cannot be approved on a date that already "
+                "has WFO/WFH attendance time. Correct the attendance record first."
+            )
+        from services.overtime_service import OvertimeService
+
+        OvertimeService(self.session).confirm_shifting_credit_leave_usage(
+            company_id=request.company_id,
+            leave_request_id=request.id,
+        )
+        request.requested_days = Decimal("1.00")
+        request.fallback_leave_type = None
+        request.primary_credit_days = Decimal("1.00")
+        request.fallback_credit_days = Decimal("0.00")
+        request.lwop_days = Decimal("0.00")
+        request.reservation_posted = True
+        balance = self._ensure_balance(
+            company_id=request.company_id,
+            employee_id=request.employee_id,
+            leave_type=request.leave_type,
+            year=self.leave_cycle_year(request.company_id, request.start_date),
+            employee=request.employee,
+            as_of=self._today(),
+        )
+        self.session.add(
+            LeaveCreditTransaction(
+                company_id=request.company_id,
+                employee_id=request.employee_id,
+                leave_type_id=request.leave_type_id,
+                leave_balance_id=balance.id,
+                leave_request_id=request.id,
+                transaction_type="ob_shifting_credit_approved",
+                amount_days=-Decimal("1.00"),
+                note=(
+                    f"Reserved Shifting Credit assigned to approved Official Business "
+                    f"request {request.public_id} for {request.start_date.isoformat()}."
+                ),
+            )
+        )
+
     def decide_leave_request(self, values: LeaveDecisionInput) -> LeaveRequest:
         """Record a leader-stage or final manager decision."""
         request = self.request_repository.get_with_details(values.company_id, values.request_id)
@@ -3923,6 +4263,7 @@ class LeaveService:
 
         now = datetime.now(timezone.utc)
         is_leader_stage = request.status == "pending_leader_approval"
+        request_code = (request.leave_type.code or "").strip().upper()
 
         if is_leader_stage:
             request.leader_reviewed_at = now
@@ -3932,6 +4273,21 @@ class LeaveService:
                 request.status = "rejected"
                 request.approval_stage = "completed"
                 request.current_approver_employee_id = None
+                if request_code == "OB":
+                    from services.overtime_service import OvertimeService
+
+                    OvertimeService(self.session).release_shifting_credit_leave_reservation(
+                        company_id=request.company_id,
+                        leave_request_id=request.id,
+                    )
+                    self._ensure_balance(
+                        company_id=request.company_id,
+                        employee_id=request.employee_id,
+                        leave_type=request.leave_type,
+                        year=self.leave_cycle_year(request.company_id, request.start_date),
+                        employee=request.employee,
+                        as_of=self._today(),
+                    )
                 decision_label = "Rejected"
             else:
                 if request.manager is None or request.manager.user_id is None:
@@ -3991,66 +4347,84 @@ class LeaveService:
                 request.reservation_posted = False
                 request.approval_stage = "completed"
                 request.current_approver_employee_id = None
+                if request_code == "OB":
+                    from services.overtime_service import OvertimeService
+
+                    OvertimeService(self.session).release_shifting_credit_leave_reservation(
+                        company_id=request.company_id,
+                        leave_request_id=request.id,
+                    )
+                    self._ensure_balance(
+                        company_id=request.company_id,
+                        employee_id=request.employee_id,
+                        leave_type=request.leave_type,
+                        year=self.leave_cycle_year(request.company_id, request.start_date),
+                        employee=request.employee,
+                        as_of=self._today(),
+                    )
                 decision_label = "Rejected"
             else:
-                self._grant_event_leave_entitlement(
-                    request=request,
-                    created_by_user_id=values.manager_user_id,
-                )
-                requested_days = self._requested_days_for_duration(
-                    company_id=request.company_id,
-                    start_date=request.start_date,
-                    end_date=request.end_date,
-                    duration_code=request.duration_code or "90503",
-                )
-                if requested_days <= 0:
-                    raise ValueError(
-                        "This request now contains no company Regular Workdays. "
-                        "Review the saved Attendance Schedule & OT Rules calendar."
+                if request_code == "OB":
+                    self._finalize_official_business_approval(request=request)
+                else:
+                    self._grant_event_leave_entitlement(
+                        request=request,
+                        created_by_user_id=values.manager_user_id,
                     )
-                request.requested_days = requested_days
-                allocation = self._request_allocation_plan(
-                    company_id=request.company_id,
-                    employee=request.employee,
-                    leave_type=request.leave_type,
-                    year=self.leave_cycle_year(request.company_id, request.start_date),
-                    requested_days=requested_days,
-                    as_of=self._today(),
-                )
-                request.fallback_leave_type = (
-                    allocation.fallback_balance.leave_type
-                    if allocation.fallback_balance is not None else None
-                )
-                request.primary_credit_days = allocation.primary_days
-                request.fallback_credit_days = allocation.fallback_days
-                request.lwop_days = allocation.lwop_days
-                request.reservation_posted = allocation.paid_days > 0
-
-                for reserved_balance, reserved_days in (
-                    (allocation.primary_balance, allocation.primary_days),
-                    (allocation.fallback_balance, allocation.fallback_days),
-                ):
-                    if reserved_balance is None or reserved_days <= 0:
-                        continue
-                    reserved_balance.reserved_days = Decimal(reserved_balance.reserved_days) + reserved_days
-                    self._validate_nonnegative_balance(reserved_balance)
-                    self.session.add(
-                        LeaveCreditTransaction(
-                            company_id=request.company_id,
-                            employee_id=request.employee_id,
-                            leave_type_id=reserved_balance.leave_type_id,
-                            leave_balance_id=reserved_balance.id,
-                            leave_request_id=request.id,
-                            created_by_user_id=values.manager_user_id,
-                            transaction_type="approval_reserved",
-                            amount_days=-reserved_days,
-                            note=(
-                                f"Reserved after final manager approval for {request.public_id}; "
-                                f"filed by {request.filed_by_employee.full_name if request.filed_by_employee else request.employee.full_name}; "
-                                f"automatic split includes {allocation.lwop_days} LWOP day(s)."
-                            ),
+                    requested_days = self._requested_days_for_duration(
+                        company_id=request.company_id,
+                        start_date=request.start_date,
+                        end_date=request.end_date,
+                        duration_code=request.duration_code or "90503",
+                    )
+                    if requested_days <= 0:
+                        raise ValueError(
+                            "This request now contains no company Regular Workdays. "
+                            "Review the saved Attendance Schedule & OT Rules calendar."
                         )
+                    request.requested_days = requested_days
+                    allocation = self._request_allocation_plan(
+                        company_id=request.company_id,
+                        employee=request.employee,
+                        leave_type=request.leave_type,
+                        year=self.leave_cycle_year(request.company_id, request.start_date),
+                        requested_days=requested_days,
+                        as_of=self._today(),
                     )
+                    request.fallback_leave_type = (
+                        allocation.fallback_balance.leave_type
+                        if allocation.fallback_balance is not None else None
+                    )
+                    request.primary_credit_days = allocation.primary_days
+                    request.fallback_credit_days = allocation.fallback_days
+                    request.lwop_days = allocation.lwop_days
+                    request.reservation_posted = allocation.paid_days > 0
+
+                    for reserved_balance, reserved_days in (
+                        (allocation.primary_balance, allocation.primary_days),
+                        (allocation.fallback_balance, allocation.fallback_days),
+                    ):
+                        if reserved_balance is None or reserved_days <= 0:
+                            continue
+                        reserved_balance.reserved_days = Decimal(reserved_balance.reserved_days) + reserved_days
+                        self._validate_nonnegative_balance(reserved_balance)
+                        self.session.add(
+                            LeaveCreditTransaction(
+                                company_id=request.company_id,
+                                employee_id=request.employee_id,
+                                leave_type_id=reserved_balance.leave_type_id,
+                                leave_balance_id=reserved_balance.id,
+                                leave_request_id=request.id,
+                                created_by_user_id=values.manager_user_id,
+                                transaction_type="approval_reserved",
+                                amount_days=-reserved_days,
+                                note=(
+                                    f"Reserved after final manager approval for {request.public_id}; "
+                                    f"filed by {request.filed_by_employee.full_name if request.filed_by_employee else request.employee.full_name}; "
+                                    f"automatic split includes {allocation.lwop_days} LWOP day(s)."
+                                ),
+                            )
+                        )
                 request.approved_at = now
                 request.status = "scheduled" if request.start_date > self._today() else "approved"
                 request.approval_stage = "completed"
@@ -4178,6 +4552,16 @@ class LeaveService:
                 )
                 for posting_type, posting_days in posting_items:
                     if posting_type is None or posting_days <= 0:
+                        continue
+                    if (posting_type.code or "").strip().upper() == "OB":
+                        self._ensure_balance(
+                            company_id=request.company_id,
+                            employee_id=request.employee_id,
+                            leave_type=posting_type,
+                            year=self.leave_cycle_year(request.company_id, request.start_date),
+                            employee=request.employee,
+                            as_of=selected_date,
+                        )
                         continue
 
                     balance = self._ensure_balance(

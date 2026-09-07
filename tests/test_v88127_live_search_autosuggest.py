@@ -19,7 +19,8 @@ def test_shared_component_filters_while_typing_without_enter() -> None:
     assert "input.oninput" in source
     assert "setStateValue('value', input.value)" in source
     assert "window.setTimeout(" in source
-    assert "event.key === 'Enter'" not in source
+    legacy = source[: source.index("# ---------------------------------------------------------------------------\n# Free-text multi-search chips")]
+    assert "event.key === 'Enter'" not in legacy
 
 
 def test_clear_button_and_escape_restore_empty_search_immediately() -> None:
@@ -35,27 +36,27 @@ def test_clear_button_and_escape_restore_empty_search_immediately() -> None:
 def test_all_explicit_portal_searches_use_shared_live_control() -> None:
     expected = {
         "ui/pages/admin/employees_page.py": (
-            'live_search_input(\n        "Search Employees"',
+            'multi_search_input(\n        "Search Employees"',
             'key="employee_master_search"',
         ),
         "ui/pages/admin/attendance_dashboard.py": (
-            'live_search_input(\n            "Search Employee / Attendance / DTR / OT"',
+            'multi_search_input(\n            "Search Employee / Attendance / DTR / OT"',
             'key="admin_dtr_employee_search"',
         ),
         "ui/pages/admin/leave_management_page.py": (
-            'live_search_input(\n        "Search Leave Requests"',
+            'multi_search_input(\n        "Search Leave Requests"',
             'key=f"leave_request_employee_search_{year}"',
         ),
         "ui/pages/admin/policies_page.py": (
-            'live_search_input(\n        "Find in Sections"',
+            'multi_search_input(\n        "Find in Sections"',
             'key=f"section_search_{view.policy.id}"',
         ),
         "ui/pages/user/policies_page.py": (
-            'live_search_input(\n            "Search Policies"',
+            'multi_search_input(\n            "Search Policies"',
             'key="employee_policy_search"',
         ),
         "ui/pages/user/announcements_page.py": (
-            'live_search_input(\n            "Search Announcements"',
+            'multi_search_input(\n            "Search Announcements"',
             'key="employee_announcement_search"',
         ),
     }
@@ -67,7 +68,7 @@ def test_all_explicit_portal_searches_use_shared_live_control() -> None:
             assert text in source
 
 
-def test_searches_supply_contextual_autosuggestions() -> None:
+def test_searches_use_manual_free_text_chips_without_autosuggestions() -> None:
     pages = (
         "ui/pages/admin/employees_page.py",
         "ui/pages/admin/attendance_dashboard.py",
@@ -77,7 +78,8 @@ def test_searches_supply_contextual_autosuggestions() -> None:
         "ui/pages/user/announcements_page.py",
     )
 
-    assert all("suggestions=(" in _source(path) for path in pages)
+    assert all("suggestions=(" not in _source(path) for path in pages)
+    assert all("multi_search_input(" in _source(path) for path in pages)
 
 
 def test_native_searchable_recipient_controls_remain_unchanged() -> None:

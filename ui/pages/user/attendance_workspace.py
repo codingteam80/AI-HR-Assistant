@@ -34,7 +34,7 @@ from ui.components.operation_feedback import (
 )
 
 
-STATUS_OPTIONS = ("WFO", "WFH", "VL", "SL", "EL")
+STATUS_OPTIONS = ("WFO", "WFH", "VL", "SL", "EL", "OB")
 WORK_LOCATION_OPTIONS = ("WFO", "WFH")
 _EDITOR_SCROLL_STATE_KEY = "_employee_attendance_scroll_to_editor"
 
@@ -332,22 +332,49 @@ def _render_overtime_request(
                 ("No", "Yes"),
                 key=f"employee_ot_dinner_{rendered_date}",
             )
+            gross_preview = Decimal(str(estimated_hours))
             payable_preview = OvertimeService.payable_hours_before_shifting(
-                Decimal(str(estimated_hours)),
+                gross_preview,
                 dinner_break_flag=dinner_break == "Yes",
                 dinner_break_deduction_hours=(
                     overtime_rules.dinner_break_deduction_hours
                 ),
             )
+            straight_vl_qualifies = (
+                shifting_eligible
+                and overtime_rules.shifting_credits_enabled
+                and overtime_rules.additional_vl_days > 0
+                and gross_preview >= overtime_rules.additional_vl_threshold_hours
+            )
+            if straight_vl_qualifies and not overtime_rules.additional_vl_also_payable:
+                payable_preview = max(
+                    Decimal("0.00"),
+                    payable_preview - overtime_rules.additional_vl_threshold_hours,
+                ).quantize(Decimal("0.01"))
+            straight_rule_note = ""
+            if straight_vl_qualifies:
+                if overtime_rules.additional_vl_also_payable:
+                    straight_rule_note = (
+                        f" Straight OT qualifies for +{overtime_rules.additional_vl_days:g} "
+                        "VL and remains OT payable under the current company setting."
+                    )
+                else:
+                    straight_rule_note = (
+                        f" Straight OT qualifies for +{overtime_rules.additional_vl_days:g} "
+                        "VL; the qualifying hours are converted and are not also OT payable."
+                    )
             st.caption(
-                f"Payable OT before Shifting Credit pairing: "
+                f"Estimated payable OT before any future same-cutoff block pairing: "
                 f"{payable_preview:.2f} hour(s). "
                 + (
                     f"Dinner Break deducts "
-                    f"{overtime_rules.dinner_break_deduction_hours:.2f} hour(s). "
+                    f"{overtime_rules.dinner_break_deduction_hours:.2f} hour(s) "
+                    "from payable OT only."
                     if dinner_break == "Yes"
                     else ""
                 )
+                + straight_rule_note
+                + " "
                 + (
                     "This position is eligible for Shifting Credits."
                     if shifting_eligible and overtime_rules.shifting_credits_enabled
@@ -753,6 +780,12 @@ def render_employee_attendance_workspace(
                 }
                 for item in existing_sessions
             ]
+            available_ob_credits = OvertimeService(session).available_shifting_credit_count(
+                company_id=current_user.company_id,
+                employee_id=current_user.employee_id,
+                as_of=edit_date,
+            )
+            session.commit()
 
         edit_record_marker = (
             f"{edit_date}_{edit_record.id}_{edit_record.updated_at}_"
@@ -764,7 +797,8 @@ def render_employee_attendance_workspace(
         st.markdown("**Work Status Only**")
         st.caption(
             "Correct the selected date's Work Status without changing Time In, "
-            "Time Out, work sessions, or completion state."
+            "Time Out, work sessions, or completion state. "
+            f"Available whole-day OB credit(s) for this date: {available_ob_credits}."
         )
         status_only_columns = st.columns([2, 1])
         with status_only_columns[0]:

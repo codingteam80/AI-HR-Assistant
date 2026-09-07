@@ -139,6 +139,11 @@ def _render_balances(
             year=current_leave_year,
             balances=balances,
         )
+        ob_summary = service.official_business_credit_summary(
+            company_id=current_user.company_id,
+            employee_id=current_user.employee_id,
+            year=current_leave_year,
+        )
         employee = service.employee_repository.get_with_details(
             company_id=current_user.company_id,
             employee_id=current_user.employee_id,
@@ -265,13 +270,26 @@ def _render_balances(
     )
 
     st.caption(
+        "OB lifecycle — "
+        f"Earned: {_days(ob_summary.earned_days)} · "
+        f"Pending: {_days(ob_summary.pending_days)} · "
+        f"Available: {_days(ob_summary.available_days)} · "
+        f"Reserved: {_days(ob_summary.reserved_days)} · "
+        f"Used: {_days(ob_summary.used_days)} · "
+        f"Expired: {_days(ob_summary.expired_days)} · "
+        f"Regular OT Restored: {_days(ob_summary.restored_regular_ot_hours)} hr(s)."
+    )
+
+    st.caption(
         "Beginning Credit is the carried balance before the current annual "
         "accrual. Credit shows only the annual or approved event allocation "
         "for the selected year. Administrator corrections affect Available "
         "Credits and remain in audit history. Available Credits is the usable balance after usage, "
         "reservations, and cash conversion. Gender-inapplicable Maternity or "
         "Paternity rows display N/A. Only Vacation and Sick Leave may be "
-        "converted to cash."
+        "converted to cash. Official Business (OB) is system-managed from "
+        "Shifting Credits; Pending OB is shown separately and is not usable "
+        "until its availability date."
     )
 
 
@@ -515,6 +533,23 @@ def _render_submit(
     selected_event_credit = Decimal(
         event_preview_credits.get(leave_type_id, Decimal("0.00"))
     )
+    selected_code = (selected_type.code or "").strip().upper()
+
+    if selected_code == "OB":
+        with SessionFactory() as session:
+            ob_summary = LeaveService(session).official_business_credit_summary(
+                company_id=current_user.company_id,
+                employee_id=owner_employee_id,
+            )
+        st.info(
+            "Official Business (OB) is earned from qualifying 4+4 same-cutoff "
+            "Shifting Credits. "
+            f"Pending: {_days(ob_summary.pending_days)} · "
+            f"Available: {_days(ob_summary.available_days)} · "
+            f"Reserved: {_days(ob_summary.reserved_days)} · "
+            f"Used: {_days(ob_summary.used_days)} · "
+            f"Expired: {_days(ob_summary.expired_days)}"
+        )
 
     available_column, rule_column = st.columns(2)
     with available_column:
@@ -539,14 +574,21 @@ def _render_submit(
             key=_key(nonce, f"end_{owner_employee_id}_{int(on_behalf)}"),
         )
 
+    duration_options = (
+        ["90503"] if selected_code == "OB" else list(LEAVE_DURATION_OPTIONS)
+    )
     duration_code = st.selectbox(
         "Duration *",
-        options=list(LEAVE_DURATION_OPTIONS),
-        index=list(LEAVE_DURATION_OPTIONS).index("90503"),
+        options=duration_options,
+        index=0 if selected_code == "OB" else duration_options.index("90503"),
         format_func=duration_label,
         help=(
-            "AM Only and PM Only use 0.50 leave credit and are allowed for "
-            "one date only. Whole Day uses the regular full-day credit."
+            "Official Business (OB) uses one whole Regular Workday per request."
+            if selected_code == "OB"
+            else (
+                "AM Only and PM Only use 0.50 leave credit and are allowed for "
+                "one date only. Whole Day uses the regular full-day credit."
+            )
         ),
         key=_key(nonce, f"duration_{owner_employee_id}_{int(on_behalf)}"),
     )
@@ -563,7 +605,6 @@ def _render_submit(
         and calendar_working_days > Decimal("0.00")
         else calendar_working_days
     )
-    selected_code = (selected_type.code or "").strip().upper()
     primary_days = Decimal("0.00")
     fallback_days = Decimal("0.00")
     if selected_code == "EMERGENCY":
@@ -622,7 +663,15 @@ def _render_submit(
         f"{' + '.join(split_parts) if split_parts else 'No working days'}"
     )
 
-    if remaining_days > Decimal("0.00"):
+    if selected_code == "OB" and (
+        start != end or working_days != Decimal("1.00")
+    ):
+        st.warning(
+            "Official Business (OB) must use one date that is selected as a "
+            "Regular Workday in Attendance Schedule & OT Rules."
+        )
+
+    if remaining_days > Decimal("0.00") and selected_code != "OB":
         if primary_days + fallback_days <= Decimal("0.00"):
             st.warning(
                 f"The Leave Owner has no available {selected_type.name} "

@@ -118,8 +118,8 @@ def test_report_page_has_separate_conversion_tab_and_all_column_search() -> None
     assert '"Combined HR Report", "Leave Conversion to Cash"' in report
     assert "build_leave_conversion_rows" in report
     assert "build_leave_conversion_excel" in report
-    assert "live_search_input(" in report
-    assert "for value in row.values()" in report
+    assert "multi_search_input(" in report
+    assert "matches_search_terms(search_terms, row.values())" in report
     for excluded in ("Conversion Status", "Date Processed", "Remarks", "Daily Rate"):
         assert excluded not in _source(
             "modules/reports/leave_conversion_report.py"

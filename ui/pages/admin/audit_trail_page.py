@@ -9,7 +9,8 @@ from authentication.current_user import AuthenticatedUser
 from database.session import SessionFactory
 from services.audit_trail_service import AuditTrailEntry, AuditTrailService
 from ui.components.data_table import render_admin_table
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import matches_visible_row
 
 
 def _display_datetime(value: datetime) -> str:
@@ -43,22 +44,19 @@ def _change_text(entry: AuditTrailEntry) -> str:
     )
 
 
-def _searchable(entry: AuditTrailEntry) -> str:
-    return " ".join(
-        str(value or "")
-        for value in (
-            entry.event_id,
-            entry.module,
-            entry.actor_label,
-            entry.action,
-            entry.entity,
-            entry.result,
-            entry.summary,
-            _change_text(entry),
-            entry.metadata_json,
-            _display_datetime(entry.occurred_at),
-        )
-    ).casefold()
+def _table_row(entry: AuditTrailEntry) -> dict[str, object]:
+    """Return exactly the columns shown in the Audit Trail table."""
+
+    return {
+        "Event ID": entry.event_id,
+        "Date / Time": _display_datetime(entry.occurred_at),
+        "Administrator": entry.actor_label,
+        "Module": entry.module,
+        "Action": entry.action,
+        "Result": entry.result.replace("_", " ").title(),
+        "Affected Record": entry.entity,
+        "Summary": entry.summary,
+    }
 
 
 def _render_details(entry: AuditTrailEntry) -> None:
@@ -195,27 +193,13 @@ def render_audit_trail_page(current_user: AuthenticatedUser) -> None:
             key="audit_trail_action_filter",
         )
 
-    search_text = live_search_input(
+    search_terms = multi_search_input(
         "Search Audit Trail",
         placeholder=(
-            "Search any event, administrator, module, action, result, "
-            "record, field, value, or date…"
+            "Type any value shown in the Audit Trail table, then press Enter…"
         ),
         key="audit_trail_search",
-        suggestions=(
-            value
-            for item in entries
-            for value in (
-                item.event_id,
-                item.module,
-                item.actor_label,
-                item.action,
-                item.entity,
-                item.result.replace("_", " ").title(),
-            )
-        ),
     )
-    normalized_search = search_text.strip().casefold()
     normalized_result = selected_result.casefold().replace(" ", "_")
     filtered = [
         item
@@ -227,7 +211,7 @@ def render_audit_trail_page(current_user: AuthenticatedUser) -> None:
                 or item.result.casefold() == normalized_result
             )
             and (selected_action == "All Actions" or item.action == selected_action)
-            and (not normalized_search or normalized_search in _searchable(item))
+            and matches_visible_row(search_terms, _table_row(item))
         )
     ]
 
@@ -237,19 +221,7 @@ def render_audit_trail_page(current_user: AuthenticatedUser) -> None:
         return
 
     render_admin_table(
-        [
-            {
-                "Event ID": item.event_id,
-                "Date / Time": _display_datetime(item.occurred_at),
-                "Administrator": item.actor_label,
-                "Module": item.module,
-                "Action": item.action,
-                "Result": item.result.replace("_", " ").title(),
-                "Affected Record": item.entity,
-                "Summary": item.summary,
-            }
-            for item in filtered
-        ],
+        [_table_row(item) for item in filtered],
         key="central-audit-trail",
         min_width=1800,
         column_widths=(

@@ -18,6 +18,8 @@ from ui.components.company_form_download import (
     prepare_editable_company_form_download,
 )
 from ui.components.data_table import render_selectable_admin_table
+from ui.components.live_search import multi_search_input
+from utils.search_utils import filter_aligned_visible_rows
 from ui.components.file_preview import render_file_preview_dialog
 from ui.components.operation_feedback import (
     render_operation_feedback,
@@ -162,18 +164,26 @@ def _render_view(
             return
 
         st.caption("Click a form row to open its file preview.")
+        form_search = multi_search_input(
+            "Search Company Forms",
+            placeholder="Type any value shown in the form table, then press Enter…",
+            key="employee_company_forms_view_search",
+        )
+        visible_forms, visible_form_rows = filter_aligned_visible_rows(
+            forms, _form_rows(forms), form_search
+        )
         table_version = int(
             st.session_state.get(VIEW_TABLE_VERSION_KEY, 0)
         )
         selected_index = render_selectable_admin_table(
-            _form_rows(forms),
+            visible_form_rows,
             key=f"employee_company_forms_view_{table_version}",
             height=420,
         )
         if selected_index is not None:
             _queue_preview(
                 kind="form",
-                record_id=forms[selected_index].id,
+                record_id=visible_forms[selected_index].id,
                 table_version_key=VIEW_TABLE_VERSION_KEY,
             )
 
@@ -359,11 +369,19 @@ def _render_my_documents(
             return
 
         st.caption("Click a submission row to preview your filled file.")
+        submission_search = multi_search_input(
+            "Search My Submitted Forms",
+            placeholder="Type any value shown in the submission table, then press Enter…",
+            key="employee_company_form_submission_search",
+        )
+        visible_submissions, visible_submission_rows = filter_aligned_visible_rows(
+            submissions, _submission_rows(submissions), submission_search
+        )
         table_version = int(
             st.session_state.get(SUBMISSION_TABLE_VERSION_KEY, 0)
         )
         selected_index = render_selectable_admin_table(
-            _submission_rows(submissions),
+            visible_submission_rows,
             key=f"employee_company_form_submissions_{table_version}",
             height=260,
         )
@@ -373,7 +391,7 @@ def _render_my_documents(
             for item in submissions
         }
         if selected_index is not None:
-            clicked_submission = submissions[selected_index]
+            clicked_submission = visible_submissions[selected_index]
             clicked_label = (
                 f"{clicked_submission.public_id} · "
                 f"{clicked_submission.form.title}"

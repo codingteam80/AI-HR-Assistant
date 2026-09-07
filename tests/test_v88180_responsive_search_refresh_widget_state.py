@@ -16,14 +16,14 @@ def _source(path: str) -> str:
 def test_employee_hr_contacts_uses_same_live_search_engine_as_employee_master() -> None:
     contacts = _source("ui/pages/user/hr_contacts_page.py")
     employees = _source("ui/pages/admin/employees_page.py")
-    assert "from ui.components.live_search import live_search_input" in contacts
-    assert 'live_search_input(\n        "Search HR Contacts"' in contacts
-    assert 'live_search_input(\n        "Search Employees"' in employees
+    assert "from ui.components.live_search import multi_search_input" in contacts
+    assert 'multi_search_input(\n        "Search HR Contacts"' in contacts
+    assert 'multi_search_input(\n        "Search Employees"' in employees
     assert 'st.text_input(\n        "Search HR Contacts"' not in contacts
 
 
 def test_no_portal_page_uses_native_text_input_for_a_literal_search_field() -> None:
-    """All actual Search ... text fields use the debounced live-search component."""
+    """All actual Search ... fields avoid native text_input and use the shared search component."""
 
     offenders: list[str] = []
     for path in (ROOT / "ui" / "pages").rglob("*.py"):

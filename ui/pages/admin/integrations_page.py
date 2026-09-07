@@ -60,21 +60,52 @@ def _email_configuration_section(
     if not configured_sender or configured_sender == "no-reply@example.com":
         configured_sender = current_user.email
 
-    sender_email = st.text_input(
-        "Company Sender Email",
-        value=configured_sender,
-        key="external_email_sender_email",
-        max_chars=255,
-        help=(
-            "Examples: companyhr@gmail.com, hr@outlook.com, or "
-            "hr@company.com. Employee recipient addresses are taken "
-            "automatically from Employee Master Record."
-        ),
-    )
+    email_columns = st.columns([1.25, 0.95, 1.1], gap="small")
+    with email_columns[0]:
+        sender_email = st.text_input(
+            "Company Sender Email",
+            value=configured_sender,
+            key="external_email_sender_email",
+            max_chars=255,
+            help=(
+                "Examples: companyhr@gmail.com, hr@outlook.com, or "
+                "hr@company.com. Employee recipient addresses are taken "
+                "automatically from Employee Master Record."
+            ),
+        )
 
     detected = None
     try:
         detected = config_service.detect_sender(sender_email)
+    except NotificationConfigurationError:
+        detected = None
+
+    credential_label = (
+        detected.credential_label
+        if detected is not None
+        else "SMTP Password / Credential"
+    )
+    with email_columns[1]:
+        sender_name = st.text_input(
+            "Sender Name",
+            value=(settings.smtp_from_name or "AI HR Assistant"),
+            key="external_email_sender_name",
+            max_chars=120,
+        )
+    with email_columns[2]:
+        credential = st.text_input(
+            credential_label,
+            value="",
+            type="password",
+            key="external_email_credential",
+            help=(
+                "Leave blank to keep the credential already saved in the "
+                "project. The saved credential is never displayed back in "
+                "the browser."
+            ),
+        )
+
+    if detected is not None:
         if detected.automatic:
             st.success(
                 f"Provider detected automatically: {detected.display_name}"
@@ -90,29 +121,30 @@ def _email_configuration_section(
                 "Microsoft 365, an on-premise server, or another relay."
             )
         st.caption(detected.guidance)
-    except NotificationConfigurationError:
-        detected = None
 
     custom_host = None
     custom_port = None
     custom_encryption = "STARTTLS"
     if detected is not None and not detected.automatic:
         with st.expander("Advanced SMTP Settings", expanded=True):
-            custom_host = st.text_input(
-                "Outgoing SMTP Server",
-                value=(settings.smtp_host or ""),
-                key="external_email_custom_host",
-                placeholder="smtp.company.com",
-                max_chars=255,
-            )
-            custom_port = st.number_input(
-                "SMTP Port",
-                min_value=1,
-                max_value=65535,
-                value=int(settings.smtp_port or 587),
-                step=1,
-                key="external_email_custom_port",
-            )
+            smtp_columns = st.columns([1.5, 0.6, 0.9], gap="small")
+            with smtp_columns[0]:
+                custom_host = st.text_input(
+                    "Outgoing SMTP Server",
+                    value=(settings.smtp_host or ""),
+                    key="external_email_custom_host",
+                    placeholder="smtp.company.com",
+                    max_chars=255,
+                )
+            with smtp_columns[1]:
+                custom_port = st.number_input(
+                    "SMTP Port",
+                    min_value=1,
+                    max_value=65535,
+                    value=int(settings.smtp_port or 587),
+                    step=1,
+                    key="external_email_custom_port",
+                )
             current_encryption = (
                 "SSL/TLS"
                 if settings.smtp_use_ssl
@@ -120,36 +152,15 @@ def _email_configuration_section(
                 if settings.smtp_use_starttls
                 else "None"
             )
-            custom_encryption = st.selectbox(
-                "Encryption",
-                ["STARTTLS", "SSL/TLS", "None"],
-                index=["STARTTLS", "SSL/TLS", "None"].index(
-                    current_encryption
-                ),
-                key="external_email_custom_encryption",
-            )
-
-    sender_name = st.text_input(
-        "Sender Name",
-        value=(settings.smtp_from_name or "AI HR Assistant"),
-        key="external_email_sender_name",
-        max_chars=120,
-    )
-    credential_label = (
-        detected.credential_label
-        if detected is not None
-        else "Email Credential"
-    )
-    credential = st.text_input(
-        credential_label,
-        value="",
-        type="password",
-        key="external_email_credential",
-        help=(
-            "Leave blank to keep the credential already saved in the project. "
-            "The saved credential is never displayed back in the browser."
-        ),
-    )
+            with smtp_columns[2]:
+                custom_encryption = st.selectbox(
+                    "Encryption",
+                    ["STARTTLS", "SSL/TLS", "None"],
+                    index=["STARTTLS", "SSL/TLS", "None"].index(
+                        current_encryption
+                    ),
+                    key="external_email_custom_encryption",
+                )
 
     activate_email = st.toggle(
         "Activate Email Notifications",
@@ -310,49 +321,57 @@ def _sms_configuration_section() -> None:
         "gateway can be added later without changing employee records."
     )
 
-    account_sid = st.text_input(
-        "Company SMS Gateway Account SID",
-        value=(settings.twilio_account_sid or ""),
-        key="external_sms_account_sid",
-        max_chars=80,
-    )
-    auth_token = st.text_input(
-        "SMS Gateway Auth Token",
-        value="",
-        type="password",
-        key="external_sms_auth_token",
-        help=(
-            "Leave blank to keep the saved token. The token is never displayed "
-            "back in the browser."
-        ),
-    )
-    sender_number = st.text_input(
-        "SMS Sender Number",
-        value=(settings.twilio_from_number or ""),
-        key="external_sms_sender_number",
-        placeholder="+15005550006",
-        max_chars=50,
-        help=(
-            "Use the sender number assigned by the company SMS gateway. "
-            "Leave blank when a Messaging Service SID supplies the sender."
-        ),
-    )
-    messaging_service_sid = st.text_input(
-        "Messaging Service SID (Optional)",
-        value=(settings.twilio_messaging_service_sid or ""),
-        key="external_sms_messaging_service_sid",
-        max_chars=80,
-    )
-    default_country_code = st.text_input(
-        "Default Country Code",
-        value=(settings.sms_default_country_code or "+63"),
-        key="external_sms_country_code",
-        max_chars=5,
-        help=(
-            "Used only when an employee number is stored in local format. "
-            "Example: 09171234567 becomes +639171234567 when +63 is used."
-        ),
-    )
+    sms_primary_columns = st.columns(3, gap="small")
+    with sms_primary_columns[0]:
+        account_sid = st.text_input(
+            "Company SMS Gateway Account SID",
+            value=(settings.twilio_account_sid or ""),
+            key="external_sms_account_sid",
+            max_chars=80,
+        )
+    with sms_primary_columns[1]:
+        auth_token = st.text_input(
+            "SMS Gateway Auth Token",
+            value="",
+            type="password",
+            key="external_sms_auth_token",
+            help=(
+                "Leave blank to keep the saved token. The token is never "
+                "displayed back in the browser."
+            ),
+        )
+    with sms_primary_columns[2]:
+        sender_number = st.text_input(
+            "SMS Sender Number",
+            value=(settings.twilio_from_number or ""),
+            key="external_sms_sender_number",
+            placeholder="+15005550006",
+            max_chars=50,
+            help=(
+                "Use the sender number assigned by the company SMS gateway. "
+                "Leave blank when a Messaging Service SID supplies the sender."
+            ),
+        )
+
+    sms_secondary_columns = st.columns(2, gap="small")
+    with sms_secondary_columns[0]:
+        messaging_service_sid = st.text_input(
+            "Messaging Service SID (Optional)",
+            value=(settings.twilio_messaging_service_sid or ""),
+            key="external_sms_messaging_service_sid",
+            max_chars=80,
+        )
+    with sms_secondary_columns[1]:
+        default_country_code = st.text_input(
+            "Default Country Code",
+            value=(settings.sms_default_country_code or "+63"),
+            key="external_sms_country_code",
+            max_chars=5,
+            help=(
+                "Used only when an employee number is stored in local format. "
+                "Example: 09171234567 becomes +639171234567 when +63 is used."
+            ),
+        )
 
     activate_sms = st.toggle(
         "Activate SMS Notifications",

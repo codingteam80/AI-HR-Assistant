@@ -88,7 +88,12 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                 "shifting_credit_cutoff_day": "INTEGER NOT NULL DEFAULT 15",
                 "shifting_credit_additional_vl_threshold_hours": "NUMERIC(5, 2) NOT NULL DEFAULT 8.00",
                 "shifting_credit_additional_vl_days": "NUMERIC(5, 2) NOT NULL DEFAULT 0.50",
+                "shifting_credit_additional_vl_also_payable": "BOOLEAN NOT NULL DEFAULT 0",
                 "shifting_credit_excluded_positions_json": "TEXT NOT NULL DEFAULT '[\"Trainee\", \"Design Engineer I\", \"Design Engineer II\"]'",
+                "shifting_credit_availability_cutoffs": "INTEGER NOT NULL DEFAULT 2",
+                "shifting_credit_expiration_mode": "VARCHAR(30) NOT NULL DEFAULT 'follow_leave_reset'",
+                "shifting_credit_expiration_month": "INTEGER NOT NULL DEFAULT 12",
+                "shifting_credit_expiration_day": "INTEGER NOT NULL DEFAULT 31",
                 "work_monday": "BOOLEAN NOT NULL DEFAULT 1",
                 "work_tuesday": "BOOLEAN NOT NULL DEFAULT 1",
                 "work_wednesday": "BOOLEAN NOT NULL DEFAULT 1",
@@ -138,12 +143,17 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
             for column in inspector.get_columns("overtime_requests")
         }
         payable_hours_added = "payable_hours" not in overtime_columns
+        straight_vl_also_payable_added = (
+            "straight_vl_also_payable" not in overtime_columns
+        )
         with engine.begin() as connection:
             overtime_additions = {
                 "payable_hours": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
                 "shifting_credit_hours": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
+                "shifting_credit_restored_hours": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
                 "shifting_credit_group": "VARCHAR(80)",
                 "additional_vl_days": "NUMERIC(8, 2) NOT NULL DEFAULT 0",
+                "straight_vl_also_payable": "BOOLEAN NOT NULL DEFAULT 0",
             }
             for column_name, column_sql in overtime_additions.items():
                 if column_name not in overtime_columns:
@@ -165,11 +175,43 @@ def _upgrade_existing_schema_once(engine: Engine) -> None:
                         "WHERE payable_hours IS NULL OR payable_hours = 0"
                     )
                 )
+            if straight_vl_also_payable_added:
+                # Before v8.8.203 every historical straight-OT VL grant also
+                # remained payable. Preserve that historical behavior per row
+                # while the new company default is conversion-only.
+                connection.execute(
+                    text(
+                        "UPDATE overtime_requests "
+                        "SET straight_vl_also_payable = 1 "
+                        "WHERE additional_vl_days > 0"
+                    )
+                )
             connection.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS "
                     "ix_overtime_requests_shifting_credit_group "
                     "ON overtime_requests (shifting_credit_group)"
+                )
+            )
+
+    if "shifting_credits" in table_names:
+        shifting_columns = {
+            column["name"]
+            for column in inspector.get_columns("shifting_credits")
+        }
+        with engine.begin() as connection:
+            if "leave_request_id" not in shifting_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE shifting_credits "
+                        "ADD COLUMN leave_request_id INTEGER"
+                    )
+                )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_shifting_credits_leave_request_id "
+                    "ON shifting_credits (leave_request_id)"
                 )
             )
 

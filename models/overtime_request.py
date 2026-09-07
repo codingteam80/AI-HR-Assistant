@@ -56,9 +56,15 @@ class OvertimeRequest(TimestampMixin, Base):
     shifting_credit_hours: Mapped[Decimal] = mapped_column(
         Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
     )
+    shifting_credit_restored_hours: Mapped[Decimal] = mapped_column(
+        Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
+    )
     shifting_credit_group: Mapped[str | None] = mapped_column(String(80), index=True)
     additional_vl_days: Mapped[Decimal] = mapped_column(
         Numeric(8, 2), default=Decimal("0.00"), server_default="0", nullable=False
+    )
+    straight_vl_also_payable: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
     )
     ot_type: Mapped[str] = mapped_column(String(80), nullable=False)
     ot_purpose: Mapped[str] = mapped_column(Text, nullable=False)

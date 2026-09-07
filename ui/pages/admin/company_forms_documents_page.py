@@ -15,6 +15,8 @@ from services.company_form_service import (
     CompanyFormService,
 )
 from ui.components.data_table import render_selectable_admin_table
+from ui.components.live_search import multi_search_input
+from utils.search_utils import filter_aligned_visible_rows
 from ui.components.confirmation_guard import invalidate_confirmation_on_change
 from ui.components.company_form_download import (
     prepare_editable_company_form_download,
@@ -273,18 +275,26 @@ def _render_overview(
 
     if active_forms:
         st.caption("Click anywhere on a form row to open its file preview.")
+        form_search = multi_search_input(
+            "Search Company Forms",
+            placeholder="Type any value shown in the form table, then press Enter…",
+            key="admin_company_forms_overview_search",
+        )
+        visible_forms, visible_form_rows = filter_aligned_visible_rows(
+            active_forms, _form_rows(active_forms), form_search
+        )
         table_version = int(
             st.session_state.get(OVERVIEW_TABLE_VERSION_KEY, 0)
         )
         selected_index = render_selectable_admin_table(
-            _form_rows(active_forms),
+            visible_form_rows,
             key=f"company_forms_overview_active_{table_version}",
             height=245,
         )
         if selected_index is not None:
             _queue_preview(
                 kind="form",
-                record_id=active_forms[selected_index].id,
+                record_id=visible_forms[selected_index].id,
                 table_version_key=OVERVIEW_TABLE_VERSION_KEY,
             )
     else:
@@ -297,16 +307,24 @@ def _render_overview(
             st.caption(
                 "Click anywhere on a submission row to preview the filled file."
             )
+            submission_search = multi_search_input(
+                "Search Employee Filled Forms",
+                placeholder="Type any value shown in the submission table, then press Enter…",
+                key="admin_company_form_submissions_search",
+            )
+            visible_submissions, visible_submission_rows = filter_aligned_visible_rows(
+                submissions, _submission_rows(submissions), submission_search
+            )
             table_version = int(
                 st.session_state.get(SUBMISSION_TABLE_VERSION_KEY, 0)
             )
             selected_index = render_selectable_admin_table(
-                _submission_rows(submissions),
+                visible_submission_rows,
                 key=f"company_forms_overview_submissions_{table_version}",
                 height=245,
             )
             if selected_index is not None:
-                selected_submission = submissions[selected_index]
+                selected_submission = visible_submissions[selected_index]
                 selected_label = (
                     f"{selected_submission.public_id} · "
                     f"{selected_submission.employee.full_name} · "
@@ -402,11 +420,19 @@ def _render_manage(
         st.caption(
             "Click anywhere on a form row to preview and select it for editing."
         )
+        manage_search = multi_search_input(
+            "Search Manage Forms",
+            placeholder="Type any value shown in the form table, then press Enter…",
+            key="admin_company_forms_manage_search",
+        )
+        visible_forms, visible_form_rows = filter_aligned_visible_rows(
+            active_forms, _form_rows(active_forms), manage_search
+        )
         table_version = int(
             st.session_state.get(MANAGE_TABLE_VERSION_KEY, 0)
         )
         selected_index = render_selectable_admin_table(
-            _form_rows(active_forms),
+            visible_form_rows,
             key=f"company_forms_manage_{table_version}",
             height=230,
         )
@@ -416,7 +442,7 @@ def _render_manage(
             for item in active_forms
         }
         if selected_index is not None:
-            clicked_form = active_forms[selected_index]
+            clicked_form = visible_forms[selected_index]
             clicked_label = f"{clicked_form.public_id} · {clicked_form.title}"
             st.session_state["manage_company_form_select"] = clicked_label
             _queue_preview(
@@ -544,11 +570,19 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
         st.caption(
             "Click anywhere on a Bin row to preview and select the stored form."
         )
+        bin_search = multi_search_input(
+            "Search Form Bin",
+            placeholder="Type any value shown in the Bin table, then press Enter…",
+            key="admin_company_forms_bin_search",
+        )
+        visible_bin_forms, visible_bin_rows = filter_aligned_visible_rows(
+            bin_forms, _form_rows(bin_forms), bin_search
+        )
         table_version = int(
             st.session_state.get(BIN_TABLE_VERSION_KEY, 0)
         )
         selected_index = render_selectable_admin_table(
-            _form_rows(bin_forms),
+            visible_bin_rows,
             key=f"company_forms_bin_{table_version}",
             height=260,
         )
@@ -557,7 +591,7 @@ def _render_bin(current_user: AuthenticatedUser, bin_forms) -> None:
             for item in bin_forms
         }
         if selected_index is not None:
-            clicked_form = bin_forms[selected_index]
+            clicked_form = visible_bin_forms[selected_index]
             clicked_label = f"{clicked_form.public_id} · {clicked_form.title}"
             st.session_state["company_form_bin_select"] = clicked_label
             _queue_preview(

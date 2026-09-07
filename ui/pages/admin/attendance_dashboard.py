@@ -36,14 +36,15 @@ from services.attendance_service import AttendanceMatrix
 from services.overtime_service import OvertimeService
 from ui.components.attendance_table import render_attendance_matrix
 from ui.components.data_table import render_admin_table
-from ui.components.live_search import live_search_input
+from ui.components.live_search import multi_search_input
+from utils.search_utils import text_matches_search_terms
 from ui.components.operation_feedback import (
     render_operation_feedback,
     set_operation_feedback,
 )
 
 
-STATUS_OPTIONS = ("WFO", "WFH", "VL", "SL", "EL")
+STATUS_OPTIONS = ("WFO", "WFH", "VL", "SL", "EL", "OB")
 CALENDAR_DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
@@ -191,7 +192,16 @@ def _render_attendance_settings(
             company.shifting_credit_additional_vl_threshold_hours
         )
         additional_vl_days = float(company.shifting_credit_additional_vl_days)
+        additional_vl_also_payable = bool(
+            company.shifting_credit_additional_vl_also_payable
+        )
         excluded_positions = service.overtime_excluded_positions(company)
+        availability_cutoffs = int(company.shifting_credit_availability_cutoffs)
+        expiration_mode = str(
+            company.shifting_credit_expiration_mode or "follow_leave_reset"
+        )
+        expiration_month = int(company.shifting_credit_expiration_month)
+        expiration_day = int(company.shifting_credit_expiration_day)
         current_positions = [
             value
             for value in session.scalars(
@@ -259,30 +269,56 @@ def _render_attendance_settings(
             "deselect any date for holidays and catch-up workdays."
         )
 
-        header_columns = st.columns(7, gap="small")
-        for column, day_name in zip(header_columns, CALENDAR_DAY_NAMES):
-            with column:
-                st.caption(day_name)
+        calendar_scope = (
+            f"regular_workdays_calendar_{current_user.company_id}_{year}_{month}"
+        )
+        st.markdown(
+            f"""
+            <style>
+            div[class*="st-key-{calendar_scope}"] > div[data-testid="stVerticalBlock"] {{
+                gap: 0.18rem !important;
+            }}
+            div[class*="st-key-{calendar_scope}"] [data-testid="stHorizontalBlock"] {{
+                gap: 0.35rem !important;
+            }}
+            div[class*="st-key-{calendar_scope}"] [data-testid="stCheckbox"] {{
+                margin-top: 0 !important;
+                margin-bottom: 0 !important;
+            }}
+            div[class*="st-key-{calendar_scope}"] p {{
+                margin-bottom: 0 !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
 
         selected_dates: list[date] = []
         month_calendar = calendar.Calendar(firstweekday=0)
-        for week in month_calendar.monthdatescalendar(year, month):
-            week_columns = st.columns(7, gap="small")
-            for column, work_date in zip(week_columns, week):
+        compact_grid = [1.5, 1, 1, 1, 1, 1, 1, 1, 1.5]
+        with st.container(key=calendar_scope):
+            header_columns = st.columns(compact_grid, gap="small")[1:8]
+            for column, day_name in zip(header_columns, CALENDAR_DAY_NAMES):
                 with column:
-                    if work_date.month != month:
-                        st.markdown("&nbsp;", unsafe_allow_html=True)
-                        continue
-                    selected = st.checkbox(
-                        str(work_date.day),
-                        value=workdays[work_date],
-                        key=(
-                            "attendance_calendar_"
-                            f"{current_user.company_id}_{work_date.isoformat()}"
-                        ),
-                    )
-                    if selected:
-                        selected_dates.append(work_date)
+                    st.caption(day_name)
+
+            for week in month_calendar.monthdatescalendar(year, month):
+                week_columns = st.columns(compact_grid, gap="small")[1:8]
+                for column, work_date in zip(week_columns, week):
+                    with column:
+                        if work_date.month != month:
+                            st.markdown("&nbsp;", unsafe_allow_html=True)
+                            continue
+                        selected = st.checkbox(
+                            str(work_date.day),
+                            value=workdays[work_date],
+                            key=(
+                                "attendance_calendar_"
+                                f"{current_user.company_id}_{work_date.isoformat()}"
+                            ),
+                        )
+                        if selected:
+                            selected_dates.append(work_date)
 
         if st.button(
             "Save Attendance Schedule",
@@ -401,6 +437,87 @@ def _render_attendance_settings(
                 key=f"shifting_additional_vl_{current_user.company_id}",
             )
 
+        additional_vl_also_payable_value = st.checkbox(
+            "Consider it also as OT Payable",
+            value=additional_vl_also_payable,
+            disabled=not shifting_enabled_value or additional_vl_value <= 0,
+            key=f"shifting_additional_vl_also_payable_{current_user.company_id}",
+            help=(
+                "Off (default): the qualifying straight-OT hours are converted "
+                "to VL and are not also Regular OT payable. On: the VL credit "
+                "is still granted and the OT remains payable, subject to the "
+                "configured dinner-break deduction."
+            ),
+        )
+        st.caption(
+            "Straight-OT VL default: conversion only. Enable the checkbox only "
+            "when company policy allows both the VL credit and OT payment."
+        )
+
+        st.markdown("**OB Availability & Expiration**")
+        lifecycle_row = st.columns(2)
+        with lifecycle_row[0]:
+            availability_cutoffs_value = st.number_input(
+                "Availability Delay (completed cut-offs)",
+                min_value=0,
+                max_value=24,
+                value=availability_cutoffs,
+                step=1,
+                disabled=not shifting_enabled_value,
+                key=f"shifting_availability_cutoffs_{current_user.company_id}",
+                help=(
+                    "Default 2: a credit earned in one cut-off becomes usable only "
+                    "after two later cut-offs are fully completed."
+                ),
+            )
+        with lifecycle_row[1]:
+            expiration_label = st.selectbox(
+                "Expiration Basis",
+                (
+                    "Follow Leave Credit Reset Date",
+                    "Use Separate Shifting Credit Expiration Date",
+                ),
+                index=(0 if expiration_mode == "follow_leave_reset" else 1),
+                disabled=not shifting_enabled_value,
+                key=f"shifting_expiration_mode_{current_user.company_id}",
+                help=(
+                    "Unused available OB expires annually. When it expires unused, "
+                    "its consumed OT hours return to Regular OT and cannot be reused "
+                    "to create another OB credit."
+                ),
+            )
+        expiration_mode_value = (
+            "follow_leave_reset"
+            if expiration_label == "Follow Leave Credit Reset Date"
+            else "custom_date"
+        )
+        custom_expiration_row = st.columns(2)
+        with custom_expiration_row[0]:
+            expiration_month_value = st.selectbox(
+                "Separate Expiration Month",
+                range(1, 13),
+                index=max(0, min(11, expiration_month - 1)),
+                format_func=lambda value: calendar.month_name[value],
+                disabled=(
+                    not shifting_enabled_value
+                    or expiration_mode_value != "custom_date"
+                ),
+                key=f"shifting_expiration_month_{current_user.company_id}",
+            )
+        with custom_expiration_row[1]:
+            expiration_day_value = st.number_input(
+                "Separate Expiration Day",
+                min_value=1,
+                max_value=31,
+                value=expiration_day,
+                step=1,
+                disabled=(
+                    not shifting_enabled_value
+                    or expiration_mode_value != "custom_date"
+                ),
+                key=f"shifting_expiration_day_{current_user.company_id}",
+            )
+
         excluded_positions_value = st.multiselect(
             "Shifting Credit Excluded Positions",
             position_options,
@@ -414,11 +531,12 @@ def _render_attendance_settings(
             ),
         )
         st.caption(
-            "Default rule: two 4-hour blocks in the same cut-off are marked "
-            "as Shifting Credits. One unmatched 4-hour block remains payable "
-            "OT. A qualifying 8-hour OT remains payable OT and earns 0.5 VL. "
-            "Qualification uses gross rendered hours; dinner-break deduction "
-            "affects payable OT only."
+            "Default rule: two qualifying blocks in the same cut-off create one "
+            "whole-day OB Shifting Credit; only each qualifying block is consumed "
+            "and excess remains Regular OT. A qualifying straight OT is converted "
+            "to the configured VL credit. Its qualifying hours are not OT payable "
+            "unless ‘Consider it also as OT Payable’ is enabled. Qualification uses "
+            "gross rendered hours; dinner-break deduction affects payable OT only."
         )
 
         ot_rules_key_prefix = f"company_ot_shifting_rules_{current_user.company_id}"
@@ -433,9 +551,14 @@ def _render_attendance_settings(
                 "shifting_credit_cutoff_day": int(cutoff_day_value),
                 "additional_vl_threshold_hours": vl_threshold_value,
                 "additional_vl_days": additional_vl_value,
+                "additional_vl_also_payable": additional_vl_also_payable_value,
                 "excluded_positions": tuple(
                     sorted(excluded_positions_value, key=str.casefold)
                 ),
+                "availability_cutoffs": int(availability_cutoffs_value),
+                "expiration_mode": expiration_mode_value,
+                "expiration_month": int(expiration_month_value),
+                "expiration_day": int(expiration_day_value),
             },
         )
         confirm_ot_rules = st.checkbox(
@@ -465,7 +588,14 @@ def _render_attendance_settings(
                     shifting_credit_cutoff_day=int(cutoff_day_value),
                     additional_vl_threshold_hours=vl_threshold_value,
                     additional_vl_days=additional_vl_value,
+                    additional_vl_also_payable=additional_vl_also_payable_value,
                     excluded_positions=excluded_positions_value,
+                    shifting_credit_availability_cutoffs=int(
+                        availability_cutoffs_value
+                    ),
+                    shifting_credit_expiration_mode=expiration_mode_value,
+                    shifting_credit_expiration_month=int(expiration_month_value),
+                    shifting_credit_expiration_day=int(expiration_day_value),
                 )
                 with SessionFactory() as session:
                     AttendanceService(session).save_overtime_rules(values)
@@ -870,27 +1000,15 @@ def render_admin_attendance_dashboard(
             ]
             return " ".join(str(value).casefold() for value in values if value not in (None, ""))
 
-        search = live_search_input(
+        search_terms = multi_search_input(
             "Search Employee / Attendance / DTR / OT",
-            placeholder="Search any employee or attendance column…",
+            placeholder="Type employee, department, status, date, time, or attendance term, then press Enter…",
             key="admin_dtr_employee_search",
-            suggestions=(
-                value
-                for employee in matrix.employees
-                for value in (
-                    employee.employee_number,
-                    employee.full_name,
-                    employee.employment_status,
-                    employee.department.name if employee.department else None,
-                    employee.job_title,
-                )
-                if value
-            ),
-        ).strip().casefold()
-        if search:
+        )
+        if search_terms:
             visible = [
                 employee for employee in matrix.employees
-                if search in searchable_employee(employee)
+                if text_matches_search_terms(search_terms, searchable_employee(employee))
             ]
             visible_ids = {employee.id for employee in visible}
             matrix = AttendanceMatrix(
